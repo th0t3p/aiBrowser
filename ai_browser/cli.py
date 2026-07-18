@@ -14,6 +14,7 @@ from ai_browser.browser_session import BrowserSession, BrowserSessionConfig, Pro
 from ai_browser.crawler import Crawler, CrawlConfig, DiscoveryMethod
 from ai_browser.agent_explorer import AgentExplorer, ExplorerConfig
 from ai_browser.registration_handler import RegistrationHandler, RegistrationConfig, IMAPConfig
+from ai_browser.login_handler import LoginHandler, LoginConfig
 
 logging.basicConfig(
     level=logging.INFO,
@@ -94,10 +95,33 @@ def main(ctx: click.Context):
     help="Run the agent explorer on JS-heavy pages with no links.",
 )
 @click.option(
+    "--llm-provider",
+    default="anthropic",
+    type=click.Choice(["anthropic", "openai", "deepseek"]),
+    show_default=True,
+    help="LLM provider for agent_explorer.",
+)
+@click.option(
+    "--llm-model",
+    default=None,
+    help="Model name (provider-specific). Defaults: claude-sonnet-4-20250514 / gpt-4o / deepseek-chat.",
+)
+@click.option(
+    "--llm-api-key",
+    default=None,
+    envvar="LLM_API_KEY",
+    help="API key for the LLM provider (or set LLM_API_KEY env var).",
+)
+@click.option(
+    "--llm-base-url",
+    default=None,
+    help="Custom base URL for the LLM API (falls back to provider default).",
+)
+@click.option(
     "--anthropic-api-key",
     default=None,
     envvar="ANTHROPIC_API_KEY",
-    help="Claude API key for agent explorer (or set ANTHROPIC_API_KEY env var).",
+    help="[Deprecated] Use --llm-provider anthropic --llm-api-key instead.",
 )
 @click.option(
     "--register",
@@ -119,6 +143,22 @@ def main(ctx: click.Context):
     "--register-name",
     default="Test User",
     help="Full name for registration.",
+)
+@click.option(
+    "--login",
+    is_flag=True,
+    default=False,
+    help="Log in before crawling using persisted or provided credentials.",
+)
+@click.option(
+    "--login-email",
+    default=None,
+    help="Email/username for login (falls back to --register-email).",
+)
+@click.option(
+    "--login-password",
+    default=None,
+    help="Password for login (falls back to --register-password).",
 )
 @click.option(
     "--imap-host",
@@ -181,11 +221,18 @@ def crawl(
     max_depth: int,
     max_pages: int,
     agent: bool,
+    llm_provider: str,
+    llm_model: Optional[str],
+    llm_api_key: Optional[str],
+    llm_base_url: Optional[str],
     anthropic_api_key: Optional[str],
     register: bool,
     register_email: Optional[str],
     register_password: str,
     register_name: str,
+    login: bool,
+    login_email: Optional[str],
+    login_password: Optional[str],
     imap_host: Optional[str],
     imap_port: int,
     imap_username: Optional[str],
@@ -211,6 +258,14 @@ def crawl(
         sys.exit(1)
 
     click.echo(AUTHORIZATION_REMINDER)
+
+    # Deprecation: --anthropic-api-key maps to new fields
+    _llm_api_key = llm_api_key or anthropic_api_key
+    if anthropic_api_key and not llm_api_key:
+        click.echo(
+            "⚠ Warning: --anthropic-api-key is deprecated. Use --llm-provider anthropic --llm-api-key instead.",
+            err=True,
+        )
 
     start_url = f"https://{hostname}"
     scope_pattern = scope or hostname
@@ -250,11 +305,17 @@ def crawl(
             session_config=session_config,
             crawl_config=crawl_config,
             run_agent=agent,
-            anthropic_api_key=anthropic_api_key,
+            llm_provider=llm_provider,
+            llm_model=llm_model,
+            llm_api_key=_llm_api_key,
+            llm_base_url=llm_base_url,
             do_register=register,
             register_email=register_email,
             register_password=register_password,
             register_name=register_name,
+            do_login=login,
+            login_email=login_email,
+            login_password=login_password,
             imap_host=imap_host,
             imap_port=imap_port,
             imap_username=imap_username,
@@ -271,11 +332,17 @@ async def _run_crawl(
     session_config: BrowserSessionConfig,
     crawl_config: CrawlConfig,
     run_agent: bool,
-    anthropic_api_key: Optional[str],
+    llm_provider: str,
+    llm_model: Optional[str],
+    llm_api_key: Optional[str],
+    llm_base_url: Optional[str],
     do_register: bool,
     register_email: Optional[str],
     register_password: str,
     register_name: str,
+    do_login: bool,
+    login_email: Optional[str],
+    login_password: Optional[str],
     imap_host: Optional[str],
     imap_port: int,
     imap_username: Optional[str],
@@ -288,6 +355,29 @@ async def _run_crawl(
     """Run the full crawl pipeline."""
 
     async with BrowserSession(session_config) as session:
+        # Phase 0: Login (before crawl, if requested)
+        if do_login:
+            _email = login_email or register_email
+            _password = login_password or register_password
+            if not _email or not _password:
+                click.echo(
+                    "ERROR: --login requires --login-email/--login-password or --register-email/--register-password.",
+                    err=True,
+                )
+                return
+            click.echo(f"\n[Phase 0] Logging in as {_email}...")
+            login_config = LoginConfig(
+                login_url=f"https://{hostname}/login",
+                email=_email,
+                password=_password,
+            )
+            login_handler = LoginHandler(login_config)
+            try:
+                await login_handler.login(session)
+                click.echo("  Login complete!")
+            except Exception as exc:
+                click.echo(f"  Login error: {exc}", err=True)
+
         # Phase 1: Deterministic crawl
         click.echo(f"\n[Phase 1] Starting deterministic crawl of {hostname}...")
         crawler = Crawler(crawl_config)
@@ -299,11 +389,14 @@ async def _run_crawl(
         )
 
         # Phase 2: Agent explorer for JS-heavy pages
-        if run_agent and anthropic_api_key:
+        if run_agent and llm_api_key:
             click.echo(f"\n[Phase 2] Running agent explorer on {hostname}...")
             explorer_config = ExplorerConfig(
                 authorized_hostname=scope_pattern,
-                anthropic_api_key=anthropic_api_key,
+                llm_provider=llm_provider,
+                llm_model=llm_model or "",
+                llm_api_key=llm_api_key,
+                llm_base_url=llm_base_url or "",
             )
             explorer = AgentExplorer(explorer_config)
 
@@ -321,9 +414,9 @@ async def _run_crawl(
                             DiscoveryMethod.LINK,
                         )
 
-        elif run_agent and not anthropic_api_key:
+        elif run_agent and not llm_api_key:
             click.echo(
-                "\n[Phase 2] Skipped: --no-agent or ANTHROPIC_API_KEY not set.",
+                "\n[Phase 2] Skipped: --no-agent or LLM_API_KEY not set.",
                 err=True,
             )
 

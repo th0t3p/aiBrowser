@@ -1,4 +1,4 @@
-"""AgentExplorer — Claude-driven exploration of JS-rendered SPAs via accessibility tree snapshots."""
+"""AgentExplorer — LLM-driven exploration of JS-rendered SPAs via accessibility tree snapshots."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional, Callable, Awaitable
 
-import anthropic
+import httpx
 from playwright.async_api import Page
 
 from ai_browser.browser_session import BrowserSession
@@ -82,7 +82,7 @@ class AgentExplorer:
 
     def __init__(self, config: ExplorerConfig):
         self.config = config
-        self._client = anthropic.AsyncAnthropic(api_key=config.anthropic_api_key)
+        self._client = httpx.AsyncClient(timeout=30.0)
         self._audit_entries: list[AuditLogEntry] = []
         self._paused: bool = False
         self._confirmation_callback: Optional[Callable[[AgentAction], Awaitable[bool]]] = None
@@ -117,8 +117,8 @@ class AgentExplorer:
 
             current_url = current_page.url
 
-            # Ask Claude what to do
-            action = await self._ask_claude(snapshot, current_url)
+            # Ask LLM what to do
+            action = await self._ask_llm(snapshot, current_url)
 
             if action is None or action.get("action") == "done":
                 logger.info("Claude signaled exploration complete after %d actions", actions_taken)
@@ -128,8 +128,41 @@ class AgentExplorer:
             if self._is_denied(action):
                 logger.warning("Action blocked by denylist: %s on '%s'",
                                action.get("action"), action.get("target"))
-                # Skip this action but continue exploring other elements
                 continue
+
+            # Check for registration forms (separate from destructive denylist):
+            # - If allow_registration=False → treat as needs-confirmation
+            # - If allow_registration=True and config present → delegate to handler
+            is_registration = self._matches_registration(action)
+            if is_registration:
+                if not self.config.allow_registration:
+                    logger.info("Registration form detected but allow_registration=False")
+                    if self._needs_confirmation(action):
+                        approved = await self._request_confirmation(action)
+                        if not approved:
+                            logger.info("Registration action denied (no callback)")
+                            continue
+                elif self.config.registration_config:
+                    logger.info("Registration form detected; delegating to RegistrationHandler")
+                    try:
+                        new_page = await self._delegate_registration(session, current_page)
+                        current_page = new_page
+                        actions_taken += 1
+                    except Exception as exc:
+                        logger.error("Registration delegation failed: %s", exc)
+                        self._audit_entries.append(AuditLogEntry(
+                            action=AgentAction(
+                                action_type=ActionType.CLICK,
+                                target_text="[registration delegation]",
+                                current_url=current_page.url,
+                                reasoning="Delegated to RegistrationHandler",
+                            ),
+                            success=False,
+                            error_message=str(exc),
+                        ))
+                        if "CaptchaDetected" in type(exc).__name__:
+                            raise
+                    continue
 
             # Check if we need human confirmation (for borderline cases)
             if self._needs_confirmation(action):
@@ -213,13 +246,12 @@ class AgentExplorer:
         return simplified
 
     # ------------------------------------------------------------------
-    # Claude interaction
+    # LLM interaction (multi-provider via httpx)
     # ------------------------------------------------------------------
 
-    async def _ask_claude(self, snapshot: dict, current_url: str) -> Optional[dict]:
-        """Send the accessibility tree to Claude and parse the action response."""
+    async def _ask_llm(self, snapshot: dict, current_url: str) -> Optional[dict]:
+        """Send the accessibility tree to the configured LLM provider."""
         snapshot_json = json.dumps(snapshot, indent=2)
-        # Truncate if too large (Claude context limits)
         if len(snapshot_json) > 100_000:
             snapshot_json = snapshot_json[:100_000] + "\n... (truncated)"
 
@@ -229,25 +261,84 @@ class AgentExplorer:
             "What is the next action to explore this application?"
         )
 
+        provider = self.config.llm_provider.lower()
+        api_key = self.config.llm_api_key
+        model = self.config.llm_model
+        base_url = self.config.llm_base_url
+
         try:
-            response = await self._client.messages.create(
-                model=self.config.anthropic_model,
-                max_tokens=512,
-                system=ACTION_SYSTEM_PROMPT,
-                messages=[{"role": "user", "content": message}],
-            )
-            text = response.content[0].text.strip()
-            # Extract JSON from response (Claude sometimes wraps in markdown)
-            json_match = re.search(r"\{[^}]+\}", text, re.DOTALL)
-            if json_match:
-                parsed = json.loads(json_match.group(0))
-                logger.debug("Claude response: %s", parsed)
-                return parsed
-            logger.warning("Could not parse JSON from Claude response: %s", text[:200])
-            return None
+            if provider == "anthropic":
+                resp = await self._call_anthropic(api_key, model, base_url, message)
+            elif provider in ("openai", "deepseek"):
+                resp = await self._call_openai_compatible(provider, api_key, model, base_url, message)
+            else:
+                logger.error("Unknown LLM provider: %s", provider)
+                return None
+            return self._parse_llm_response(provider, resp)
         except Exception as exc:
-            logger.error("Claude API error: %s", exc)
+            logger.error("LLM API error (%s): %s", provider, exc)
             return None
+
+    async def _call_anthropic(self, api_key, model, base_url, message):
+        url = base_url or "https://api.anthropic.com"
+        url = url.rstrip("/") + "/v1/messages"
+        headers = {
+            "x-api-key": api_key,
+            "anthropic-version": "2023-06-01",
+            "Content-Type": "application/json",
+        }
+        body = {
+            "model": model,
+            "max_tokens": 512,
+            "system": ACTION_SYSTEM_PROMPT,
+            "messages": [{"role": "user", "content": message}],
+        }
+        return await self._client.post(url, json=body, headers=headers)
+
+    async def _call_openai_compatible(self, provider, api_key, model, base_url, message):
+        if base_url:
+            url = base_url.rstrip("/") + "/chat/completions"
+        elif provider == "openai":
+            url = "https://api.openai.com/v1/chat/completions"
+        else:
+            url = "https://api.deepseek.com/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+        body = {
+            "model": model,
+            "max_tokens": 512,
+            "messages": [
+                {"role": "system", "content": ACTION_SYSTEM_PROMPT},
+                {"role": "user", "content": message},
+            ],
+        }
+        return await self._client.post(url, json=body, headers=headers)
+
+    def _parse_llm_response(self, provider, response) -> Optional[dict]:
+        """Extract action JSON from provider-specific API response."""
+        data = response.json()
+        if provider == "anthropic":
+            content = data.get("content", [])
+            text = content[0]["text"].strip() if content else ""
+        else:
+            choices = data.get("choices", [])
+            text = choices[0].get("message", {}).get("content", "").strip() if choices else ""
+
+        json_match = re.search(r"\{[^}]+\}", text, re.DOTALL)
+        if json_match:
+            parsed = json.loads(json_match.group(0))
+            logger.debug("LLM (%s) response: %s", provider, parsed)
+            return parsed
+        logger.warning("Could not parse JSON from %s response: %s", provider, text[:200])
+        return None
+
+    # Deprecated backward-compat alias
+    async def _ask_claude(self, snapshot, current_url):
+        import warnings
+        warnings.warn("_ask_claude is deprecated; use _ask_llm", DeprecationWarning, stacklevel=2)
+        return await self._ask_llm(snapshot, current_url)
 
     # ------------------------------------------------------------------
     # Action execution
@@ -332,6 +423,12 @@ class AgentExplorer:
                             selector,
                         )
                         return False
+                    # Also check registration: if allow_registration is True, the
+                    # registration delegation path handles this — don't click here
+                    if await self._element_matches_registration(element):
+                        if self.config.allow_registration:
+                            logger.info("Skipping click on registration element; handled by delegation")
+                            return False
                     await element.click()
                     await page.wait_for_load_state("networkidle", timeout=5000)
                     return True
@@ -440,6 +537,32 @@ class AgentExplorer:
             logger.warning("Navigation to %s failed: %s", url, exc)
             return False
 
+    async def _delegate_registration(self, session: BrowserSession, current_page: Page) -> Page:
+        """Hand off to RegistrationHandler for the full signup + email confirmation flow.
+
+        The agent's role is to recognize this is a signup point and delegate.
+        RegistrationHandler already knows how to fill fields, submit, handle CAPTCHA,
+        and poll IMAP for confirmation links.
+
+        Returns the authenticated page after successful registration.
+        Propagates CaptchaDetected unchanged so the caller can handle it.
+        """
+        from ai_browser.registration_handler import RegistrationHandler
+
+        if not self.config.registration_config:
+            raise RuntimeError("allow_registration is True but no registration_config set")
+
+        logger.info("Delegating registration flow to RegistrationHandler")
+        handler = RegistrationHandler(self.config.registration_config)
+
+        try:
+            page = await handler.register(session)
+            logger.info("Registration delegation completed: %s", page.url)
+            return page
+        except Exception:
+            # CaptchaDetected (and any other exception) propagates up to explore()
+            raise
+
     # ------------------------------------------------------------------
     # Denylist enforcement
     # ------------------------------------------------------------------
@@ -464,6 +587,39 @@ class AgentExplorer:
                     combined[:100],
                 )
                 return True
+        return False
+
+    def _matches_registration(self, action: dict) -> bool:
+        """Check if the LLM's self-reported text matches registration patterns.
+
+        The *actual* resolved element text is also checked at click/submit time
+        via _element_matches_registration() for defense-in-depth.
+        """
+        target = (action.get("target") or "").lower()
+        value = (action.get("value") or "").lower()
+        reasoning = (action.get("reasoning") or "").lower()
+        combined = f"{target} {value} {reasoning}"
+
+        for pattern in self.config.registration_patterns:
+            if re.search(pattern, combined):
+                return True
+        return False
+
+    async def _element_matches_registration(self, element) -> bool:
+        """Check the *actual* resolved DOM element text against registration patterns.
+
+        Same approach as _element_matches_denylist but against registration_patterns.
+        """
+        try:
+            inner_text = (await element.inner_text() or "").lower()
+            aria_label = (await element.get_attribute("aria-label") or "").lower()
+            combined = f"{inner_text} {aria_label}"
+
+            for pattern in self.config.registration_patterns:
+                if re.search(pattern, combined):
+                    return True
+        except Exception as exc:
+            logger.debug("Failed to check element registration: %s", exc)
         return False
 
     async def _element_matches_denylist(self, element) -> bool:

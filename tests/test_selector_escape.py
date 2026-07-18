@@ -1,7 +1,7 @@
 """Tests for CSS selector escaping (Fix #5)."""
 
 from ai_browser.agent_explorer.explorer import _escape_css_string
-from ai_browser.registration_handler.handler import _escape_css_string as _handler_escape
+from ai_browser._form_helpers import _escape_css_string as _handler_escape
 
 
 class TestCSSEscape:
