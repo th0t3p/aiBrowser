@@ -150,6 +150,12 @@ class ExplorerConfig(BaseModel):
         description="Configuration passed to RegistrationHandler when allow_registration "
         "is True and a signup form is detected during exploration.",
     )
+    raise_on_registration_failure: bool = Field(
+        default=False,
+        description="If True, any exception from registration delegation (not just "
+        "CaptchaDetected) re-raises through explore(). If False (default), only "
+        "CaptchaDetected propagates; other errors are logged and exploration continues.",
+    )
 
     @model_validator(mode="after")
     def _migrate_deprecated_fields(self) -> "ExplorerConfig":

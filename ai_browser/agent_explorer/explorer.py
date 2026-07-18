@@ -15,6 +15,7 @@ from playwright.async_api import Page
 
 from ai_browser.browser_session import BrowserSession
 from ai_browser._scope import page_url_matches_scope
+from ai_browser.registration_handler.models import CaptchaDetected
 
 from .models import (
     ActionType,
@@ -160,7 +161,12 @@ class AgentExplorer:
                             success=False,
                             error_message=str(exc),
                         ))
-                        if "CaptchaDetected" in type(exc).__name__:
+                        # CaptchaDetected always propagates so the caller can
+                        # solve it manually and resume. Other exceptions re-raise
+                        # only when raise_on_registration_failure is True.
+                        if isinstance(exc, CaptchaDetected):
+                            raise
+                        if self.config.raise_on_registration_failure:
                             raise
                     continue
 
@@ -274,7 +280,19 @@ class AgentExplorer:
             else:
                 logger.error("Unknown LLM provider: %s", provider)
                 return None
+
+            # Surface HTTP errors (401, 429, 500, …) before parsing
+            resp.raise_for_status()
             return self._parse_llm_response(provider, resp)
+
+        except httpx.HTTPStatusError as exc:
+            logger.error(
+                "LLM API error (%s): HTTP %s — %s",
+                provider,
+                exc.response.status_code,
+                exc.response.text[:200],
+            )
+            return None
         except Exception as exc:
             logger.error("LLM API error (%s): %s", provider, exc)
             return None
