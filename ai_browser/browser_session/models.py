@@ -75,6 +75,12 @@ class BrowserSessionConfig(BaseModel):
         default=True,
         description="Ignore HTTPS certificate errors (needed when routing through Burp).",
     )
+    passive_xhr_hosts: list[str] = Field(
+        default_factory=list,
+        description="Hostnames or glob patterns (e.g. '*.cdn.example.com') for which "
+        "out-of-scope XHR/fetch requests are allowed through instead of blocked. "
+        "Use this for known-safe telemetry/CDN endpoints that pages fire autonomously.",
+    )
 
     model_config = {"arbitrary_types_allowed": True}
 

@@ -201,27 +201,54 @@ class BrowserSession:
             hostname = urlparse(url).hostname or ""
             if not hostname_matches_scope(hostname, authorized):
                 resource_type = getattr(route.request, "resource_type", None) or "unknown"
+
                 if resource_type == "document":
-                    # Top-level or iframe navigation — full violation
-                    logger.warning("Scope guard blocked navigation to %s (hostname=%s)", url, hostname)
+                    # Top-level / iframe navigation — full violation
+                    logger.warning(
+                        "Scope guard blocked navigation to %s (hostname=%s)", url, hostname
+                    )
                     violation = ScopeGuardError(
                         attempted_hostname=hostname,
                         authorized_hostname=self.config.authorized_hostname,
                     )
                     self.violations.append(violation)
                     self._get_violation_event().set()
-                else:
-                    # Sub-resource (script, stylesheet, image, font, xhr, etc.)
-                    # Block the individual request but don't treat as fatal
+                    await route.abort()
+                    return
+
+                if resource_type in ("xhr", "fetch"):
+                    # XHR/fetch — could be page-initiated telemetry OR an
+                    # agent_explorer action. Block by default; only allow
+                    # through if the hostname is explicitly allowlisted.
+                    for pattern in self.config.passive_xhr_hosts:
+                        if hostname_matches_scope(hostname, pattern):
+                            logger.debug(
+                                "Scope guard allowed XHR (%s) to %s (hostname=%s) — "
+                                "passive_xhr_hosts match",
+                                resource_type, url, hostname,
+                            )
+                            await route.continue_()
+                            return
                     logger.debug(
-                        "Scope guard blocked sub-resource (%s) to %s (hostname=%s)",
-                        resource_type, url, hostname,
+                        "Scope guard blocked XHR/fetch to %s (hostname=%s)",
+                        url, hostname,
                     )
                     self.blocked_subresources.append(
                         BlockedSubresource(url=url, hostname=hostname, resource_type=resource_type)
                     )
-                await route.abort()
+                    await route.abort()
+                    return
+
+                # All other resource types: script, stylesheet, image, font,
+                # media, and anything else — these are page sub-resources that
+                # are loaded passively during rendering. Let them through.
+                logger.debug(
+                    "Scope guard allowed sub-resource (%s) to %s (hostname=%s)",
+                    resource_type, url, hostname,
+                )
+                await route.continue_()
                 return
+
             await route.continue_()
 
         # Route all requests through the guard

@@ -221,11 +221,14 @@ class TestScopeGuardViolationTracking:
 
 
 class TestSubresourceBlocking:
-    """Test that blocked sub-resources don't kill the crawl."""
+    """Test that sub-resources are allowed/blocked based on resource type."""
 
     @staticmethod
-    def _make_config(hostname="example.com"):
-        return BrowserSessionConfig(authorized_hostname=hostname)
+    def _make_config(hostname="example.com", passive_xhr_hosts=None):
+        return BrowserSessionConfig(
+            authorized_hostname=hostname,
+            passive_xhr_hosts=passive_xhr_hosts or [],
+        )
 
     @staticmethod
     def _make_mock_page():
@@ -265,7 +268,7 @@ class TestSubresourceBlocking:
         mock_page = session._context.pages[0]
         await session._install_scope_guard(mock_page)
 
-    async def _trigger_subresource(self, session, url, resource_type="script"):
+    async def _trigger_resource(self, session, url, resource_type="script"):
         mock_page = session._context.pages[0]
         handler = mock_page._routes.get("**/*")
         assert handler is not None
@@ -274,19 +277,11 @@ class TestSubresourceBlocking:
         mock_route.request.url = url
         mock_route.request.resource_type = resource_type
         await handler(mock_route)
+        return mock_route
 
-    @pytest.mark.asyncio
-    async def test_subresource_blocked_but_not_violation(self):
-        config = self._make_config()
-        page = self._make_mock_page()
-        context = self._make_mock_context(page)
-        session = self._make_session(config, context)
-        await self._install_guard(session)
-        await self._trigger_subresource(session, "https://cdn.evil.com/app.js", "script")
-        assert session.violations == []
-        assert len(session.blocked_subresources) == 1
-        assert session.blocked_subresources[0].hostname == "cdn.evil.com"
-        session.check_violations()
+    # ------------------------------------------------------------------
+    # document — always blocked as violation
+    # ------------------------------------------------------------------
 
     @pytest.mark.asyncio
     async def test_document_navigation_still_records_violation(self):
@@ -295,38 +290,138 @@ class TestSubresourceBlocking:
         context = self._make_mock_context(page)
         session = self._make_session(config, context)
         await self._install_guard(session)
-        await self._trigger_subresource(session, "https://evil.com", "document")
+        await self._trigger_resource(session, "https://evil.com", "document")
         assert len(session.violations) == 1
+        assert session.violations[0].attempted_hostname == "evil.com"
+
+    # ------------------------------------------------------------------
+    # script, stylesheet, image, font, media — allowed through
+    # ------------------------------------------------------------------
 
     @pytest.mark.asyncio
-    async def test_mixed_subresources_and_document(self):
+    async def test_script_allowed_through(self):
+        """Out-of-scope <script src> is allowed (page rendering)."""
         config = self._make_config()
         page = self._make_mock_page()
         context = self._make_mock_context(page)
         session = self._make_session(config, context)
         await self._install_guard(session)
-        await self._trigger_subresource(session, "https://cdn.evil.com/app.js", "script")
-        await self._trigger_subresource(session, "https://img.evil.com/pixel.png", "image")
-        assert len(session.blocked_subresources) == 2
+        route = await self._trigger_resource(session, "https://cdn.evil.com/app.js", "script")
+        route.continue_.assert_called_once()
         assert session.violations == []
-        await self._trigger_subresource(session, "https://evil.com", "document")
-        assert len(session.violations) == 1
+        assert session.blocked_subresources == []
 
     @pytest.mark.asyncio
-    async def test_get_blocked_subresource_summary(self):
+    async def test_stylesheet_allowed_through(self):
         config = self._make_config()
         page = self._make_mock_page()
         context = self._make_mock_context(page)
         session = self._make_session(config, context)
         await self._install_guard(session)
-        await self._trigger_subresource(session, "https://cdn.evil.com/a.js", "script")
-        await self._trigger_subresource(session, "https://cdn.evil.com/b.js", "script")
-        await self._trigger_subresource(session, "https://img.evil.com/pixel.png", "image")
-        count, hosts = session.get_blocked_subresource_summary()
-        assert count == 3
-        assert "cdn.evil.com" in hosts
-        assert "img.evil.com" in hosts
-        assert len(hosts) == 2
+        route = await self._trigger_resource(session, "https://cdn.evil.com/style.css", "stylesheet")
+        route.continue_.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_image_allowed_through(self):
+        config = self._make_config()
+        page = self._make_mock_page()
+        context = self._make_mock_context(page)
+        session = self._make_session(config, context)
+        await self._install_guard(session)
+        route = await self._trigger_resource(session, "https://img.evil.com/pixel.png", "image")
+        route.continue_.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_font_allowed_through(self):
+        config = self._make_config()
+        page = self._make_mock_page()
+        context = self._make_mock_context(page)
+        session = self._make_session(config, context)
+        await self._install_guard(session)
+        route = await self._trigger_resource(session, "https://fonts.evil.com/roboto.woff2", "font")
+        route.continue_.assert_called_once()
+
+    # ------------------------------------------------------------------
+    # xhr / fetch — blocked by default
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_xhr_blocked_by_default(self):
+        """XHR to out-of-scope host is blocked (could be agent action)."""
+        config = self._make_config()
+        page = self._make_mock_page()
+        context = self._make_mock_context(page)
+        session = self._make_session(config, context)
+        await self._install_guard(session)
+        route = await self._trigger_resource(session, "https://api.evil.com/data", "xhr")
+        route.abort.assert_called_once()
+        assert len(session.blocked_subresources) == 1
+        assert session.blocked_subresources[0].resource_type == "xhr"
+
+    @pytest.mark.asyncio
+    async def test_fetch_blocked_by_default(self):
+        """Fetch to out-of-scope host is blocked by default."""
+        config = self._make_config()
+        page = self._make_mock_page()
+        context = self._make_mock_context(page)
+        session = self._make_session(config, context)
+        await self._install_guard(session)
+        route = await self._trigger_resource(session, "https://api.evil.com/data", "fetch")
+        route.abort.assert_called_once()
+
+    # ------------------------------------------------------------------
+    # passive_xhr_hosts allowlist
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_xhr_allowed_when_in_passive_hosts(self):
+        """XHR to an allowlisted host passes through."""
+        config = self._make_config(passive_xhr_hosts=["api.telemetry.com"])
+        page = self._make_mock_page()
+        context = self._make_mock_context(page)
+        session = self._make_session(config, context)
+        await self._install_guard(session)
+        route = await self._trigger_resource(session, "https://api.telemetry.com/beacon", "xhr")
+        route.continue_.assert_called_once()
+        assert session.blocked_subresources == []
+
+    @pytest.mark.asyncio
+    async def test_xhr_glob_pattern_allowlist(self):
+        """XHR to host matching glob pattern in passive_xhr_hosts passes."""
+        config = self._make_config(passive_xhr_hosts=["*.telemetry.com"])
+        page = self._make_mock_page()
+        context = self._make_mock_context(page)
+        session = self._make_session(config, context)
+        await self._install_guard(session)
+        route = await self._trigger_resource(session, "https://api.telemetry.com/beacon", "xhr")
+        route.continue_.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_xhr_still_blocked_when_not_in_allowlist(self):
+        """XHR to non-allowlisted host is still blocked even with passive_xhr_hosts set."""
+        config = self._make_config(passive_xhr_hosts=["*.telemetry.com"])
+        page = self._make_mock_page()
+        context = self._make_mock_context(page)
+        session = self._make_session(config, context)
+        await self._install_guard(session)
+        route = await self._trigger_resource(session, "https://evil.com/data", "xhr")
+        route.abort.assert_called_once()
+
+    # ------------------------------------------------------------------
+    # Mixed: allowlisted xhr passes, document still blocked
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_document_still_blocked_when_xhr_hosts_set(self):
+        """passive_xhr_hosts does NOT affect document-level blocking."""
+        config = self._make_config(passive_xhr_hosts=["evil.com"])
+        page = self._make_mock_page()
+        context = self._make_mock_context(page)
+        session = self._make_session(config, context)
+        await self._install_guard(session)
+        route = await self._trigger_resource(session, "https://evil.com", "document")
+        route.abort.assert_called_once()
+        assert len(session.violations) == 1
 
 
 class TestCrawlResultSubresourceFields:
