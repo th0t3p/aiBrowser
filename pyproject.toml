@@ -18,6 +18,7 @@ dependencies = [
     "lxml>=5.0",
     "click>=8.1",
     "typing-extensions>=4.10",
+    "cryptography>=41.0",
 ]
 
 [project.optional-dependencies]

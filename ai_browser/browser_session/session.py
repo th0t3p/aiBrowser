@@ -12,6 +12,8 @@ from urllib.parse import urlparse
 
 from playwright.async_api import async_playwright, Browser, BrowserContext, Page
 
+from ai_browser._scope import hostname_matches_scope
+
 from .models import BrowserSessionConfig, ProxyConfig, ScopeGuardError
 
 logger = logging.getLogger(__name__)
@@ -23,13 +25,17 @@ class BrowserSession:
     All traffic flows through the configured Burp Suite proxy so that aiScraper
     can capture and normalize everything from Burp's proxy history.
 
-    Usage::
+    Because Playwright route handlers run as background tasks, exceptions raised
+    inside them are NOT propagated to the caller. Instead, scope violations are
+    recorded in ``session.violations`` and can be checked explicitly::
 
         config = BrowserSessionConfig(authorized_hostname="example.com")
         async with BrowserSession(config) as session:
             page = await session.new_page()
-            await page.goto("https://example.com")
-            # ... any attempt to reach other hostnames raises ScopeGuardError
+            await session.goto(page, "https://example.com")
+            # Check for scope violations after navigation:
+            session.check_violations()  # raises ScopeGuardError if any occurred
+            # Or inspect: if session.violations: ...
     """
 
     def __init__(self, config: BrowserSessionConfig):
@@ -40,6 +46,8 @@ class BrowserSession:
         self._storage_file: Path = self._resolve_storage_file()
         self._temp_dir: Optional[tempfile.TemporaryDirectory] = None
         self._route_handlers: list = []
+        self.violations: list[ScopeGuardError] = []
+        self._violation_event: Optional[asyncio.Event] = None  # created lazily when event loop is running
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -121,31 +129,69 @@ class BrowserSession:
     # ------------------------------------------------------------------
 
     async def new_page(self) -> Page:
-        """Create a new page, injecting the hostname scope guard."""
+        """Create a new page, injecting the hostname scope guard.
+
+        Raises ScopeGuardError if any scope violations were recorded
+        during page setup (e.g. from pre-existing persisted state triggering
+        background requests).
+        """
         if not self._context:
             raise RuntimeError("BrowserSession not started. Call start() or use as context manager.")
         page = await self._context.new_page()
         await self._install_scope_guard(page)
+        self.check_violations()
         return page
+
+    async def goto(self, page: Page, url: str, **kwargs) -> None:
+        """Navigate a page to *url*, then check for scope violations.
+
+        This wraps ``page.goto()`` and calls ``check_violations()`` afterwards
+        so that any blocked out-of-scope requests (triggered by the page load)
+        are surfaced to the caller.  Additional keyword arguments are forwarded
+        to ``page.goto()`` (timeout, wait_until, etc.).
+        """
+        await page.goto(url, **kwargs)
+        self.check_violations()
+
+    def check_violations(self) -> None:
+        """Raise the most recent ScopeGuardError if any scope violations occurred.
+
+        Raises:
+            ScopeGuardError: The most recent violation, if any were recorded.
+        """
+        if self.violations:
+            raise self.violations[-1]
+
+    def _get_violation_event(self) -> asyncio.Event:
+        """Lazily create and return the violation event (requires a running event loop)."""
+        if self._violation_event is None:
+            self._violation_event = asyncio.Event()
+        return self._violation_event
 
     def _on_new_page(self, page: Page) -> None:
         """Callback: when a new page/tab is created, inject the scope guard."""
         asyncio.ensure_future(self._install_scope_guard(page))
 
     async def _install_scope_guard(self, page: Page) -> None:
-        """Intercept all requests and navigations; abort any that leave the authorized hostname."""
-        authorized = self.config.authorized_hostname.lower().strip()
+        """Intercept all requests and navigations; abort any that leave the authorized hostname.
+
+        Uses glob-pattern matching so ``*.example.com`` covers all subdomains.
+        """
+        authorized = self.config.authorized_hostname
 
         async def _guard(route):
             url = route.request.url
             hostname = urlparse(url).hostname or ""
-            if hostname.lower() != authorized:
+            if not hostname_matches_scope(hostname, authorized):
                 logger.warning("Scope guard blocked navigation to %s (hostname=%s)", url, hostname)
-                await route.abort()
-                raise ScopeGuardError(
+                violation = ScopeGuardError(
                     attempted_hostname=hostname,
                     authorized_hostname=self.config.authorized_hostname,
                 )
+                self.violations.append(violation)
+                self._get_violation_event().set()
+                await route.abort()
+                return
             await route.continue_()
 
         # Route all requests through the guard
@@ -157,16 +203,19 @@ class BrowserSession:
                 url = frame.url
                 if url and url != "about:blank":
                     hostname = urlparse(url).hostname or ""
-                    if hostname.lower() != authorized:
+                    if not hostname_matches_scope(hostname, authorized):
                         logger.warning(
                             "Scope guard detected navigation to %s via client-side redirect",
                             url,
                         )
-                        await page.goto("about:blank")
-                        raise ScopeGuardError(
+                        violation = ScopeGuardError(
                             attempted_hostname=hostname,
                             authorized_hostname=self.config.authorized_hostname,
                         )
+                        self.violations.append(violation)
+                        self._get_violation_event().set()
+                        await page.goto("about:blank")
+                        return
 
         page.on("framenavigated", lambda frame: asyncio.ensure_future(_guard_navigation(frame)))
 
@@ -225,20 +274,49 @@ class BrowserSession:
     def _calculate_cert_spki_fingerprint(self) -> str:
         """Calculate the SPKI fingerprint of the Burp CA certificate for Chromium.
 
-        This is a simplified approach; for production use, import the cert
-        into the OS trust store instead.
+        Extracts the SubjectPublicKeyInfo substructure, SHA-256 hashes it,
+        and returns the base64-encoded result. Uses the ``cryptography`` library
+        for correct ASN.1 parsing. Falls back to whole-cert hash if unavailable.
         """
         import hashlib
         import base64
 
         cert_bytes = self.config.ca_cert_path.read_bytes()  # type: ignore[union-attr]
-        # For a PEM cert, try to extract the DER body
-        if cert_bytes.startswith(b"-----"):
-            b64_body = cert_bytes.decode().split("-----")[2].replace("\n", "").replace("\r", "")
-            cert_bytes = base64.b64decode(b64_body)
 
-        sha256 = hashlib.sha256(cert_bytes).digest()
-        return base64.b64encode(sha256).decode()
+        try:
+            from cryptography import x509
+            from cryptography.hazmat.primitives import serialization
+
+            # Try PEM first, then DER
+            try:
+                cert = x509.load_pem_x509_certificate(cert_bytes)
+            except Exception:
+                cert = x509.load_der_x509_certificate(cert_bytes)
+
+            # Extract just the SubjectPublicKeyInfo (not the whole certificate)
+            spki_der = cert.public_key().public_bytes(
+                serialization.Encoding.DER,
+                serialization.PublicFormat.SubjectPublicKeyInfo,
+            )
+            sha256 = hashlib.sha256(spki_der).digest()
+            return base64.b64encode(sha256).decode()
+
+        except ImportError:
+            logger.warning(
+                "cryptography library not installed; falling back to whole-cert hash "
+                "(install with: pip install cryptography)"
+            )
+            # Fallback: hash the whole DER certificate (incorrect but functional)
+            if cert_bytes.startswith(b"-----"):
+                b64_body = (
+                    cert_bytes.decode()
+                    .split("-----")[2]
+                    .replace("\n", "")
+                    .replace("\r", "")
+                )
+                cert_bytes = base64.b64decode(b64_body)
+            sha256 = hashlib.sha256(cert_bytes).digest()
+            return base64.b64encode(sha256).decode()
 
     # ------------------------------------------------------------------
     # Helpers

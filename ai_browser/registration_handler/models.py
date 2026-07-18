@@ -1,9 +1,13 @@
 """Pydantic models for registration_handler."""
 
+import logging
+import secrets
 from pathlib import Path
 from typing import Optional, Callable, Awaitable
 
 from pydantic import BaseModel, Field
+
+logger = logging.getLogger(__name__)
 
 
 class IMAPConfig(BaseModel):
@@ -53,8 +57,9 @@ class RegistrationConfig(BaseModel):
         "(e.g. test+targetname@mydomain.com).",
     )
     password: str = Field(
-        default="Test1234!@#$",
-        description="Password to use for registration.",
+        default_factory=lambda: secrets.token_urlsafe(16),
+        description="Password to use for registration. A random password is generated "
+        "per instance unless explicitly provided.",
     )
     name: Optional[str] = Field(
         default="Test User",

@@ -79,6 +79,15 @@ class ExplorerConfig(BaseModel):
         description="Delay between actions to avoid hammering the target.",
     )
 
+    # Safety: by default, borderline actions require human confirmation.
+    # Set allow_unattended=True to let the agent operate fully autonomously.
+    allow_unattended: bool = Field(
+        default=False,
+        description="If True, borderline actions (save/confirm/update/submit) proceed "
+        "without human confirmation. Default False (fail-closed: denied unless a "
+        "confirmation callback approves them).",
+    )
+
     # Denylist patterns for destructive actions
     destructive_patterns: list[str] = Field(
         default_factory=lambda: [

@@ -14,6 +14,7 @@ import anthropic
 from playwright.async_api import Page
 
 from ai_browser.browser_session import BrowserSession
+from ai_browser._scope import page_url_matches_scope
 
 from .models import (
     ActionType,
@@ -23,6 +24,12 @@ from .models import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _escape_css_string(value: str) -> str:
+    """Escape special characters in a string for safe use in CSS attribute selectors."""
+    return value.replace("\\", "\\\\").replace("'", "\\'").replace("\n", "\\n")
+
 
 # System prompt instructing Claude how to decide actions from an accessibility tree
 EXPLORER_SYSTEM_PROMPT = """You are a web exploration agent. Your goal is to discover all navigable
@@ -249,7 +256,14 @@ class AgentExplorer:
     async def _execute_action(
         self, session: BrowserSession, page: Page, action_raw: dict
     ) -> AuditLogEntry:
-        """Execute the parsed action on the page and return an audit entry."""
+        """Execute the parsed action on the page and return an audit entry.
+
+        Defense-in-depth: verifies the page's hostname against authorized_hostname
+        before dispatching any click/fill/submit, independent of BrowserSession's guard.
+        """
+        # Independent scope verification — defense in depth
+        self._verify_scope(page)
+
         action_type = action_raw.get("action", "")
         target = action_raw.get("target", "")
         value = action_raw.get("value", "")
@@ -293,18 +307,31 @@ class AgentExplorer:
         return entry
 
     async def _do_click(self, page: Page, target: str) -> bool:
-        """Try to click an element by accessible name, text content, or role."""
+        """Try to click an element by accessible name, text content, or role.
+
+        Before clicking, the *actual* resolved element text is checked against
+        the denylist — even if the LLM's self-report already passed _is_denied().
+        This prevents prompt-injection or model-paraphrasing bypasses.
+        """
+        escaped = _escape_css_string(target)
         selectors = [
-            f"text={target}",
-            f"[aria-label='{target}']",
-            f"button:has-text('{target}')",
-            f"a:has-text('{target}')",
-            f"[role='{target}']",
+            f"text={escaped}",
+            f"[aria-label='{escaped}']",
+            f"button:has-text('{escaped}')",
+            f"a:has-text('{escaped}')",
+            f"[role='{escaped}']",
         ]
         for selector in selectors:
             try:
                 element = await page.query_selector(selector)
                 if element and await element.is_visible():
+                    # Defense-in-depth: check actual element text before clicking
+                    if await self._element_matches_denylist(element):
+                        logger.warning(
+                            "Click blocked: element text matches denylist (selector=%s)",
+                            selector,
+                        )
+                        return False
                     await element.click()
                     await page.wait_for_load_state("networkidle", timeout=5000)
                     return True
@@ -314,11 +341,12 @@ class AgentExplorer:
 
     async def _do_fill(self, page: Page, target: str, value: str) -> bool:
         """Try to fill an input field by name, placeholder, or label."""
+        escaped = _escape_css_string(target)
         selectors = [
-            f"input[name='{target}']",
-            f"input[placeholder*='{target}']",
-            f"input[aria-label='{target}']",
-            f"[aria-label='{target}']",
+            f"input[name='{escaped}']",
+            f"input[placeholder*='{escaped}']",
+            f"input[aria-label='{escaped}']",
+            f"[aria-label='{escaped}']",
         ]
         for selector in selectors:
             try:
@@ -345,24 +373,53 @@ class AgentExplorer:
         return False
 
     async def _do_submit(self, page: Page, target: str) -> bool:
-        """Try to submit a form."""
+        """Try to submit a form.
+
+        Before submitting, the submit button's actual text is checked against
+        the denylist for defense-in-depth — even if the LLM's self-report passed.
+        """
         if target:
             form = await page.query_selector(target)
             if form:
+                # Check the form element or its submit button for destructive text
+                submit_btn = await page.query_selector(
+                    f"{target} button[type='submit'], {target} input[type='submit']"
+                )
+                btn_to_check = submit_btn or form
+                if await self._element_matches_denylist(btn_to_check):
+                    logger.warning("Submit blocked: form element text matches denylist")
+                    return False
                 await form.evaluate("el => el.submit()")
                 await page.wait_for_load_state("networkidle", timeout=5000)
                 return True
 
         # Try pressing Enter on the active element
         try:
+            # Check focused element before pressing Enter
+            focused = await page.evaluate(
+                "() => document.activeElement?.innerText || ''"
+            )
+            if focused:
+                for pattern in self.config.destructive_patterns:
+                    if re.search(pattern, focused):
+                        logger.warning(
+                            "Submit blocked: focused element text matches denylist"
+                        )
+                        return False
             await page.keyboard.press("Enter")
             await page.wait_for_load_state("networkidle", timeout=5000)
             return True
         except Exception:
             pass
 
-        # Generic form submit
+        # Generic form submit — check submit button text first
         try:
+            submit_btn = await page.query_selector(
+                "button[type='submit'], input[type='submit']"
+            )
+            if submit_btn and await self._element_matches_denylist(submit_btn):
+                logger.warning("Submit blocked: submit button text matches denylist")
+                return False
             form = await page.query_selector("form")
             if form:
                 await form.evaluate("el => el.submit()")
@@ -388,7 +445,12 @@ class AgentExplorer:
     # ------------------------------------------------------------------
 
     def _is_denied(self, action: dict) -> bool:
-        """Check if the proposed action matches any destructive patterns."""
+        """Check if the proposed action matches any destructive patterns.
+
+        This checks the LLM's self-reported target/value/reasoning text.
+        For defense-in-depth, _do_click and _do_submit also verify the
+        *actual* resolved DOM element text before acting.
+        """
         target = (action.get("target") or "").lower()
         value = (action.get("value") or "").lower()
         reasoning = (action.get("reasoning") or "").lower()
@@ -404,25 +466,58 @@ class AgentExplorer:
                 return True
         return False
 
+    async def _element_matches_denylist(self, element) -> bool:
+        """Check the *actual* resolved DOM element text against destructive patterns.
+
+        This is the runtime safety check — it inspects the real element's
+        visible text and aria-label, regardless of what the LLM reported.
+
+        Returns True if the element should be blocked (matches a destructive pattern).
+        """
+        try:
+            inner_text = (await element.inner_text() or "").lower()
+            aria_label = (await element.get_attribute("aria-label") or "").lower()
+            combined = f"{inner_text} {aria_label}"
+
+            for pattern in self.config.destructive_patterns:
+                if re.search(pattern, combined):
+                    logger.warning(
+                        "Denylist ELEMENT match: pattern '%s' matched in element '%s'",
+                        pattern,
+                        combined[:100],
+                    )
+                    return True
+        except Exception as exc:
+            logger.debug("Failed to check element denylist: %s", exc)
+        return False
+
     def _needs_confirmation(self, action: dict) -> bool:
         """Determine if the action falls into a borderline category needing human approval.
 
-        Currently, all actions pass through if they clear the denylist. Override
-        this method or set a confirmation callback for stricter policies.
-        """
-        if self._confirmation_callback is None:
-            return False
+        Default behavior (fail-closed): if allow_unattended is False and the action
+        matches a borderline pattern, confirmation is required. If no callback is
+        configured, the action will be denied by _request_confirmation().
 
-        # Check for borderline patterns: "save", "confirm", "update settings"
+        Borderline patterns: save, confirm, update, submit — actions that modify
+        state but aren't overtly destructive.
+        """
         borderline = [r"(?i)\bsave\b", r"(?i)\bconfirm\b", r"(?i)\bupdate\b", r"(?i)\bsubmit\b"]
         target = (action.get("target") or "").lower()
+
         for pattern in borderline:
             if re.search(pattern, target):
+                # If unattended mode is explicitly enabled, skip confirmation
+                if self.config.allow_unattended:
+                    return False
                 return True
         return False
 
     async def _request_confirmation(self, action: dict) -> bool:
-        """Request human confirmation for a potentially sensitive action."""
+        """Request human confirmation for a potentially sensitive action.
+
+        Fail-closed default: if no confirmation callback is configured, deny the
+        action. Callers must either set allow_unattended=True or provide a callback.
+        """
         if self._confirmation_callback:
             agent_action = AgentAction(
                 action_type=ActionType(action.get("action", "click")),
@@ -431,7 +526,14 @@ class AgentExplorer:
                 reasoning=action.get("reasoning", ""),
             )
             return await self._confirmation_callback(agent_action)
-        return True
+        # Fail-closed: no callback means deny
+        logger.warning(
+            "Action '%s' on '%s' denied: no confirmation callback configured "
+            "and allow_unattended is False.",
+            action.get("action"),
+            action.get("target"),
+        )
+        return False
 
     def set_confirmation_callback(self, callback: Callable[[AgentAction], Awaitable[bool]]) -> None:
         """Set a callback that is invoked when an action needs human confirmation.
@@ -440,6 +542,23 @@ class AgentExplorer:
         proceed or False to skip.
         """
         self._confirmation_callback = callback
+
+    def _verify_scope(self, page: Page) -> None:
+        """Verify the current page's hostname is within the authorized scope.
+
+        Independent defense-in-depth check — separate from BrowserSession's route-level
+        guard. Uses glob-pattern matching so ``*.example.com`` matches subdomains.
+
+        Raises:
+            ScopeError: If the page URL's hostname does not match the authorized scope.
+        """
+        from ai_browser._scope import ScopeError
+
+        if not page_url_matches_scope(page.url, self.config.authorized_hostname):
+            raise ScopeError(
+                f"AgentExplorer scope violation: page at '{page.url}' "
+                f"is outside authorized scope '{self.config.authorized_hostname}'"
+            )
 
     # ------------------------------------------------------------------
     # Audit logging

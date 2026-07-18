@@ -17,6 +17,12 @@ from .models import CaptchaDetected, IMAPConfig, RegistrationConfig
 
 logger = logging.getLogger(__name__)
 
+
+def _escape_css_string(value: str) -> str:
+    """Escape special characters in a string for safe use in CSS attribute selectors."""
+    return value.replace("\\", "\\\\").replace("'", "\\'").replace("\n", "\\n")
+
+
 # Common CAPTCHA detection patterns
 CAPTCHA_PATTERNS = [
     # reCAPTCHA
@@ -53,6 +59,7 @@ class RegistrationHandler:
         self._current_page: Optional[Page] = None
         self._paused: bool = False
         self._captcha_info: Optional[CaptchaDetected] = None
+        self._signup_submitted_at: float = 0.0  # watermark for IMAP filtering
 
     # ------------------------------------------------------------------
     # Main registration flow
@@ -82,7 +89,8 @@ class RegistrationHandler:
         # Step 4: Check for CAPTCHA after form fill (some CAPTCHAs appear on submit)
         await self._check_captcha(page, "signup_submit")
 
-        # Step 5: Submit the form
+        # Step 5: Submit the form (record watermark before submitting)
+        self._signup_submitted_at = asyncio.get_event_loop().time()
         await self._submit_form(page)
 
         # Step 6: Wait a moment, then check for CAPTCHA again
@@ -91,7 +99,9 @@ class RegistrationHandler:
 
         # Step 7: Poll email inbox for confirmation link
         if self.config.imap_config:
-            confirmation_link = await self._poll_inbox_for_link()
+            from urllib.parse import urlparse
+            target_domain = urlparse(self.config.signup_url).hostname or ""
+            confirmation_link = await self._poll_inbox_for_link(target_domain)
             if confirmation_link:
                 logger.info("Confirmation link found: %s", confirmation_link)
                 await page.goto(confirmation_link, timeout=30_000)
@@ -125,7 +135,9 @@ class RegistrationHandler:
 
         # Continue with email confirmation
         if self.config.imap_config:
-            confirmation_link = await self._poll_inbox_for_link()
+            from urllib.parse import urlparse
+            target_domain = urlparse(self.config.signup_url).hostname or ""
+            confirmation_link = await self._poll_inbox_for_link(target_domain)
             if confirmation_link:
                 await self._current_page.goto(confirmation_link, timeout=30_000)
                 await self._current_page.wait_for_load_state("networkidle", timeout=15_000)
@@ -251,8 +263,8 @@ class RegistrationHandler:
     # IMAP polling for confirmation email
     # ------------------------------------------------------------------
 
-    async def _poll_inbox_for_link(self) -> Optional[str]:
-        """Poll the configured IMAP inbox for a confirmation email and extract the first link."""
+    async def _poll_inbox_for_link(self, target_domain="") -> Optional[str]:
+        """Poll the configured IMAP inbox for a confirmation email and extract the link."""
         if not self.config.imap_config:
             return None
 
@@ -265,7 +277,7 @@ class RegistrationHandler:
         deadline = asyncio.get_event_loop().time() + self.config.email_poll_timeout_seconds
 
         while asyncio.get_event_loop().time() < deadline:
-            link = await self._check_inbox_for_new_email()
+            link = await self._check_inbox_for_new_email(target_domain)
             if link:
                 return link
             await asyncio.sleep(self.config.email_poll_interval_seconds)
@@ -273,8 +285,8 @@ class RegistrationHandler:
         logger.warning("Timed out waiting for confirmation email")
         return None
 
-    async def _check_inbox_for_new_email(self) -> Optional[str]:
-        """Check the IMAP inbox for a recent unread email and extract the first HTTP link."""
+    async def _check_inbox_for_new_email(self, target_domain=""):
+        """Check the IMAP inbox for a recent unread email matching the target domain."""
         try:
             import aioimaplib
 
@@ -313,8 +325,27 @@ class RegistrationHandler:
 
             msg = email.message_from_bytes(raw_email)
 
+            # Filter by sender domain: skip emails not from the target domain
+            if target_domain:
+                from_header = msg.get("From", "")
+                if target_domain.lower() not in from_header.lower():
+                    logger.debug("Skipping email from %s (not from %s)", from_header, target_domain)
+                    return None
+
+            # Filter by date watermark: skip emails received before signup was submitted
+            date_str = msg.get("Date", "")
+            if date_str and self._signup_submitted_at > 0:
+                try:
+                    from email.utils import parsedate_to_datetime
+                    msg_date = parsedate_to_datetime(date_str)
+                    if msg_date.timestamp() < self._signup_submitted_at:
+                        logger.debug("Skipping old email from %s", date_str)
+                        return None
+                except Exception:
+                    pass  # unparseable date, proceed anyway
+
             # Extract links from the email body
-            link = self._extract_link_from_email(msg)
+            link = self._extract_link_from_email(msg, target_domain)
             return link
 
         except ImportError:
@@ -324,8 +355,13 @@ class RegistrationHandler:
             logger.error("IMAP check failed: %s", exc)
             return None
 
-    def _extract_link_from_email(self, msg: email.message.Message) -> Optional[str]:
-        """Extract the first HTTP(S) link from an email's text or HTML body."""
+    def _extract_link_from_email(self, msg, target_domain=""):
+        """Extract the confirmation link from an email body.
+
+        Prioritizes links whose path/query contains confirmation signals
+        (confirm, verify, activate, token=, code=) or that match the target domain.
+        Falls back to the first non-image HTTP link as a last resort.
+        """
         body_text = ""
 
         if msg.is_multipart():
@@ -350,15 +386,37 @@ class RegistrationHandler:
 
         # Find all http/https links
         links = re.findall(r'https?://[^\s<>"\')\]]+', body_text)
-        if links:
-            # Return the first non-tracking, non-image link
-            for link in links:
-                # Skip common tracking pixels and image links
-                if not re.search(r'\.(png|jpg|jpeg|gif|svg|css|js)(\?|$)', link, re.IGNORECASE):
-                    return link.rstrip(".,;:'")
-            return links[0].rstrip(".,;:'")
+        if not links:
+            return None
 
-        return None
+        clean_links = [link.rstrip(".,;:'") for link in links]
+
+        # Skip image/tracking links
+        non_asset_links = [
+            link for link in clean_links
+            if not re.search(r'\.(png|jpg|jpeg|gif|svg|css|js)(\?|$)', link, re.IGNORECASE)
+        ]
+        if not non_asset_links:
+            return clean_links[0]
+
+        # Priority 1: links with confirmation signals in path/query
+        confirm_patterns = [r'confirm', r'verify', r'activate', r'token=', r'code=']
+        for link in non_asset_links:
+            if any(re.search(p, link, re.IGNORECASE) for p in confirm_patterns):
+                logger.debug("Found confirmation link: %s", link)
+                return link
+
+        # Priority 2: links matching the target domain
+        if target_domain:
+            from urllib.parse import urlparse
+            for link in non_asset_links:
+                parsed = urlparse(link)
+                if parsed.hostname and target_domain.lower() in parsed.hostname.lower():
+                    logger.debug("Found same-domain link: %s", link)
+                    return link
+
+        # Priority 3: first non-asset link (fallback)
+        return non_asset_links[0]
 
     @property
     def is_paused(self) -> bool:
