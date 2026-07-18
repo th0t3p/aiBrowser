@@ -14,6 +14,7 @@ from urllib.robotparser import RobotFileParser
 from bs4 import BeautifulSoup
 
 from ai_browser.browser_session import BrowserSession, BrowserSessionConfig
+from ai_browser._scope import hostname_matches_scope
 
 from .models import CrawlConfig, CrawlResult, DiscoveredEndpoint, DiscoveryMethod
 
@@ -95,7 +96,7 @@ class Crawler:
 
     async def _fetch_robots_txt(self) -> None:
         """Fetch and parse robots.txt for the target hostname."""
-        robots_url = f"https://{self.config.authorized_hostname}/robots.txt"
+        robots_url = f"https://{self.config.seed_hostname}/robots.txt"
         try:
             page = await self._session.new_page()  # type: ignore[union-attr]
             response = await page.goto(robots_url, timeout=self.config.timeout_ms)
@@ -111,7 +112,7 @@ class Crawler:
                     if line.startswith("Allow:") or line.startswith("Disallow:"):
                         path = line.split(":", 1)[1].strip()
                         if path and path != "/" and not path.startswith("*"):
-                            full_url = urljoin(f"https://{self.config.authorized_hostname}", path)
+                            full_url = urljoin(f"https://{self.config.seed_hostname}", path)
                             self._result.add_endpoint(full_url, DiscoveryMethod.ROBOTS_TXT)
 
                 logger.info("robots.txt parsed: %d entries", len(self._result.endpoints))
@@ -124,15 +125,22 @@ class Crawler:
     # ------------------------------------------------------------------
 
     async def _fetch_sitemap(self) -> None:
-        """Fetch and parse sitemap.xml (and sitemap index files) for the target."""
-        sitemap_url = f"https://{self.config.authorized_hostname}/sitemap.xml"
+        """Fetch and parse sitemap.xml (and sitemap index files) for the target.
+
+        TODO: When crawling across multiple hostnames under a wildcard scope
+        (e.g. seed=developers.tiktok.com, scope=*.tiktok.com), robots.txt and
+        sitemap.xml are currently only fetched for seed_hostname. A follow-up
+        should consider re-fetching them per newly-encountered in-scope hostname,
+        with appropriate politeness controls to avoid hammering.
+        """
+        sitemap_url = f"https://{self.config.seed_hostname}/sitemap.xml"
         await self._parse_sitemap(sitemap_url)
 
         # Also try common alternative sitemap paths
         alt_paths = [
-            f"https://{self.config.authorized_hostname}/sitemap_index.xml",
-            f"https://{self.config.authorized_hostname}/sitemap-index.xml",
-            f"https://{self.config.authorized_hostname}/sitemap.php",
+            f"https://{self.config.seed_hostname}/sitemap_index.xml",
+            f"https://{self.config.seed_hostname}/sitemap-index.xml",
+            f"https://{self.config.seed_hostname}/sitemap.php",
         ]
         for alt_url in alt_paths:
             try:
@@ -162,7 +170,7 @@ class Crawler:
                 loc = sm.find("loc")
                 if loc and loc.text:
                     parsed = urlparse(loc.text)
-                    if parsed.hostname == self.config.authorized_hostname:
+                    if parsed.hostname and hostname_matches_scope(parsed.hostname, self.config.scope_pattern):
                         await self._parse_sitemap(loc.text)
 
             # Extract URLs
@@ -246,9 +254,8 @@ class Crawler:
     # ------------------------------------------------------------------
 
     def _extract_links(self, soup: BeautifulSoup, current_url: str, depth: int) -> list[str]:
-        """Extract same-hostname <a href> links from a page."""
+        """Extract in-scope <a href> links from a page (glob-aware)."""
         links: list[str] = []
-        base_url = f"https://{self.config.authorized_hostname}"
 
         for a_tag in soup.find_all("a", href=True):
             href = a_tag["href"]
@@ -258,7 +265,7 @@ class Crawler:
             absolute = urljoin(current_url, href)
             parsed = urlparse(absolute)
 
-            if parsed.hostname != self.config.authorized_hostname:
+            if not parsed.hostname or not hostname_matches_scope(parsed.hostname, self.config.scope_pattern):
                 continue
             # Skip non-http schemes
             if parsed.scheme not in ("http", "https"):
@@ -291,7 +298,7 @@ class Crawler:
         """)
         for js_url in linked_scripts:
             parsed = urlparse(js_url)
-            if parsed.hostname and parsed.hostname != self.config.authorized_hostname:
+            if parsed.hostname and not hostname_matches_scope(parsed.hostname, self.config.scope_pattern):
                 continue
             try:
                 js_page = await self._session.new_page()  # type: ignore[union-attr]
@@ -313,17 +320,17 @@ class Crawler:
                     continue
                 if path.startswith("http"):
                     parsed = urlparse(path)
-                    if parsed.hostname and parsed.hostname != self.config.authorized_hostname:
+                    if parsed.hostname and not hostname_matches_scope(parsed.hostname, self.config.scope_pattern):
                         continue
                     full_url = path
                 else:
-                    # Relative path — resolve against the authorized hostname
+                    # Relative path — resolve against the seed hostname
                     if path.startswith("/"):
-                        full_url = urljoin(f"https://{self.config.authorized_hostname}", path)
+                        full_url = urljoin(f"https://{self.config.seed_hostname}", path)
                     else:
                         # Might not be a URL-like path at all; skip unless it looks like one
                         if re.search(r"[a-zA-Z]+/", path) or "." in path:
-                            full_url = urljoin(f"https://{self.config.authorized_hostname}", f"/{path}")
+                            full_url = urljoin(f"https://{self.config.seed_hostname}", f"/{path}")
                         else:
                             continue
 

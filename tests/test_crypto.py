@@ -18,7 +18,7 @@ class TestSPKIFingerprint:
         """Generate a self-signed cert and return PEM bytes using cryptography."""
         from cryptography import x509
         from cryptography.x509.oid import NameOID
-        from cryptography.hazmat.primitives import hashes
+        from cryptography.hazmat.primitives import hashes, serialization
         from cryptography.hazmat.primitives.asymmetric import rsa
         from cryptography.hazmat.backends import default_backend
         import datetime
@@ -35,9 +35,9 @@ class TestSPKIFingerprint:
             .issuer_name(issuer)
             .public_key(key.public_key())
             .serial_number(x509.random_serial_number())
-            .not_valid_before(datetime.datetime.utcnow())
+            .not_valid_before(datetime.datetime.now(datetime.UTC))
             .not_valid_after(
-                datetime.datetime.utcnow() + datetime.timedelta(days=1)
+                datetime.datetime.now(datetime.UTC) + datetime.timedelta(days=1)
             )
             .add_extension(
                 x509.BasicConstraints(ca=True, path_length=None),

@@ -5,7 +5,7 @@ from enum import Enum
 from typing import Optional
 from urllib.parse import urlparse
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class DiscoveryMethod(str, Enum):
@@ -45,13 +45,28 @@ class DiscoveredEndpoint(BaseModel):
 
 
 class CrawlConfig(BaseModel):
-    """Configuration for the deterministic crawler."""
+    """Configuration for the deterministic crawler.
+
+    ``seed_hostname`` is the concrete, resolvable hostname used to construct
+    fetch URLs (robots.txt, sitemap.xml). It must be a real host, not a glob.
+
+    ``scope_pattern`` is a glob (e.g. ``*.tiktok.com``) that determines which
+    discovered hostnames are in-scope to follow. Defaults to ``seed_hostname``
+    (exact match) when not set.
+    """
 
     start_url: str = Field(
         ..., description="The starting URL for the crawl."
     )
-    authorized_hostname: str = Field(
-        ..., description="Only URLs on this hostname are crawled."
+    seed_hostname: str = Field(
+        ...,
+        description="Concrete hostname to start crawling from, e.g. 'developers.tiktok.com'. "
+        "Must be a real resolvable host, not a glob pattern.",
+    )
+    scope_pattern: str = Field(
+        default="",
+        description="Glob pattern for which discovered hostnames are in-scope to follow, "
+        "e.g. '*.tiktok.com'. Defaults to seed_hostname (exact match) if not set.",
     )
     max_depth: int = Field(default=3, ge=0, le=20)
     max_pages: int = Field(default=50, ge=1, le=500)
@@ -70,6 +85,13 @@ class CrawlConfig(BaseModel):
         default=None,
         description="Custom User-Agent header. If unset, uses browser default.",
     )
+
+    @model_validator(mode="after")
+    def _default_scope_pattern(self) -> "CrawlConfig":
+        """Default scope_pattern to seed_hostname when left empty."""
+        if not self.scope_pattern:
+            self.scope_pattern = self.seed_hostname
+        return self
 
 
 class CrawlResult(BaseModel):

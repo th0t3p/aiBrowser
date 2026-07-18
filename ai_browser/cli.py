@@ -36,6 +36,10 @@ AUTHORIZATION_REMINDER = """
 ║  All traffic is proxied through Burp Suite (127.0.0.1:8080) ║
 ║  for capture via aiScraper. This tool does NOT log traffic   ║
 ║  itself — Burp Suite is the source of truth.                ║
+║                                                              ║
+║  --scope accepts glob patterns (e.g. '*.tiktok.com') to      ║
+║  follow links across subdomains. Defaults to exact-match     ║
+║  on the seed hostname.                                       ║
 ╚══════════════════════════════════════════════════════════════╝
 """
 
@@ -58,6 +62,12 @@ def main(ctx: click.Context):
     is_flag=True,
     default=False,
     help="Confirm you have authorization to test this hostname. REQUIRED.",
+)
+@click.option(
+    "--scope",
+    default=None,
+    help="Glob pattern for in-scope hostnames (e.g. '*.tiktok.com'). "
+    "Defaults to the seed hostname (exact match only) if not provided.",
 )
 @click.option(
     "--proxy-server",
@@ -166,6 +176,7 @@ def crawl(
     ctx: click.Context,
     hostname: str,
     authorized: bool,
+    scope: Optional[str],
     proxy_server: str,
     max_depth: int,
     max_pages: int,
@@ -202,10 +213,22 @@ def crawl(
     click.echo(AUTHORIZATION_REMINDER)
 
     start_url = f"https://{hostname}"
+    scope_pattern = scope or hostname
+
+    # If --scope is provided, warn if the seed hostname doesn't match
+    if scope and hostname != scope:
+        from ai_browser._scope import hostname_matches_scope
+        if not hostname_matches_scope(hostname, scope):
+            click.echo(
+                f"⚠ Warning: seed hostname '{hostname}' does not match "
+                f"scope pattern '{scope}'. The crawl will start outside its "
+                f"own declared scope.",
+                err=True,
+            )
 
     # Build browser session config
     session_config = BrowserSessionConfig(
-        authorized_hostname=hostname,
+        authorized_hostname=scope_pattern,
         proxy=ProxyConfig(server=proxy_server),
         headless=headless,
         storage_dir=Path(storage_dir),
@@ -215,7 +238,8 @@ def crawl(
     # Build crawl config
     crawl_config = CrawlConfig(
         start_url=start_url,
-        authorized_hostname=hostname,
+        seed_hostname=hostname,
+        scope_pattern=scope_pattern,
         max_depth=max_depth,
         max_pages=max_pages,
     )
@@ -238,6 +262,7 @@ def crawl(
             email_timeout=email_timeout,
             output_file=output,
             hostname=hostname,
+            scope_pattern=scope_pattern,
         )
     )
 
@@ -258,6 +283,7 @@ async def _run_crawl(
     email_timeout: int,
     output_file: Optional[str],
     hostname: str,
+    scope_pattern: str,
 ) -> None:
     """Run the full crawl pipeline."""
 
@@ -276,7 +302,7 @@ async def _run_crawl(
         if run_agent and anthropic_api_key:
             click.echo(f"\n[Phase 2] Running agent explorer on {hostname}...")
             explorer_config = ExplorerConfig(
-                authorized_hostname=hostname,
+                authorized_hostname=scope_pattern,
                 anthropic_api_key=anthropic_api_key,
             )
             explorer = AgentExplorer(explorer_config)
