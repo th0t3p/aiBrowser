@@ -215,7 +215,12 @@ class Crawler:
             await asyncio.sleep(self.config.request_delay_ms / 1000.0)
 
     async def _crawl_page(self, url: str, depth: int, queue: deque) -> None:
-        """Crawl a single page: extract links and JS endpoints."""
+        """Crawl a single page: extract links and JS endpoints.
+
+        Out-of-scope sub-resources (scripts, images, fonts loaded from external
+        CDNs) are blocked by the scope guard but do NOT halt the crawl — they are
+        recorded as BlockedSubresource entries and tallied in the result.
+        """
         if self._result.total_pages_crawled >= self.config.max_pages:
             return
 
@@ -225,6 +230,20 @@ class Crawler:
             if not response or not response.ok:
                 await page.close()
                 return
+
+            # Check for blocked sub-resources from this page load
+            sub_count, sub_hosts = self._session.get_blocked_subresource_summary()  # type: ignore[union-attr]
+            if sub_count > 0:
+                logger.warning(
+                    "%d sub-resources on other domains were blocked (out of scope) "
+                    "while loading %s; page may be partially rendered. "
+                    "External hostnames: %s",
+                    sub_count, url, ", ".join(sub_hosts[:10]),
+                )
+                self._result.blocked_subresource_count += sub_count
+                for host in sub_hosts:
+                    if host not in self._result.blocked_subresource_hostnames:
+                        self._result.blocked_subresource_hostnames.append(host)
 
             self._result.total_pages_crawled += 1
             self._result.add_endpoint(url, DiscoveryMethod.LINK)

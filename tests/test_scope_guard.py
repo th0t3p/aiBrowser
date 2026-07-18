@@ -65,6 +65,19 @@ class TestScopeGuardViolationTracking:
         mock_route = AsyncMock()
         mock_route.request = MagicMock()
         mock_route.request.url = url
+        mock_route.request.resource_type = "document"  # simulate top-level navigation
+        await handler(mock_route)
+
+    async def _trigger_subresource_block(self, session, url: str, resource_type: str = "script") -> None:
+        """Simulate a sub-resource (JS, CSS, image) being blocked."""
+        mock_page = session._context.pages[0]
+        handler = mock_page._routes.get("**/*")
+        assert handler is not None, "Scope guard route was not installed"
+
+        mock_route = AsyncMock()
+        mock_route.request = MagicMock()
+        mock_route.request.url = url
+        mock_route.request.resource_type = resource_type
         await handler(mock_route)
 
     # ------------------------------------------------------------------
@@ -205,3 +218,123 @@ class TestScopeGuardViolationTracking:
 
         with pytest.raises(ScopeGuardError):
             await session.new_page()
+
+
+class TestSubresourceBlocking:
+    """Test that blocked sub-resources don't kill the crawl."""
+
+    @staticmethod
+    def _make_config(hostname="example.com"):
+        return BrowserSessionConfig(authorized_hostname=hostname)
+
+    @staticmethod
+    def _make_mock_page():
+        page = AsyncMock()
+        page.url = "https://example.com"
+        page.main_frame = MagicMock()
+        page.main_frame.url = "https://example.com"
+        page._routes = {}
+
+        async def mock_route(pattern, handler):
+            page._routes[pattern] = handler
+
+        page.route = mock_route
+        page.on = MagicMock()
+        return page
+
+    @staticmethod
+    def _make_mock_context(page):
+        ctx = AsyncMock()
+        ctx.new_page = AsyncMock(return_value=page)
+        ctx.pages = [page]
+        ctx.add_cookies = AsyncMock()
+        ctx.storage_state = AsyncMock(return_value={"cookies": [], "origins": []})
+        ctx.close = AsyncMock()
+        return ctx
+
+    @staticmethod
+    def _make_session(config, context):
+        session = BrowserSession(config)
+        session._playwright = AsyncMock()
+        session._playwright.stop = AsyncMock()
+        session._context = context
+        session._browser = context
+        return session
+
+    async def _install_guard(self, session):
+        mock_page = session._context.pages[0]
+        await session._install_scope_guard(mock_page)
+
+    async def _trigger_subresource(self, session, url, resource_type="script"):
+        mock_page = session._context.pages[0]
+        handler = mock_page._routes.get("**/*")
+        assert handler is not None
+        mock_route = AsyncMock()
+        mock_route.request = MagicMock()
+        mock_route.request.url = url
+        mock_route.request.resource_type = resource_type
+        await handler(mock_route)
+
+    @pytest.mark.asyncio
+    async def test_subresource_blocked_but_not_violation(self):
+        config = self._make_config()
+        page = self._make_mock_page()
+        context = self._make_mock_context(page)
+        session = self._make_session(config, context)
+        await self._install_guard(session)
+        await self._trigger_subresource(session, "https://cdn.evil.com/app.js", "script")
+        assert session.violations == []
+        assert len(session.blocked_subresources) == 1
+        assert session.blocked_subresources[0].hostname == "cdn.evil.com"
+        session.check_violations()
+
+    @pytest.mark.asyncio
+    async def test_document_navigation_still_records_violation(self):
+        config = self._make_config()
+        page = self._make_mock_page()
+        context = self._make_mock_context(page)
+        session = self._make_session(config, context)
+        await self._install_guard(session)
+        await self._trigger_subresource(session, "https://evil.com", "document")
+        assert len(session.violations) == 1
+
+    @pytest.mark.asyncio
+    async def test_mixed_subresources_and_document(self):
+        config = self._make_config()
+        page = self._make_mock_page()
+        context = self._make_mock_context(page)
+        session = self._make_session(config, context)
+        await self._install_guard(session)
+        await self._trigger_subresource(session, "https://cdn.evil.com/app.js", "script")
+        await self._trigger_subresource(session, "https://img.evil.com/pixel.png", "image")
+        assert len(session.blocked_subresources) == 2
+        assert session.violations == []
+        await self._trigger_subresource(session, "https://evil.com", "document")
+        assert len(session.violations) == 1
+
+    @pytest.mark.asyncio
+    async def test_get_blocked_subresource_summary(self):
+        config = self._make_config()
+        page = self._make_mock_page()
+        context = self._make_mock_context(page)
+        session = self._make_session(config, context)
+        await self._install_guard(session)
+        await self._trigger_subresource(session, "https://cdn.evil.com/a.js", "script")
+        await self._trigger_subresource(session, "https://cdn.evil.com/b.js", "script")
+        await self._trigger_subresource(session, "https://img.evil.com/pixel.png", "image")
+        count, hosts = session.get_blocked_subresource_summary()
+        assert count == 3
+        assert "cdn.evil.com" in hosts
+        assert "img.evil.com" in hosts
+        assert len(hosts) == 2
+
+
+class TestCrawlResultSubresourceFields:
+    """Test CrawlResult blocked_subresource fields."""
+
+    def test_crawl_result_has_subresource_fields(self):
+        from ai_browser.crawler import CrawlResult, CrawlConfig
+        config = CrawlConfig(start_url="https://example.com", seed_hostname="example.com")
+        result = CrawlResult(config=config)
+        assert result.blocked_subresource_count == 0
+        assert result.blocked_subresource_hostnames == []

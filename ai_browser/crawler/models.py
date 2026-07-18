@@ -103,6 +103,8 @@ class CrawlResult(BaseModel):
     total_links_discovered: int = 0
     total_js_endpoints: int = 0
     errors: list[str] = Field(default_factory=list)
+    blocked_subresource_count: int = 0
+    blocked_subresource_hostnames: list[str] = Field(default_factory=list)
     started_at: datetime = Field(default_factory=datetime.utcnow)
     finished_at: Optional[datetime] = None
 

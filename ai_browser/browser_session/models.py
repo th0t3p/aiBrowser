@@ -89,3 +89,23 @@ class ScopeGuardError(Exception):
             f"Navigation blocked: attempted to reach '{attempted_hostname}' "
             f"but only '{authorized_hostname}' is authorized."
         )
+
+
+class BlockedSubresource:
+    """Record of a blocked out-of-scope sub-resource (JS, CSS, image, font, etc.).
+
+    These are informational — they indicate that a page loaded assets from
+    external domains, which is common and expected. Unlike ScopeGuardError,
+    they do NOT halt crawling of the page that triggered them.
+    """
+
+    def __init__(self, url: str, hostname: str, resource_type: str):
+        self.url = url
+        self.hostname = hostname
+        self.resource_type = resource_type
+
+    def __repr__(self) -> str:
+        return (
+            f"BlockedSubresource(url={self.url!r}, hostname={self.hostname!r}, "
+            f"resource_type={self.resource_type!r})"
+        )

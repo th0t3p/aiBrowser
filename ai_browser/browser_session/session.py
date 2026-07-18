@@ -14,7 +14,7 @@ from playwright.async_api import async_playwright, Browser, BrowserContext, Page
 
 from ai_browser._scope import hostname_matches_scope
 
-from .models import BrowserSessionConfig, ProxyConfig, ScopeGuardError
+from .models import BrowserSessionConfig, ProxyConfig, ScopeGuardError, BlockedSubresource
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +47,7 @@ class BrowserSession:
         self._temp_dir: Optional[tempfile.TemporaryDirectory] = None
         self._route_handlers: list = []
         self.violations: list[ScopeGuardError] = []
+        self.blocked_subresources: list[BlockedSubresource] = []
         self._violation_event: Optional[asyncio.Event] = None  # created lazily when event loop is running
 
     # ------------------------------------------------------------------
@@ -146,9 +147,11 @@ class BrowserSession:
         """Navigate a page to *url*, then check for scope violations.
 
         This wraps ``page.goto()`` and calls ``check_violations()`` afterwards
-        so that any blocked out-of-scope requests (triggered by the page load)
-        are surfaced to the caller.  Additional keyword arguments are forwarded
-        to ``page.goto()`` (timeout, wait_until, etc.).
+        so that blocked top-level navigations are surfaced.
+
+        Blocked sub-resources (scripts, images, etc.) are NOT surfaced here —
+        they are recorded in ``self.blocked_subresources`` and can be queried
+        via ``get_blocked_subresource_summary()``.
         """
         await page.goto(url, **kwargs)
         self.check_violations()
@@ -156,11 +159,25 @@ class BrowserSession:
     def check_violations(self) -> None:
         """Raise the most recent ScopeGuardError if any scope violations occurred.
 
+        Only checks ``self.violations`` (top-level navigation blocks).
+        Sub-resource blocks are tracked separately in ``self.blocked_subresources``.
+
         Raises:
             ScopeGuardError: The most recent violation, if any were recorded.
         """
         if self.violations:
             raise self.violations[-1]
+
+    def get_blocked_subresource_summary(self) -> tuple[int, list[str]]:
+        """Return (count, deduplicated_hostnames) of blocked sub-resources.
+
+        These are out-of-scope assets (JS, CSS, images, etc.) that were
+        blocked during page loads. They are informational — useful for
+        reporting ("this page loads from N external domains") — and are
+        NOT an error state.
+        """
+        hosts = list({b.hostname for b in self.blocked_subresources})
+        return len(self.blocked_subresources), sorted(hosts)
 
     def _get_violation_event(self) -> asyncio.Event:
         """Lazily create and return the violation event (requires a running event loop)."""
@@ -183,13 +200,26 @@ class BrowserSession:
             url = route.request.url
             hostname = urlparse(url).hostname or ""
             if not hostname_matches_scope(hostname, authorized):
-                logger.warning("Scope guard blocked navigation to %s (hostname=%s)", url, hostname)
-                violation = ScopeGuardError(
-                    attempted_hostname=hostname,
-                    authorized_hostname=self.config.authorized_hostname,
-                )
-                self.violations.append(violation)
-                self._get_violation_event().set()
+                resource_type = getattr(route.request, "resource_type", None) or "unknown"
+                if resource_type == "document":
+                    # Top-level or iframe navigation — full violation
+                    logger.warning("Scope guard blocked navigation to %s (hostname=%s)", url, hostname)
+                    violation = ScopeGuardError(
+                        attempted_hostname=hostname,
+                        authorized_hostname=self.config.authorized_hostname,
+                    )
+                    self.violations.append(violation)
+                    self._get_violation_event().set()
+                else:
+                    # Sub-resource (script, stylesheet, image, font, xhr, etc.)
+                    # Block the individual request but don't treat as fatal
+                    logger.debug(
+                        "Scope guard blocked sub-resource (%s) to %s (hostname=%s)",
+                        resource_type, url, hostname,
+                    )
+                    self.blocked_subresources.append(
+                        BlockedSubresource(url=url, hostname=hostname, resource_type=resource_type)
+                    )
                 await route.abort()
                 return
             await route.continue_()
