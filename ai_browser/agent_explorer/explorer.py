@@ -69,7 +69,7 @@ For "done": {"action": "done", "reasoning": "<summary of what was explored>"}"""
 
 ACTION_SYSTEM_PROMPT = EXPLORER_SYSTEM_PROMPT  # alias for readability
 
-MAX_ACCESSIBILITY_DEPTH = 5  # how deep to traverse the accessibility tree for the snapshot
+MAX_ACCESSIBILITY_YAML_CHARS = 8000  # max chars for aria_snapshot() YAML before truncation
 
 
 class AgentExplorer:
@@ -105,6 +105,14 @@ class AgentExplorer:
         self._audit_entries = []
         current_page = start_page
         actions_taken = 0
+
+        # Guard: if Phase 1 (crawler) failed to land on a real page,
+        # don't waste an attempt exploring about:blank.
+        if not current_page.url or current_page.url == "about:blank":
+            logger.info(
+                "Skipping agent exploration — no page from crawl phase to explore"
+            )
+            return self._audit_entries
 
         logger.info("Starting agent exploration on %s (max %d actions)",
                      current_page.url, self.config.max_actions)
@@ -202,68 +210,42 @@ class AgentExplorer:
     # Accessibility tree capture
     # ------------------------------------------------------------------
 
-    async def _capture_accessibility_tree(self, page: Page) -> Optional[dict]:
-        """Capture a depth-limited accessibility tree snapshot from the page.
+    async def _capture_accessibility_tree(self, page: Page) -> Optional[str]:
+        """Capture an ARIA snapshot of the page as YAML text.
 
-        Returns a simplified dict representation, or None if unavailable.
+        Uses Playwright's ``locator.aria_snapshot()`` (the replacement for
+        the removed ``page.accessibility.snapshot()``), scoped to the page
+        body.  The result is truncated to ``MAX_ACCESSIBILITY_YAML_CHARS``
+        with a clear marker so the LLM context stays bounded.
         """
         try:
-            snapshot = await page.accessibility.snapshot()
-            if snapshot is None:
+            snapshot = await page.locator("body").aria_snapshot()
+            if snapshot is None or not snapshot.strip():
                 return None
-            return self._simplify_snapshot(snapshot, depth=0)
+
+            if len(snapshot) > MAX_ACCESSIBILITY_YAML_CHARS:
+                snapshot = (
+                    snapshot[:MAX_ACCESSIBILITY_YAML_CHARS]
+                    + "\n\n... (ARIA snapshot truncated to fit context window)"
+                )
+            return snapshot
         except Exception as exc:
             logger.warning("Failed to capture accessibility tree: %s", exc)
             return None
-
-    def _simplify_snapshot(self, node: dict, depth: int) -> Optional[dict]:
-        """Recursively prune the accessibility snapshot to a manageable depth."""
-        if depth > MAX_ACCESSIBILITY_DEPTH:
-            return {"role": node.get("role", "unknown"), "name": node.get("name", ""),
-                    "_truncated": True}
-
-        simplified: dict = {
-            "role": node.get("role", ""),
-            "name": node.get("name", ""),
-        }
-        if "value" in node:
-            simplified["value"] = node["value"]
-        if "checked" in node:
-            simplified["checked"] = node["checked"]
-        if "disabled" in node:
-            simplified["disabled"] = node["disabled"]
-        if "expanded" in node:
-            simplified["expanded"] = node["expanded"]
-        if "selected" in node:
-            simplified["selected"] = node["selected"]
-        if "level" in node:
-            simplified["level"] = node["level"]
-
-        children = node.get("children", [])
-        if children:
-            pruned = []
-            for child in children:
-                simplified_child = self._simplify_snapshot(child, depth + 1)
-                if simplified_child:
-                    pruned.append(simplified_child)
-            if pruned:
-                simplified["children"] = pruned
-
-        return simplified
 
     # ------------------------------------------------------------------
     # LLM interaction (multi-provider via httpx)
     # ------------------------------------------------------------------
 
-    async def _ask_llm(self, snapshot: dict, current_url: str) -> Optional[dict]:
-        """Send the accessibility tree to the configured LLM provider."""
-        snapshot_json = json.dumps(snapshot, indent=2)
-        if len(snapshot_json) > 100_000:
-            snapshot_json = snapshot_json[:100_000] + "\n... (truncated)"
+    async def _ask_llm(self, snapshot: str, current_url: str) -> Optional[dict]:
+        """Send the ARIA snapshot YAML text to the configured LLM provider."""
+        snapshot_text = snapshot
+        if len(snapshot_text) > 100_000:
+            snapshot_text = snapshot_text[:100_000] + "\n... (truncated)"
 
         message = (
             f"Current URL: {current_url}\n\n"
-            f"Accessibility tree snapshot:\n{snapshot_json}\n\n"
+            f"Accessibility tree snapshot:\n{snapshot_text}\n\n"
             "What is the next action to explore this application?"
         )
 

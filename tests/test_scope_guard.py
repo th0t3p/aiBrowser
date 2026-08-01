@@ -185,39 +185,39 @@ class TestScopeGuardViolationTracking:
         assert exc_info.value.attempted_hostname == "ads.evil.com"
 
     @pytest.mark.asyncio
-    async def test_goto_wrapper_checks_violations(self):
-        """session.goto() calls page.goto() and then check_violations()."""
+    async def test_goto_ignores_stale_violations(self):
+        """session.goto() does NOT raise for violations from before the navigation."""
         config = self._make_config()
         page = self._make_mock_page()
         context = self._make_mock_context(page)
         session = self._make_session(config, context)
         page.goto = AsyncMock()
 
-        # Pre-populate a violation so check_violations will find one
+        # Pre-populate a violation from a *previous* navigation
         session.violations.append(
             ScopeGuardError(attempted_hostname="evil.com", authorized_hostname="example.com")
         )
 
-        with pytest.raises(ScopeGuardError):
-            await session.goto(page, "https://example.com")
-
+        # goto() should NOT raise — the violation predates this navigation
+        await session.goto(page, "https://example.com")
         page.goto.assert_called_once_with("https://example.com")
 
     @pytest.mark.asyncio
-    async def test_new_page_checks_violations(self):
-        """new_page() calls check_violations() after creating the page."""
+    async def test_new_page_ignores_stale_violations(self):
+        """new_page() does NOT raise for violations from earlier navigations."""
         config = self._make_config()
         page = self._make_mock_page()
         context = self._make_mock_context(page)
         session = self._make_session(config, context)
 
-        # Pre-populate a violation
+        # Pre-populate a violation from a previous navigation
         session.violations.append(
             ScopeGuardError(attempted_hostname="evil.com", authorized_hostname="example.com")
         )
 
-        with pytest.raises(ScopeGuardError):
-            await session.new_page()
+        # new_page() should NOT raise — the violation predates this page creation
+        new_page = await session.new_page()
+        assert new_page is not None
 
 
 class TestSubresourceBlocking:

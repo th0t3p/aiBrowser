@@ -134,27 +134,31 @@ class BrowserSession:
 
         Raises ScopeGuardError if any scope violations were recorded
         during page setup (e.g. from pre-existing persisted state triggering
-        background requests).
+        background requests). Stale violations from earlier navigations
+        are NOT surfaced here.
         """
         if not self._context:
             raise RuntimeError("BrowserSession not started. Call start() or use as context manager.")
+        violations_before = len(self.violations)
         page = await self._context.new_page()
         await self._install_scope_guard(page)
-        self.check_violations()
+        self._check_new_violations(violations_before)
         return page
 
     async def goto(self, page: Page, url: str, **kwargs) -> None:
         """Navigate a page to *url*, then check for scope violations.
 
-        This wraps ``page.goto()`` and calls ``check_violations()`` afterwards
-        so that blocked top-level navigations are surfaced.
+        This wraps ``page.goto()`` and only raises if a scope violation
+        occurred during **this specific navigation** — stale violations from
+        earlier navigations in the same session do NOT cause false positives.
 
         Blocked sub-resources (scripts, images, etc.) are NOT surfaced here —
         they are recorded in ``self.blocked_subresources`` and can be queried
         via ``get_blocked_subresource_summary()``.
         """
+        violations_before = len(self.violations)
         await page.goto(url, **kwargs)
-        self.check_violations()
+        self._check_new_violations(violations_before)
 
     def check_violations(self) -> None:
         """Raise the most recent ScopeGuardError if any scope violations occurred.
@@ -162,11 +166,32 @@ class BrowserSession:
         Only checks ``self.violations`` (top-level navigation blocks).
         Sub-resource blocks are tracked separately in ``self.blocked_subresources``.
 
+        This checks the **entire session history** — suitable for end-of-session
+        or batch-level checks. For per-navigation checks (e.g. inside ``goto()``),
+        use ``_check_new_violations()`` instead to avoid stale-violation false positives.
+
         Raises:
             ScopeGuardError: The most recent violation, if any were recorded.
         """
         if self.violations:
             raise self.violations[-1]
+
+    def _check_new_violations(self, before_count: int) -> None:
+        """Raise if a violation occurred since ``before_count`` was recorded.
+
+        Unlike ``check_violations()``, this is scoped to violations that were
+        appended to ``self.violations`` *after* the caller's snapshot, avoiding
+        stale-state false positives where a single violation poisons every
+        subsequent navigation in the session.
+
+        ``self.violations`` itself is preserved as a full historical record.
+
+        Raises:
+            ScopeGuardError: The most recent NEW violation, if any.
+        """
+        new_violations = self.violations[before_count:]
+        if new_violations:
+            raise new_violations[-1]
 
     def get_blocked_subresource_summary(self) -> tuple[int, list[str]]:
         """Return (count, deduplicated_hostnames) of blocked sub-resources.
