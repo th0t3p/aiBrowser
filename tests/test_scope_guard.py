@@ -219,6 +219,80 @@ class TestScopeGuardViolationTracking:
         new_page = await session.new_page()
         assert new_page is not None
 
+    @pytest.mark.asyncio
+    async def test_goto_regression_stale_violation_does_not_poison(self):
+        """Regression: a violation during goto #1 does NOT cause goto #2 to raise.
+
+        This is the exact bug that was happening: a single legitimate blocked
+        video load on one page caused every subsequent navigation to erroneously
+        report that same stale violation as a new error.
+        """
+        config = self._make_config()
+        page = self._make_mock_page()
+        context = self._make_mock_context(page)
+        session = self._make_session(config, context)
+        await self._install_guard(session)
+
+        # --- Navigation 1: triggers a real violation ---
+        page.goto = AsyncMock()
+
+        async def _goto_with_violation(url, **kwargs):
+            # Simulate a scope violation occurring during page load
+            session.violations.append(
+                ScopeGuardError(attempted_hostname="evil.com", authorized_hostname="example.com")
+            )
+
+        page.goto.side_effect = _goto_with_violation
+
+        with pytest.raises(ScopeGuardError) as exc_info:
+            await session.goto(page, "https://example.com/page1")
+        assert exc_info.value.attempted_hostname == "evil.com"
+
+        # --- Navigation 2: clean, unrelated page ---
+        page.goto = AsyncMock()
+
+        # This is the core assertion: a stale violation from a PREVIOUS
+        # navigation must NOT cause this completely unrelated goto() to raise.
+        await session.goto(page, "https://example.com/page2")
+        page.goto.assert_called_once_with("https://example.com/page2")
+
+        # Historical record is preserved (not cleared)
+        assert len(session.violations) == 1
+
+    @pytest.mark.asyncio
+    async def test_check_new_violations_scoped_correctly(self):
+        """_check_new_violations() only sees violations after the snapshot."""
+        config = self._make_config()
+        page = self._make_mock_page()
+        context = self._make_mock_context(page)
+        session = self._make_session(config, context)
+
+        # Pre-populate some historical violations
+        session.violations.append(
+            ScopeGuardError(attempted_hostname="old1.com", authorized_hostname="example.com")
+        )
+        session.violations.append(
+            ScopeGuardError(attempted_hostname="old2.com", authorized_hostname="example.com")
+        )
+
+        # Snapshot after 2 violations — _check_new_violations(2) should see nothing
+        session._check_new_violations(2)  # should not raise
+
+        # Add a new violation
+        session.violations.append(
+            ScopeGuardError(attempted_hostname="new.com", authorized_hostname="example.com")
+        )
+
+        # Now _check_new_violations(2) should see it
+        with pytest.raises(ScopeGuardError) as exc_info:
+            session._check_new_violations(2)
+        assert exc_info.value.attempted_hostname == "new.com"
+
+        # check_violations() (full-history check) still works
+        with pytest.raises(ScopeGuardError) as exc_info:
+            session.check_violations()
+        assert exc_info.value.attempted_hostname == "new.com"
+
 
 class TestSubresourceBlocking:
     """Test that sub-resources are allowed/blocked based on resource type."""
