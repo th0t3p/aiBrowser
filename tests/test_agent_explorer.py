@@ -166,16 +166,26 @@ class TestCaptureAccessibilityTree:
 
 
 # ---------------------------------------------------------------------------
-# about:blank guard in explore()
+# about:blank defensive guard in explore()
+# ---------------------------------------------------------------------------
+#
+# The caller (cli.py Phase 2) now opens a fresh page and explicitly
+# navigates to the target hostname before calling explore(), so
+# about:blank is *not* reached under normal operation.  This guard
+# remains as a defense-in-depth safety net: if the navigation above
+# somehow still lands on about:blank (e.g. a redirect chain that
+# resolves to a blocked/empty page or an empty string URL), we bail
+# out early rather than wasting LLM calls on a blank canvas.
 # ---------------------------------------------------------------------------
 
 class TestAboutBlankGuard:
-    """Tests that explore() returns early when the start page is about:blank."""
+    """Tests that explore() returns early when the start page is about:blank
+    (defensive guard, not primary failure detection)."""
 
     @pytest.mark.asyncio
     async def test_skips_exploration_when_url_is_about_blank(self):
         """explore() returns early with zero actions when start_page.url
-        is 'about:blank'."""
+        is 'about:blank' — bail out rather than calling the LLM on nothing."""
         config = _make_config()
         explorer = AgentExplorer(config)
         session = MagicMock()
@@ -202,7 +212,12 @@ class TestAboutBlankGuard:
 
     @pytest.mark.asyncio
     async def test_proceeds_normally_when_url_is_valid(self, monkeypatch):
-        """explore() continues the loop when start_page.url is a real page."""
+        """explore() continues the loop when start_page.url is a real page.
+
+        This is the expected code path: cli.py Phase 2 opens a fresh page,
+        navigates to ``https://{hostname}``, and only calls explore() once
+        the navigation succeeds.
+        """
         config = _make_config(max_actions=1)
         explorer = AgentExplorer(config)
         session = MagicMock()

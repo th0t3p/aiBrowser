@@ -400,10 +400,21 @@ async def _run_crawl(
             )
             explorer = AgentExplorer(explorer_config)
 
-            # Start from the first page
-            pages = session.pages
-            if pages:
-                audit_entries = await explorer.explore(session, pages[0])
+            # Open a genuinely fresh page and navigate to the target hostname.
+            # The crawler closes all its pages in a finally block, so
+            # session.pages after Phase 1 contains only an auto-created
+            # about:blank tab — not a reflection of crawl outcome.
+            explorer_page = await session.new_page()
+            try:
+                await explorer_page.goto(f"https://{hostname}", timeout=30000)
+            except Exception as exc:
+                logger.warning(
+                    "Failed to navigate to %s for agent exploration: %s",
+                    hostname, exc,
+                )
+                click.echo(f"  Agent exploration skipped: could not load {hostname}.")
+            else:
+                audit_entries = await explorer.explore(session, explorer_page)
                 click.echo(f"  Agent took {len(audit_entries)} autonomous actions.")
 
                 # Add discovered URLs from agent exploration
@@ -413,6 +424,8 @@ async def _run_crawl(
                             entry.action.current_url,
                             DiscoveryMethod.LINK,
                         )
+            finally:
+                await explorer_page.close()
 
         elif run_agent and not llm_api_key:
             click.echo(
@@ -452,7 +465,15 @@ async def _run_crawl(
 
             try:
                 page = await handler.register(session)
-                click.echo(f"  Registration complete! Current URL: {page.url}")
+                if handler.confirmed:
+                    click.echo(f"  Registration complete and confirmed! Current URL: {page.url}")
+                else:
+                    click.echo(
+                        f"  Registration form submitted, but email confirmation was "
+                        f"NOT completed (no confirmation link found within timeout). "
+                        f"Account may not be fully active. Current URL: {page.url}",
+                        err=True,
+                    )
             except Exception as exc:
                 click.echo(f"  Registration error: {exc}", err=True)
 

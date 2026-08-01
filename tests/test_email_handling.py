@@ -3,6 +3,7 @@
 import email
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -127,3 +128,111 @@ class TestIMAPFiltering:
         # _poll_inbox_for_link now takes target_domain parameter
         assert hasattr(handler, '_signup_submitted_at')
         assert handler._signup_submitted_at == 9999999.0
+
+
+# ---------------------------------------------------------------------------
+# RegistrationHandler.confirmed — distinguishes confirmed vs unconfirmed
+# outcomes so cli.py can report accurately.
+# ---------------------------------------------------------------------------
+
+
+class TestRegistrationConfirmed:
+    """Tests that handler.confirmed is set correctly after register()."""
+
+    @staticmethod
+    def _make_config(**kwargs):
+        from ai_browser.registration_handler.models import IMAPConfig
+        return RegistrationConfig(
+            signup_url="https://target.com/signup",
+            email="test@target.com",
+            imap_config=IMAPConfig(
+                host="imap.target.com",
+                username="test@target.com",
+                password="fake-pw",
+            ),
+            **kwargs,
+        )
+
+    @pytest.mark.asyncio
+    async def test_confirmed_true_when_link_found_and_navigated(self, monkeypatch):
+        """confirmed is True when IMAP polling returns a link and navigation succeeds."""
+        config = self._make_config()
+        handler = RegistrationHandler(config)
+
+        # Silence internal steps we don't care about
+        async def _noop(*_a, **_kw):
+            return None
+        monkeypatch.setattr(handler, "_check_captcha", _noop)
+        monkeypatch.setattr(handler, "_fill_signup_form", _noop)
+        monkeypatch.setattr(handler, "_submit_form", _noop)
+
+        # Return a fake confirmation link
+        async def _fake_poll(*_a, **_kw):
+            return "https://target.com/confirm?token=abc"
+        monkeypatch.setattr(handler, "_poll_inbox_for_link", _fake_poll)
+
+        # Mock session + page
+        page = AsyncMock()
+        page.url = "https://target.com/confirm?token=abc"
+        session = MagicMock()
+        session.new_page = AsyncMock(return_value=page)
+
+        result_page = await handler.register(session)
+        assert handler.confirmed is True
+        assert result_page is page
+
+    @pytest.mark.asyncio
+    async def test_confirmed_false_when_no_link_found(self, monkeypatch):
+        """confirmed stays False when IMAP polling returns None (timeout)."""
+        config = self._make_config()
+        handler = RegistrationHandler(config)
+
+        async def _noop(*_a, **_kw):
+            return None
+        monkeypatch.setattr(handler, "_check_captcha", _noop)
+        monkeypatch.setattr(handler, "_fill_signup_form", _noop)
+        monkeypatch.setattr(handler, "_submit_form", _noop)
+
+        # Polling returns None — no confirmation email arrived
+        async def _fake_poll(*_a, **_kw):
+            return None
+        monkeypatch.setattr(handler, "_poll_inbox_for_link", _fake_poll)
+
+        page = AsyncMock()
+        page.url = "https://target.com/signup"
+        session = MagicMock()
+        session.new_page = AsyncMock(return_value=page)
+
+        result_page = await handler.register(session)
+        assert handler.confirmed is False
+        assert result_page is page
+
+    @pytest.mark.asyncio
+    async def test_confirmed_false_when_no_imap_configured(self, monkeypatch):
+        """confirmed stays False when no IMAP config exists (skip email path)."""
+        config = RegistrationConfig(
+            signup_url="https://target.com/signup",
+            email="test@target.com",
+            # No imap_config — email confirmation is skipped entirely
+        )
+        handler = RegistrationHandler(config)
+
+        async def _noop(*_a, **_kw):
+            return None
+        monkeypatch.setattr(handler, "_check_captcha", _noop)
+        monkeypatch.setattr(handler, "_fill_signup_form", _noop)
+        monkeypatch.setattr(handler, "_submit_form", _noop)
+
+        page = AsyncMock()
+        page.url = "https://target.com/signup"
+        session = MagicMock()
+        session.new_page = AsyncMock(return_value=page)
+
+        await handler.register(session)
+        assert handler.confirmed is False
+
+    def test_confirmed_defaults_to_false(self):
+        """confirmed starts as False immediately after construction."""
+        config = self._make_config()
+        handler = RegistrationHandler(config)
+        assert handler.confirmed is False

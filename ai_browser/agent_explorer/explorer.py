@@ -106,11 +106,12 @@ class AgentExplorer:
         current_page = start_page
         actions_taken = 0
 
-        # Guard: if Phase 1 (crawler) failed to land on a real page,
-        # don't waste an attempt exploring about:blank.
+        # Defensive guard: if the caller passes an about:blank page (e.g. a
+        # navigation redirect chain that resolved to a blocked/empty page),
+        # bail out early rather than wasting LLM calls on a blank canvas.
         if not current_page.url or current_page.url == "about:blank":
             logger.info(
-                "Skipping agent exploration — no page from crawl phase to explore"
+                "Skipping agent exploration — start page is about:blank or has no URL"
             )
             return self._audit_entries
 

@@ -43,6 +43,7 @@ class RegistrationHandler:
         self._paused: bool = False
         self._captcha_info: Optional[CaptchaDetected] = None
         self._signup_submitted_at: float = 0.0
+        self.confirmed: bool = False
 
     # ------------------------------------------------------------------
     # Main registration flow
@@ -75,6 +76,7 @@ class RegistrationHandler:
                 logger.info("Confirmation link found: %s", confirmation_link)
                 await page.goto(confirmation_link, timeout=30_000)
                 await page.wait_for_load_state("networkidle", timeout=15_000)
+                self.confirmed = True
             else:
                 logger.warning("No confirmation link found within timeout window")
         else:
@@ -103,6 +105,7 @@ class RegistrationHandler:
             if confirmation_link:
                 await self._current_page.goto(confirmation_link, timeout=30_000)
                 await self._current_page.wait_for_load_state("networkidle", timeout=15_000)
+                self.confirmed = True
 
         return self._current_page
 
