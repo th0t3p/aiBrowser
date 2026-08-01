@@ -208,6 +208,27 @@ ai-browser crawl example.com \
     --output results.json
 ```
 
+### Resume a crawl — skipping already-discovered URLs
+
+When you've already run a crawl against a target and want a second pass to
+find **new** endpoints without re-crawling what you already found, pass the
+previous run's output JSON with `--skip-existing`:
+
+```bash
+ai-browser crawl example.com --authorized \
+    --skip-existing results.json \
+    --output run2.json
+```
+
+The crawler seeds its visited set with every URL present in the prior
+output, so those pages are never re-queued. The final output JSON merges
+the prior entries (kept as-is) with any genuinely new endpoints discovered
+in the resumed run, and includes `skipped_existing_count` /
+`newly_discovered_count` fields to make the result self-documenting.
+
+Prior entries win on URL collision — the already-verified data from the
+earlier run is preserved unchanged.
+
 ---
 
 ## Module layout

@@ -49,9 +49,9 @@ class Crawler:
     Relies on a BrowserSession for scope-guarded, proxy-routed navigation.
     """
 
-    def __init__(self, config: CrawlConfig):
+    def __init__(self, config: CrawlConfig, seed_visited: Optional[set[str]] = None):
         self.config = config
-        self._visited: set[str] = set()
+        self._visited: set[str] = set(seed_visited) if seed_visited else set()
         self._result = CrawlResult(config=config)
         self._session: Optional[BrowserSession] = None
 

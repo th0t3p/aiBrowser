@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import sys
 from pathlib import Path
@@ -194,6 +195,14 @@ def main(ctx: click.Context):
     help="Path to write JSON crawl results. Prints to stdout if not set.",
 )
 @click.option(
+    "--skip-existing",
+    type=click.Path(exists=True, dir_okay=False),
+    default=None,
+    help="Path to a previous run's output JSON. URLs already "
+    "present there will not be re-crawled; their entries "
+    "are merged into this run's output.",
+)
+@click.option(
     "--headless/--visible",
     default=True,
     help="Run browser headless (default) or visible.",
@@ -239,6 +248,7 @@ def crawl(
     imap_password: Optional[str],
     email_timeout: int,
     output: Optional[str],
+    skip_existing: Optional[str],
     headless: bool,
     ca_cert: Optional[str],
     storage_dir: str,
@@ -299,11 +309,34 @@ def crawl(
         max_pages=max_pages,
     )
 
+    # Prior-run support: seed visited set so previously-seen URLs are skipped
+    prior_endpoints: list = []
+    seed_visited: Optional[set[str]] = None
+    if skip_existing:
+        try:
+            prior_data = json.loads(Path(skip_existing).read_text())
+        except json.JSONDecodeError as exc:
+            click.echo(
+                f"ERROR: --skip-existing file {skip_existing} is not valid JSON: {exc}",
+                err=True,
+            )
+            sys.exit(1)
+        prior_endpoints = prior_data.get("endpoints", [])
+        seed_visited = {
+            Crawler._normalize(ep["url"]) for ep in prior_endpoints
+        }
+        click.echo(
+            f"Loaded {len(prior_endpoints)} previously-discovered "
+            f"endpoints from {skip_existing} — these will be skipped."
+        )
+
     # Run
     asyncio.run(
         _run_crawl(
             session_config=session_config,
             crawl_config=crawl_config,
+            seed_visited=seed_visited,
+            prior_endpoints=prior_endpoints,
             run_agent=agent,
             llm_provider=llm_provider,
             llm_model=llm_model,
@@ -331,6 +364,8 @@ def crawl(
 async def _run_crawl(
     session_config: BrowserSessionConfig,
     crawl_config: CrawlConfig,
+    seed_visited: Optional[set[str]],
+    prior_endpoints: list,
     run_agent: bool,
     llm_provider: str,
     llm_model: Optional[str],
@@ -380,7 +415,7 @@ async def _run_crawl(
 
         # Phase 1: Deterministic crawl
         click.echo(f"\n[Phase 1] Starting deterministic crawl of {hostname}...")
-        crawler = Crawler(crawl_config)
+        crawler = Crawler(crawl_config, seed_visited=seed_visited)
         result = await crawler.run(session)
         click.echo(
             f"  Crawl complete: {result.total_pages_crawled} pages, "
@@ -478,7 +513,20 @@ async def _run_crawl(
                 click.echo(f"  Registration error: {exc}", err=True)
 
         # Output results
-        import json as json_mod
+        # Deduplicate new endpoints against prior endpoints so skipped
+        # URLs are not included twice. Prior entries win on conflict
+        # (they represent already-verified data from a previous run).
+        existing_urls = {Crawler._normalize(ep["url"]) for ep in prior_endpoints}
+        new_endpoints = [
+            {
+                "url": ep.url,
+                "method": ep.method.value,
+                "source_url": ep.source_url,
+                "discovered_at": ep.discovered_at.isoformat(),
+            }
+            for ep in result.endpoints
+            if Crawler._normalize(ep.url) not in existing_urls
+        ]
 
         output_data = {
             "hostname": hostname,
@@ -486,23 +534,18 @@ async def _run_crawl(
             "total_links_discovered": result.total_links_discovered,
             "total_js_endpoints": result.total_js_endpoints,
             "unique_urls": result.unique_urls,
-            "endpoints": [
-                {
-                    "url": ep.url,
-                    "method": ep.method.value,
-                    "source_url": ep.source_url,
-                    "discovered_at": ep.discovered_at.isoformat(),
-                }
-                for ep in result.endpoints
-            ],
+            "endpoints": prior_endpoints + new_endpoints,
             "errors": result.errors,
         }
+        if prior_endpoints:
+            output_data["skipped_existing_count"] = len(prior_endpoints)
+            output_data["newly_discovered_count"] = len(new_endpoints)
 
         if output_file:
-            Path(output_file).write_text(json_mod.dumps(output_data, indent=2))
+            Path(output_file).write_text(json.dumps(output_data, indent=2))
             click.echo(f"\nResults written to {output_file}")
         else:
-            click.echo(f"\n{json_mod.dumps(output_data, indent=2)}")
+            click.echo(f"\n{json.dumps(output_data, indent=2)}")
 
 
 if __name__ == "__main__":
