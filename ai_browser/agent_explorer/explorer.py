@@ -305,6 +305,32 @@ def _distill_aria_snapshot(raw_yaml: str) -> tuple[str, int, int]:
     return distilled, len(raw_yaml), interactive_count
 
 
+def _snapshots_near_identical(a: str, b: str, threshold: float = 0.95) -> bool:
+    """Return True if two accessibility snapshots are near-identical.
+
+    Normalizes whitespace, then computes Jaccard similarity of line-level
+    hashes.  Returns True when >= *threshold* fraction of unique lines match
+    between the two snapshots, which tolerates minor dynamic content (timestamps,
+    counts, etc.) while still detecting that no real structural change occurred.
+    """
+    def _normalize(text: str) -> set[str]:
+        lines = [line.strip() for line in text.splitlines()]
+        return {ln for ln in lines if ln}
+
+    set_a = _normalize(a)
+    set_b = _normalize(b)
+
+    if not set_a and not set_b:
+        return True
+    if not set_a or not set_b:
+        return False
+
+    intersection = set_a & set_b
+    union = set_a | set_b
+    similarity = len(intersection) / len(union)
+    return similarity >= threshold
+
+
 def _extract_json(text: str) -> Optional[dict]:
     """Extract a JSON object from `text` using a proper decoder-based parse.
 
@@ -340,6 +366,13 @@ class AgentExplorer:
         self._confirmation_callback: Optional[Callable[[AgentAction], Awaitable[bool]]] = None
         self._message_history: list[dict] = []  # raw per-session multi-turn history
 
+        # Repeat-action guard state (reset per explore() call)
+        self._attempted_no_effect: set[tuple[str, str]] = set()
+        self._prev_snapshot: Optional[str] = None
+        self._prev_url: Optional[str] = None
+        self._prev_action_key: Optional[tuple[str, str]] = None
+        self._consecutive_corrections: int = 0
+
     # ------------------------------------------------------------------
     # Main exploration loop
     # ------------------------------------------------------------------
@@ -356,6 +389,11 @@ class AgentExplorer:
         """
         self._audit_entries = []
         self._message_history = []  # fresh history per explore() call
+        self._attempted_no_effect = set()
+        self._prev_snapshot = None
+        self._prev_url = None
+        self._prev_action_key = None
+        self._consecutive_corrections = 0
         current_page = start_page
         actions_taken = 0
 
@@ -375,10 +413,47 @@ class AgentExplorer:
             # Take accessibility snapshot
             snapshot = await self._capture_accessibility_tree(current_page)
             if snapshot is None:
-                logger.warning("No accessibility tree available, ending exploration.")
-                break
+                # One-shot crash recovery: reload the page and retry once.
+                # A single renderer crash doesn't mean every page is broken.
+                logger.warning(
+                    "Accessibility snapshot failed; attempting page reload "
+                    "and single retry"
+                )
+                try:
+                    await current_page.reload()
+                    await asyncio.sleep(1)
+                    snapshot = await self._capture_accessibility_tree(current_page)
+                except Exception as reload_exc:
+                    logger.warning(
+                        "Page reload during crash recovery failed: %s", reload_exc
+                    )
+                if snapshot is None:
+                    logger.warning(
+                        "No accessibility tree available after reload, "
+                        "ending exploration."
+                    )
+                    break
+                logger.info("Snapshot recovered after page reload")
 
             current_url = current_page.url
+
+            # ---- No-effect detection for the *previous* action -------------
+            # Compare the snapshot we just captured (post-action-N) with the
+            # snapshot saved *before* action N was executed.  If the URL
+            # didn't change *and* the accessibility tree is near-identical,
+            # mark that action as having no observable effect.
+            if self._prev_snapshot is not None and self._prev_action_key is not None:
+                url_unchanged = (current_url == self._prev_url)
+                tree_unchanged = _snapshots_near_identical(
+                    snapshot, self._prev_snapshot
+                )
+                if url_unchanged and tree_unchanged:
+                    self._attempted_no_effect.add(self._prev_action_key)
+                    logger.debug(
+                        "Action %s on %r marked as no-effect "
+                        "(URL unchanged, tree near-identical)",
+                        self._prev_action_key[0], self._prev_action_key[1],
+                    )
 
             # Build user turn: outcome of previous action (if any) + current snapshot
             user_content = self._build_user_turn(snapshot, current_url, actions_taken)
@@ -487,11 +562,51 @@ class AgentExplorer:
                     ))
                     continue
 
+            # ---- Repeat-action guard ---------------------------------------
+            # Before executing, check if this exact (action, target) was
+            # already attempted and produced no observable change.  This is a
+            # deterministic guard — it does not rely on the model noticing
+            # the repetition through raw history.
+            action_key = (action.get("action", ""), action.get("target", "") or "")
+            if action_key in self._attempted_no_effect:
+                self._consecutive_corrections += 1
+                max_corr = self.config.max_consecutive_corrections
+                logger.warning(
+                    "Rejected repeat action: %s on %r "
+                    "(already tried, no effect) — %d/%d consecutive corrections",
+                    action_key[0], action_key[1],
+                    self._consecutive_corrections, max_corr,
+                )
+                # Inject corrective message — same treatment as denylist
+                # rejection: no increment of actions_taken, loop back.
+                corrective = (
+                    f"You already tried {action_key[0]} on "
+                    f"'{action_key[1]}' and it had no effect. "
+                    f"Choose a different, unexplored element instead."
+                )
+                self._message_history.append(
+                    {"role": "user", "content": corrective}
+                )
+                if self._consecutive_corrections >= max_corr:
+                    logger.warning(
+                        "Giving up after %d consecutive repeat-action "
+                        "corrections without progress",
+                        self._consecutive_corrections,
+                    )
+                    break
+                continue
+
             # Execute the action
             url_before_action = current_page.url
             entry = await self._execute_action(session, current_page, action)
             self._audit_entries.append(entry)
             actions_taken += 1
+
+            # ---- Save state for next iteration's no-effect detection -------
+            self._prev_snapshot = snapshot
+            self._prev_url = url_before_action
+            self._prev_action_key = action_key
+            self._consecutive_corrections = 0
 
             # Log what the agent did this cycle
             action_type = action.get("action", "?")

@@ -181,6 +181,20 @@ class ExplorerConfig(BaseModel):
         "CaptchaDetected propagates; other errors are logged and exploration continues.",
     )
 
+    # Repeat-action guard: when the LLM proposes the same action+target that
+    # already had no observable effect, a corrective message is injected and
+    # the model is asked again.  This counter caps consecutive corrections
+    # before the exploration loop gives up to avoid an infinite cycle.
+    max_consecutive_corrections: int = Field(
+        default=3,
+        ge=1,
+        le=20,
+        description="Maximum number of consecutive repeat-action corrections "
+        "before the exploration loop gives up.  When the model proposes an "
+        "action+target that was already tried with no effect more than this "
+        "many times in a row, exploration ends.",
+    )
+
     @model_validator(mode="after")
     def _migrate_deprecated_fields(self) -> "ExplorerConfig":
         """Map deprecated anthropic_* fields onto the new llm_* fields."""

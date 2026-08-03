@@ -735,3 +735,234 @@ class TestAriaDistillation:
         # The fixture has: 4 nav links + 2 product links + 2 footer links
         # + 2 buttons + 1 textbox = 11 interactive elements
         assert count == 11, f"Expected 11 interactive elements, got {count}"
+
+
+# ---------------------------------------------------------------------------
+# Repeat-action guard
+# ---------------------------------------------------------------------------
+
+
+class TestRepeatActionGuard:
+    """Verify the deterministic repeat-action guard: when an action produces
+    no observable effect and the model proposes it again, the guard rejects
+    it, injects a corrective message, and does NOT increment actions_taken.
+    Consecutive corrections are capped to avoid infinite loops."""
+
+    @pytest.mark.asyncio
+    async def test_rejects_repeat_action_and_injects_corrective_message(
+        self, monkeypatch
+    ):
+        """After an action has no effect (URL unchanged, tree identical),
+        proposing the exact same (action, target) again is rejected with a
+        corrective message, and actions_taken is NOT incremented."""
+        config = _make_config(max_actions=5)
+        explorer = AgentExplorer(config)
+        session = MagicMock()
+
+        page = _make_mock_page(url="https://example.com/home")
+
+        # LLM returns the same click twice in a row, then "done"
+        actions_iter = iter([
+            {"action": "click", "target": "Research Tools", "reasoning": "explore"},
+            {"action": "click", "target": "Research Tools", "reasoning": "try again"},  # repeat!
+            {"action": "done", "reasoning": "finished"},
+        ])
+
+        async def fake_ask_llm(_messages):
+            try:
+                return next(actions_iter)
+            except StopIteration:
+                return {"action": "done", "reasoning": "exhausted"}
+
+        monkeypatch.setattr(explorer, "_ask_llm", fake_ask_llm)
+
+        # _execute_action always succeeds, but doesn't change URL or page state
+        async def fake_execute(_session, pg, action_raw):
+            return AuditLogEntry(
+                action=AgentAction(
+                    action_type=ActionType(action_raw.get("action", "click")),
+                    target_text=action_raw.get("target", ""),
+                    current_url=pg.url,
+                    reasoning=action_raw.get("reasoning", ""),
+                ),
+                success=True,
+            )
+
+        monkeypatch.setattr(explorer, "_execute_action", fake_execute)
+
+        entries = await explorer.explore(session, page)
+
+        # Only 1 action was actually executed (the first click).
+        # The repeat was rejected → no increment.
+        assert len(entries) == 1
+        assert entries[0].action.target_text == "Research Tools"
+
+        # The corrective message should be in the raw message history
+        corrective_found = any(
+            "already tried" in m.get("content", "")
+            and "no effect" in m.get("content", "")
+            for m in explorer._message_history
+            if m["role"] == "user"
+        )
+        assert corrective_found, (
+            "Expected a corrective message about the repeat action, "
+            f"got history: {explorer._message_history}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_consecutive_corrections_capped(self, monkeypatch):
+        """After 3 consecutive repeat-action corrections (default cap),
+        the exploration loop ends cleanly rather than looping forever."""
+        config = _make_config(max_actions=10, max_consecutive_corrections=3)
+        explorer = AgentExplorer(config)
+        session = MagicMock()
+
+        page = _make_mock_page(url="https://example.com/home")
+
+        # LLM keeps proposing the same no-effect action over and over
+        repeat_action = {"action": "click", "target": "Research Tools", "reasoning": "keep trying"}
+
+        async def fake_ask_llm(_messages):
+            return dict(repeat_action)
+
+        monkeypatch.setattr(explorer, "_ask_llm", fake_ask_llm)
+
+        async def fake_execute(_session, pg, action_raw):
+            return AuditLogEntry(
+                action=AgentAction(
+                    action_type=ActionType(action_raw.get("action", "click")),
+                    target_text=action_raw.get("target", ""),
+                    current_url=pg.url,
+                    reasoning=action_raw.get("reasoning", ""),
+                ),
+                success=True,
+            )
+
+        monkeypatch.setattr(explorer, "_execute_action", fake_execute)
+
+        entries = await explorer.explore(session, page)
+
+        # Only the first "Research Tools" click was executed.
+        # After that, 3 consecutive corrections → exploration ends.
+        assert len(entries) == 1
+
+        # Verify the consecutive corrections counter reached the cap
+        assert explorer._consecutive_corrections >= 3
+
+        # Verify the corrective messages are in history
+        correction_count = sum(
+            1 for m in explorer._message_history
+            if m["role"] == "user" and "already tried" in m.get("content", "")
+        )
+        assert correction_count == 3, (
+            f"Expected 3 corrective messages, got {correction_count}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Browser crash recovery
+# ---------------------------------------------------------------------------
+
+
+class TestCrashRecovery:
+    """Verify that a mid-exploration browser crash during aria_snapshot()
+    triggers a one-shot page reload retry before giving up."""
+
+    @pytest.mark.asyncio
+    async def test_retries_snapshot_once_via_reload(self, monkeypatch):
+        """When _capture_accessibility_tree returns None (simulating a browser
+        crash), a single page.reload() is attempted.  If the retry succeeds,
+        exploration continues normally."""
+        config = _make_config(max_actions=2)
+        explorer = AgentExplorer(config)
+        session = MagicMock()
+
+        page = _make_mock_page(url="https://example.com/home")
+
+        # Track reload calls
+        reload_calls = []
+        page.reload = AsyncMock(side_effect=lambda: reload_calls.append(1))
+
+        # _capture_accessibility_tree: returns None on 1st call, valid on 2nd+
+        capture_count = [0]
+
+        _original_capture = explorer._capture_accessibility_tree
+
+        async def fake_capture(pg):
+            capture_count[0] += 1
+            if capture_count[0] == 1:
+                return None  # simulated crash
+            return await _original_capture(pg)
+
+        monkeypatch.setattr(explorer, "_capture_accessibility_tree", fake_capture)
+
+        # LLM returns one action then "done"
+        actions_iter = iter([
+            {"action": "click", "target": "Products", "reasoning": "explore"},
+            {"action": "done", "reasoning": "finished"},
+        ])
+
+        async def fake_ask_llm(_messages):
+            try:
+                return next(actions_iter)
+            except StopIteration:
+                return {"action": "done", "reasoning": "exhausted"}
+
+        monkeypatch.setattr(explorer, "_ask_llm", fake_ask_llm)
+
+        async def fake_execute(_session, pg, action_raw):
+            return AuditLogEntry(
+                action=AgentAction(
+                    action_type=ActionType(action_raw.get("action", "click")),
+                    target_text=action_raw.get("target", ""),
+                    current_url=pg.url,
+                    reasoning=action_raw.get("reasoning", ""),
+                ),
+                success=True,
+            )
+
+        monkeypatch.setattr(explorer, "_execute_action", fake_execute)
+
+        entries = await explorer.explore(session, page)
+
+        # Reload should have been called exactly once
+        assert len(reload_calls) == 1, (
+            f"Expected 1 reload call, got {len(reload_calls)}"
+        )
+
+        # Exploration should have continued: one action was executed
+        assert len(entries) == 1
+        assert entries[0].action.target_text == "Products"
+
+    @pytest.mark.asyncio
+    async def test_ends_exploration_when_retry_also_fails(self, monkeypatch):
+        """When the reload retry also fails (snapshot still None), exploration
+        ends cleanly with zero actions executed."""
+        config = _make_config(max_actions=5)
+        explorer = AgentExplorer(config)
+        session = MagicMock()
+
+        page = _make_mock_page(url="https://example.com/home")
+
+        reload_calls = []
+        page.reload = AsyncMock(side_effect=lambda: reload_calls.append(1))
+
+        # Always return None — crash is unrecoverable
+        async def fake_capture(_pg):
+            return None
+
+        monkeypatch.setattr(explorer, "_capture_accessibility_tree", fake_capture)
+
+        # LLM should never be called
+        async def fake_ask_llm(_messages):
+            raise AssertionError("LLM should not be called when crash is unrecoverable")
+
+        monkeypatch.setattr(explorer, "_ask_llm", fake_ask_llm)
+
+        entries = await explorer.explore(session, page)
+
+        # Reload called once, then gave up
+        assert len(reload_calls) == 1
+
+        # Zero actions executed
+        assert entries == []
