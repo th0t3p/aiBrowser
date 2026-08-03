@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import socket
 import tempfile
 from pathlib import Path
 from typing import Optional
@@ -48,7 +49,8 @@ class BrowserSession:
         self._route_handlers: list = []
         self.violations: list[ScopeGuardError] = []
         self.blocked_subresources: list[BlockedSubresource] = []
-        self._violation_event: Optional[asyncio.Event] = None  # created lazily when event loop is running
+        self._violation_event: Optional[asyncio.Event] = None
+        self.cdp_url: Optional[str] = None
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -74,6 +76,16 @@ class BrowserSession:
             "args": [],
         }
 
+        # Pick a free port for CDP so browser-use (or any other tool)
+        # can attach to the same browser process.  We bind to port 0 and
+        # let the OS assign a free one to avoid collisions.
+        cdp_port: Optional[int] = None
+        if self.config.expose_cdp:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.bind(("127.0.0.1", 0))
+                cdp_port = s.getsockname()[1]
+            launch_options["args"].append(f"--remote-debugging-port={cdp_port}")
+
         # If a CA cert path is provided, add it via --ignore-certificate-errors-spki-list
         # or set the NSS cert db via --user-data-dir. The primary method is
         # passing it as a launch arg for Chromium.
@@ -97,6 +109,12 @@ class BrowserSession:
             ignore_https_errors=self.config.ignore_https_errors,
         )
         self._context = self._browser
+
+        # Expose the CDP URL for external tools (e.g. browser-use) to
+        # attach to the same browser process.
+        if cdp_port is not None:
+            self.cdp_url = f"http://localhost:{cdp_port}"
+            logger.info("CDP endpoint available at %s", self.cdp_url)
 
         # Restore persisted storage state if available
         await self._restore_storage_state()

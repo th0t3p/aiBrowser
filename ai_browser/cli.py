@@ -106,6 +106,25 @@ def main(ctx: click.Context):
     help="Run the agent explorer on JS-heavy pages with no links.",
 )
 @click.option(
+    "--agent-backend",
+    type=click.Choice(["custom", "browser-use"]),
+    default="custom",
+    show_default=True,
+    envvar="AIBROWSER_AGENT_BACKEND",
+    help="Which engine drives Phase 2 autonomous exploration. "
+    "'custom' is aiBrowser's own explorer (default, stable). "
+    "'browser-use' uses the browser-use library, connected "
+    "to the same browser via CDP — requires the "
+    "[browser-use] extra to be installed.",
+)
+@click.option(
+    "--max-actions",
+    default=20,
+    show_default=True,
+    help="Maximum autonomous actions (clicks, scrolls, etc.) for "
+    "the Phase 2 agent explorer.",
+)
+@click.option(
     "--llm-provider",
     default="anthropic",
     type=click.Choice(["anthropic", "openai", "deepseek"]),
@@ -275,6 +294,8 @@ def crawl(
     max_depth: int,
     max_pages: int,
     agent: bool,
+    agent_backend: str,
+    max_actions: int,
     llm_provider: str,
     llm_model: Optional[str],
     llm_api_key: Optional[str],
@@ -353,6 +374,7 @@ def crawl(
         headless=headless,
         storage_dir=Path(storage_dir),
         ca_cert_path=Path(ca_cert) if ca_cert else None,
+        expose_cdp=(agent_backend == "browser-use"),
     )
 
     # Build crawl config
@@ -393,6 +415,8 @@ def crawl(
             seed_visited=seed_visited,
             prior_endpoints=prior_endpoints,
             run_agent=agent,
+            agent_backend=agent_backend,
+            max_actions=max_actions,
             llm_provider=llm_provider,
             llm_model=llm_model,
             llm_api_key=_llm_api_key,
@@ -455,12 +479,294 @@ def _save_credentials(
         )
 
 
+# ---------------------------------------------------------------------------
+# Phase 2: Agent explorer backends
+# ---------------------------------------------------------------------------
+
+
+async def _run_phase2_custom(
+    *,
+    session,
+    result,
+    prior_endpoints: list,
+    llm_provider: str,
+    llm_model: str,
+    llm_api_key: str,
+    llm_base_url: Optional[str],
+    llm_max_tokens: Optional[int],
+    hostname: str,
+    scope_pattern: str,
+) -> None:
+    """Run aiBrowser's own AgentExplorer (default, stable)."""
+    click.echo(f"\n[Phase 2] Running agent explorer on {hostname}...")
+    explorer_config = ExplorerConfig(
+        authorized_hostname=scope_pattern,
+        llm_provider=llm_provider,
+        llm_model=llm_model,
+        llm_api_key=llm_api_key,
+        llm_base_url=llm_base_url or "",
+        llm_max_tokens=llm_max_tokens,
+    )
+    explorer = AgentExplorer(explorer_config)
+
+    explorer_page = await session.new_page()
+    try:
+        await explorer_page.goto(f"https://{hostname}", timeout=30000)
+    except Exception as exc:
+        logger.warning(
+            "Failed to navigate to %s for agent exploration: %s",
+            hostname, exc,
+        )
+        click.echo(f"  Agent exploration skipped: could not load {hostname}.")
+    else:
+        audit_entries = await explorer.explore(session, explorer_page)
+        click.echo(f"  Agent took {len(audit_entries)} autonomous actions.")
+
+        phase1_urls: set[str] = {
+            Crawler._normalize(ep.url) for ep in result.endpoints
+        }
+        if prior_endpoints:
+            phase1_urls |= {
+                Crawler._normalize(ep["url"]) for ep in prior_endpoints
+            }
+
+        agent_urls: set[str] = set()
+        for entry in audit_entries:
+            if entry.action.current_url:
+                normalized = Crawler._normalize(entry.action.current_url)
+                agent_urls.add(normalized)
+                result.add_endpoint(
+                    entry.action.current_url,
+                    DiscoveryMethod.AGENT_EXPLORATION,
+                )
+
+        new_count = len(agent_urls - phase1_urls)
+        already_known_count = len(agent_urls & phase1_urls)
+        logger.info(
+            "Agent exploration summary: %d actions taken, %d new "
+            "endpoints discovered, %d already known",
+            len(audit_entries), new_count, already_known_count,
+        )
+        click.echo(f"  Agent discovered {new_count} new endpoint(s).")
+    finally:
+        await explorer_page.close()
+
+
+async def _run_phase2_browser_use(
+    *,
+    session,
+    result,
+    prior_endpoints: list,
+    llm_provider: str,
+    llm_model: str,
+    llm_api_key: str,
+    llm_base_url: Optional[str],
+    max_actions: int,
+    hostname: str,
+    scope_pattern: str,
+) -> None:
+    """Run browser-use as the Phase 2 agent engine, connected to the same
+    browser process via CDP (--remote-debugging-port)."""
+    try:
+        from browser_use import Agent as BrowserUseAgent
+        from browser_use import Browser as BrowserUseBrowser
+        from browser_use import BrowserConfig as BUBrowserConfig
+        from browser_use import BrowserContextConfig
+    except ImportError:
+        raise click.ClickException(
+            "browser-use is not installed.  Install it with:\n"
+            "    pip install -e \".[browser-use]\"\n"
+            "or:\n"
+            "    pip install \"browser-use==0.1.48\" \"langchain-deepseek>=0.1\""
+        )
+
+    if not session.cdp_url:
+        raise click.ClickException(
+            "BrowserSession did not expose a CDP endpoint — this is a bug. "
+            "Make sure expose_cdp=True was passed to BrowserSessionConfig."
+        )
+
+    click.echo(f"\n[Phase 2] Running browser-use agent on {hostname}...")
+
+    # ---- LLM ----------------------------------------------------------
+    if llm_provider == "deepseek":
+        try:
+            from langchain_deepseek import ChatDeepSeek
+        except ImportError:
+            raise click.ClickException(
+                "langchain-deepseek is not installed.  Install it with:\n"
+                "    pip install -e \".[browser-use]\""
+            )
+        llm = ChatDeepSeek(
+            model=llm_model,
+            api_key=llm_api_key,
+            # DeepSeek V4 models are always in thinking mode by default
+            # and reject forced tool-calling — required for browser-use's
+            # structured actions.  Confirmed via testing (DeepSeek-V3
+            # GitHub issue #1376, multiple LangChain issues).
+            extra_body={"thinking": {"type": "disabled"}},
+        )
+        if llm_base_url:
+            llm.model_kwargs = llm.model_kwargs or {}
+            llm.model_kwargs["base_url"] = llm_base_url
+    elif llm_provider == "anthropic":
+        try:
+            from langchain_anthropic import ChatAnthropic
+        except ImportError:
+            raise click.ClickException(
+                "langchain-anthropic is not installed.  Install it with:\n"
+                "    pip install -e \".[browser-use]\""
+            )
+        llm = ChatAnthropic(model=llm_model, api_key=llm_api_key)
+    elif llm_provider == "openai":
+        from langchain_openai import ChatOpenAI
+        llm = ChatOpenAI(
+            model=llm_model,
+            api_key=llm_api_key,
+            base_url=llm_base_url or None,
+        )
+    else:
+        raise click.ClickException(
+            f"--agent-backend browser-use does not yet support "
+            f"--llm-provider {llm_provider}"
+        )
+
+    # ---- Confirm hostname loads before handing off --------------------
+    explorer_page = await session.new_page()
+    try:
+        await explorer_page.goto(f"https://{hostname}", timeout=30000)
+    except Exception as exc:
+        logger.warning(
+            "Failed to navigate to %s for browser-use exploration: %s",
+            hostname, exc,
+        )
+        click.echo(f"  Agent exploration skipped: could not load {hostname}.")
+        return
+    finally:
+        await explorer_page.close()
+
+    # ---- Browser-use setup (CDP attach) -------------------------------
+    bu_browser_config = BUBrowserConfig(
+        cdp_url=session.cdp_url,
+        keep_alive=True,
+        headless=True,
+    )
+    bu_context_config = BrowserContextConfig(
+        allowed_domains=[scope_pattern],
+        wait_for_network_idle_page_load_time=1.0,
+        minimum_wait_page_load_time=0.5,
+        maximum_wait_page_load_time=5.0,
+    )
+
+    bu_browser = BrowserUseBrowser(config=bu_browser_config)
+    bu_ctx = await bu_browser.new_context(config=bu_context_config)
+    await bu_ctx._initialize_session()
+
+    # Clean any leftover pages from Phase 1 in the CDP context
+    pw_context = bu_ctx.session.context
+    for page in list(pw_context.pages):
+        try:
+            await page.close()
+        except Exception:
+            pass
+
+    # ---- Task ---------------------------------------------------------
+    task = (
+        f"Explore {hostname} thoroughly. Look for API documentation, "
+        f"developer resources, webhook/callback configuration pages, "
+        f"and other technical endpoints. Click through navigation menus, "
+        f"expand collapsed sections, and follow links that seem likely "
+        f"to reveal more of the site's structure. Do not submit any "
+        f"forms or attempt to register/sign up for anything."
+    )
+
+    bu_agent = BrowserUseAgent(
+        task=task,
+        llm=llm,
+        browser=bu_browser,
+        browser_context=bu_ctx,
+        use_vision=False,
+    )
+
+    click.echo(f"  browser-use agent starting (CDP: {session.cdp_url})...")
+    visited_urls: list[str] = []
+    try:
+        bu_result = await bu_agent.run(max_steps=max_actions)
+        visited_urls = _extract_urls_from_browser_use_result(bu_result)
+        click.echo(f"  browser-use agent completed. {len(visited_urls)} URLs visited.")
+    except Exception as exc:
+        logger.warning("browser-use agent failed: %s", exc)
+        click.echo(f"  browser-use agent error: {exc}")
+    finally:
+        # Clean up pages so the CDP context is empty for any future
+        # browser-use runs in the same browser process.
+        try:
+            for page in list(pw_context.pages):
+                await page.close()
+        except Exception:
+            pass
+        try:
+            await bu_agent.close()
+        except Exception:
+            pass
+        try:
+            await bu_browser.close()
+        except Exception:
+            pass
+
+    if not visited_urls:
+        return
+
+    # ---- Merge discovered URLs ---------------------------------------
+    phase1_urls: set[str] = {
+        Crawler._normalize(ep.url) for ep in result.endpoints
+    }
+    if prior_endpoints:
+        phase1_urls |= {
+            Crawler._normalize(ep["url"]) for ep in prior_endpoints
+        }
+
+    agent_urls: set[str] = set()
+    for url in visited_urls:
+        if url == "about:blank":
+            continue
+        normalized = Crawler._normalize(url)
+        agent_urls.add(normalized)
+        result.add_endpoint(url, DiscoveryMethod.AGENT_EXPLORATION)
+
+    new_count = len(agent_urls - phase1_urls)
+    already_known_count = len(agent_urls & phase1_urls)
+    logger.info(
+        "browser-use exploration summary: %d new endpoints discovered, "
+        "%d already known",
+        new_count, already_known_count,
+    )
+    click.echo(f"  Agent discovered {new_count} new endpoint(s) "
+               f"(via browser-use).")
+
+
+def _extract_urls_from_browser_use_result(bu_result) -> list[str]:
+    """Extract visited URLs from a browser-use AgentHistoryList result.
+
+    Uses the ``urls()`` method confirmed correct via verify_browser_use_safety.py
+    testing — it returns ``[h.state.url for h in self.history]``.
+    """
+    if bu_result is None:
+        return []
+    if hasattr(bu_result, "urls"):
+        # AgentHistoryList.urls() returns list[str | None]
+        return [u for u in bu_result.urls() if u is not None]
+    return []
+
+
 async def _run_crawl(
     session_config: BrowserSessionConfig,
     crawl_config: CrawlConfig,
     seed_visited: Optional[set[str]],
     prior_endpoints: list,
     run_agent: bool,
+    agent_backend: str,
+    max_actions: int,
     llm_provider: str,
     llm_model: Optional[str],
     llm_api_key: Optional[str],
@@ -537,65 +843,33 @@ async def _run_crawl(
                     err=True,
                 )
                 return
-            click.echo(f"\n[Phase 2] Running agent explorer on {hostname}...")
-            explorer_config = ExplorerConfig(
-                authorized_hostname=scope_pattern,
-                llm_provider=llm_provider,
-                llm_model=llm_model,
-                llm_api_key=llm_api_key,
-                llm_base_url=llm_base_url or "",
-                llm_max_tokens=llm_max_tokens,
-            )
-            explorer = AgentExplorer(explorer_config)
 
-            # Open a genuinely fresh page and navigate to the target hostname.
-            # The crawler closes all its pages in a finally block, so
-            # session.pages after Phase 1 contains only an auto-created
-            # about:blank tab — not a reflection of crawl outcome.
-            explorer_page = await session.new_page()
-            try:
-                await explorer_page.goto(f"https://{hostname}", timeout=30000)
-            except Exception as exc:
-                logger.warning(
-                    "Failed to navigate to %s for agent exploration: %s",
-                    hostname, exc,
+            if agent_backend == "custom":
+                await _run_phase2_custom(
+                    session=session,
+                    result=result,
+                    prior_endpoints=prior_endpoints,
+                    llm_provider=llm_provider,
+                    llm_model=llm_model,
+                    llm_api_key=llm_api_key,
+                    llm_base_url=llm_base_url,
+                    llm_max_tokens=llm_max_tokens,
+                    hostname=hostname,
+                    scope_pattern=scope_pattern,
                 )
-                click.echo(f"  Agent exploration skipped: could not load {hostname}.")
-            else:
-                audit_entries = await explorer.explore(session, explorer_page)
-                click.echo(f"  Agent took {len(audit_entries)} autonomous actions.")
-
-                # Collect URLs already known from Phase 1 + any --skip-existing
-                # prior runs, so we can distinguish genuinely new discoveries.
-                phase1_urls: set[str] = {
-                    Crawler._normalize(ep.url) for ep in result.endpoints
-                }
-                if prior_endpoints:
-                    phase1_urls |= {
-                        Crawler._normalize(ep["url"]) for ep in prior_endpoints
-                    }
-
-                # Add discovered URLs from agent exploration
-                agent_urls: set[str] = set()
-                for entry in audit_entries:
-                    if entry.action.current_url:
-                        normalized = Crawler._normalize(entry.action.current_url)
-                        agent_urls.add(normalized)
-                        result.add_endpoint(
-                            entry.action.current_url,
-                            DiscoveryMethod.AGENT_EXPLORATION,
-                        )
-
-                new_count = len(agent_urls - phase1_urls)
-                already_known_count = len(agent_urls & phase1_urls)
-                logger.info(
-                    "Agent exploration summary: %d actions taken, %d new "
-                    "endpoints discovered, %d already known",
-                    len(audit_entries), new_count, already_known_count,
+            elif agent_backend == "browser-use":
+                await _run_phase2_browser_use(
+                    session=session,
+                    result=result,
+                    prior_endpoints=prior_endpoints,
+                    llm_provider=llm_provider,
+                    llm_model=llm_model,
+                    llm_api_key=llm_api_key,
+                    llm_base_url=llm_base_url,
+                    max_actions=max_actions,
+                    hostname=hostname,
+                    scope_pattern=scope_pattern,
                 )
-                click.echo(f"  Agent discovered {new_count} new endpoint(s).")
-            finally:
-                await explorer_page.close()
 
         elif run_agent and not llm_api_key:
             click.echo(

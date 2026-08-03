@@ -31,6 +31,8 @@ dev = [
 browser-use = [
     "browser-use==0.1.48",
     "langchain-deepseek>=0.1",
+    "langchain-anthropic>=0.1",
+    "langchain-openai>=0.1",
 ]
 
 [tool.hatch.build.targets.wheel]

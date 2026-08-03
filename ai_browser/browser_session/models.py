@@ -81,6 +81,12 @@ class BrowserSessionConfig(BaseModel):
         "out-of-scope XHR/fetch requests are allowed through instead of blocked. "
         "Use this for known-safe telemetry/CDN endpoints that pages fire autonomously.",
     )
+    expose_cdp: bool = Field(
+        default=False,
+        description="Expose a Chrome DevTools Protocol endpoint on a free local "
+        "port so external tools (e.g. browser-use) can attach to the same "
+        "browser process via --remote-debugging-port.",
+    )
 
     model_config = {"arbitrary_types_allowed": True}
 
