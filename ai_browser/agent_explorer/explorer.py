@@ -72,6 +72,24 @@ ACTION_SYSTEM_PROMPT = EXPLORER_SYSTEM_PROMPT  # alias for readability
 MAX_ACCESSIBILITY_YAML_CHARS = 8000  # max chars for aria_snapshot() YAML before truncation
 
 
+def _extract_json(text: str) -> Optional[dict]:
+    """Extract a JSON object from `text` using a proper decoder-based parse.
+
+    Finds the first ``{`` and delegates to ``json.JSONDecoder().raw_decode()``,
+    which determines the real, syntactically-correct end of the JSON value
+    (unlike a regex that stops at the first ``}`` and breaks on nested objects).
+    """
+    decoder = json.JSONDecoder()
+    start = text.find("{")
+    if start == -1:
+        return None
+    try:
+        obj, _ = decoder.raw_decode(text, start)
+        return obj
+    except json.JSONDecodeError:
+        return None
+
+
 class AgentExplorer:
     """Uses Claude API to decide the next interaction on JS-heavy pages.
 
@@ -290,7 +308,7 @@ class AgentExplorer:
         }
         body = {
             "model": model,
-            "max_tokens": 512,
+            "max_tokens": self.config.llm_max_tokens,
             "system": ACTION_SYSTEM_PROMPT,
             "messages": [{"role": "user", "content": message}],
         }
@@ -309,7 +327,7 @@ class AgentExplorer:
         }
         body = {
             "model": model,
-            "max_tokens": 512,
+            "max_tokens": self.config.llm_max_tokens,
             "messages": [
                 {"role": "system", "content": ACTION_SYSTEM_PROMPT},
                 {"role": "user", "content": message},
@@ -327,12 +345,15 @@ class AgentExplorer:
             choices = data.get("choices", [])
             text = choices[0].get("message", {}).get("content", "").strip() if choices else ""
 
-        json_match = re.search(r"\{[^}]+\}", text, re.DOTALL)
-        if json_match:
-            parsed = json.loads(json_match.group(0))
+        parsed = _extract_json(text)
+        if parsed is not None:
             logger.debug("LLM (%s) response: %s", provider, parsed)
             return parsed
-        logger.warning("Could not parse JSON from %s response: %s", provider, text[:200])
+        logger.warning(
+            "Could not parse JSON from %s response. Extracted content "
+            "length=%d, content=%r. Full raw response: %s",
+            provider, len(text), text[:200], data,
+        )
         return None
 
     # Deprecated backward-compat alias
