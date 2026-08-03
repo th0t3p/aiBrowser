@@ -5,7 +5,11 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
+import secrets
+import stat
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -157,8 +161,10 @@ def main(ctx: click.Context):
 )
 @click.option(
     "--register-password",
-    default="Test1234!@#$",
-    help="Password for registration.",
+    default=None,
+    help="Password for registration. If not provided, a random "
+    "password is generated automatically and saved to the "
+    "credentials file after successful registration.",
 )
 @click.option(
     "--register-name",
@@ -263,7 +269,7 @@ def crawl(
     anthropic_api_key: Optional[str],
     register: bool,
     register_email: Optional[str],
-    register_password: str,
+    register_password: Optional[str],
     register_name: str,
     login: bool,
     login_email: Optional[str],
@@ -302,6 +308,13 @@ def crawl(
             "⚠ Warning: --anthropic-api-key is deprecated. Use --llm-provider anthropic --llm-api-key instead.",
             err=True,
         )
+
+    # Auto-generate a fresh registration password when none is provided.
+    # A static default would silently reuse the same weak password for
+    # every registered account — fresh random is safer and the password
+    # is always saved to the credentials file after registration.
+    if register_password is None:
+        register_password = secrets.token_urlsafe(16)
 
     start_url = f"https://{hostname}"
     scope_pattern = scope or hostname
@@ -386,6 +399,42 @@ def crawl(
             scope_pattern=scope_pattern,
         )
     )
+
+
+def _save_credentials(
+    storage_dir: Path,
+    hostname: str,
+    email: str,
+    password: str,
+    confirmed: bool,
+) -> None:
+    """Persist registration credentials to a local file with restricted permissions.
+
+    The password is saved in plaintext — ``chmod 0600`` restricts the file
+    to the current user only.  Credentials are always saved even when
+    ``confirmed`` is False, because the password is still needed to
+    complete confirmation manually later.
+    """
+    credentials_dir = storage_dir / "credentials"
+    credentials_dir.mkdir(parents=True, exist_ok=True)
+    cred_file = credentials_dir / f"{hostname}.json"
+    cred_data = {
+        "hostname": hostname,
+        "email": email,
+        "password": password,
+        "registered_at": datetime.now(timezone.utc).isoformat(),
+        "confirmed": confirmed,
+    }
+    cred_file.write_text(json.dumps(cred_data, indent=2) + "\n")
+    cred_file.chmod(stat.S_IRUSR | stat.S_IWUSR)  # 0o600 — owner read/write only
+    click.echo(f"  Credentials saved to {cred_file}")
+    if not confirmed:
+        click.echo(
+            "  WARNING: Registration completed but email confirmation was NOT "
+            "received. The password has been saved so you can complete "
+            "confirmation manually — the account may not be fully active.",
+            err=True,
+        )
 
 
 async def _run_crawl(
@@ -568,6 +617,17 @@ async def _run_crawl(
                     )
             except Exception as exc:
                 click.echo(f"  Registration error: {exc}", err=True)
+            else:
+                # Save credentials so the account is recoverable.
+                # Always save even if confirmation failed — the password
+                # is still needed to complete confirmation manually later.
+                _save_credentials(
+                    storage_dir=session_config.storage_dir,
+                    hostname=hostname,
+                    email=register_email,
+                    password=register_password,
+                    confirmed=handler.confirmed,
+                )
 
         # Output results
         # Deduplicate new endpoints against prior endpoints so skipped

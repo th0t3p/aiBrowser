@@ -105,7 +105,7 @@ class TestClickEnvvarResolution:
     def test_register_password_has_no_envvar(self, monkeypatch):
         """--register-password is deliberately excluded from envvar
         support — setting AIBROWSER_REGISTER_PASSWORD in the environment
-        should NOT affect the default value."""
+        should NOT affect the generated password."""
         monkeypatch.setenv("AIBROWSER_REGISTER_PASSWORD", "should-not-be-used")
         monkeypatch.setenv("AIBROWSER_LLM_API_KEY", "sk-test-key")
 
@@ -121,9 +121,12 @@ class TestClickEnvvarResolution:
             )
         assert result.exit_code == 0, result.output
         call_kwargs = mock_run.call_args.kwargs
-        # The default for register_password should be the hardcoded CLI
-        # default, NOT the env var we set.
-        assert call_kwargs["register_password"] == "Test1234!@#$"
+        password = call_kwargs["register_password"]
+        # When omitted, a random password is auto-generated — it must
+        # NOT be the env var value we set.
+        assert isinstance(password, str)
+        assert len(password) > 0
+        assert password != "should-not-be-used"
 
 
 # ---------------------------------------------------------------------------
