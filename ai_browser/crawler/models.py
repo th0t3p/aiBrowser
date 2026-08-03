@@ -13,6 +13,7 @@ class DiscoveryMethod(str, Enum):
     SITEMAP = "sitemap"
     JS_REGEX = "js-regex"
     ROBOTS_TXT = "robots-txt"
+    AGENT_EXPLORATION = "agent-exploration"
 
 
 class DiscoveredEndpoint(BaseModel):
@@ -126,7 +127,7 @@ class CrawlResult(BaseModel):
         for existing in self.endpoints:
             if existing == candidate:
                 # Prefer the more specific discovery method
-                method_priority = {DiscoveryMethod.SITEMAP: 0, DiscoveryMethod.ROBOTS_TXT: 1, DiscoveryMethod.LINK: 2, DiscoveryMethod.JS_REGEX: 3}
+                method_priority = {DiscoveryMethod.SITEMAP: 0, DiscoveryMethod.ROBOTS_TXT: 1, DiscoveryMethod.LINK: 2, DiscoveryMethod.JS_REGEX: 3, DiscoveryMethod.AGENT_EXPLORATION: 4}
                 if method_priority.get(method, 99) < method_priority.get(existing.method, 99):
                     existing.method = method
                 return

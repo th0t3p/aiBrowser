@@ -17,6 +17,10 @@ from ai_browser.agent_explorer import AgentExplorer, ExplorerConfig
 from ai_browser.registration_handler import RegistrationHandler, RegistrationConfig, IMAPConfig
 from ai_browser.login_handler import LoginHandler, LoginConfig
 
+from dotenv import load_dotenv
+
+load_dotenv()  # loads .env from CWD into os.environ before Click parses options
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -75,6 +79,7 @@ def main(ctx: click.Context):
     "--proxy-server",
     default="http://127.0.0.1:8080",
     show_default=True,
+    envvar="AIBROWSER_PROXY_SERVER",
     help="Burp Suite proxy address.",
 )
 @click.option(
@@ -100,28 +105,42 @@ def main(ctx: click.Context):
     default="anthropic",
     type=click.Choice(["anthropic", "openai", "deepseek"]),
     show_default=True,
+    envvar="AIBROWSER_LLM_PROVIDER",
     help="LLM provider for agent_explorer.",
 )
 @click.option(
     "--llm-model",
     default=None,
+    envvar="AIBROWSER_LLM_MODEL",
     help="Model name (provider-specific). Defaults: claude-sonnet-4-20250514 / gpt-4o / deepseek-chat.",
 )
 @click.option(
     "--llm-api-key",
     default=None,
-    envvar="LLM_API_KEY",
-    help="API key for the LLM provider (or set LLM_API_KEY env var).",
+    envvar="AIBROWSER_LLM_API_KEY",
+    help="API key for the LLM provider (or set AIBROWSER_LLM_API_KEY env var).",
 )
 @click.option(
     "--llm-base-url",
     default=None,
+    envvar="AIBROWSER_LLM_BASE_URL",
     help="Custom base URL for the LLM API (falls back to provider default).",
+)
+@click.option(
+    "--llm-max-tokens",
+    type=int,
+    default=4096,
+    show_default=True,
+    envvar="AIBROWSER_LLM_MAX_TOKENS",
+    help="Max tokens for LLM API calls during agent exploration. "
+    "Reasoning-enabled models (e.g. DeepSeek v4) consume tokens "
+    "on internal reasoning before the final answer — too low a "
+    "value can result in empty responses.",
 )
 @click.option(
     "--anthropic-api-key",
     default=None,
-    envvar="ANTHROPIC_API_KEY",
+    envvar="AIBROWSER_ANTHROPIC_API_KEY",
     help="[Deprecated] Use --llm-provider anthropic --llm-api-key instead.",
 )
 @click.option(
@@ -133,6 +152,7 @@ def main(ctx: click.Context):
 @click.option(
     "--register-email",
     default=None,
+    envvar="AIBROWSER_REGISTER_EMAIL",
     help="Email to use for registration (e.g. test+target@mydomain.com).",
 )
 @click.option(
@@ -164,24 +184,27 @@ def main(ctx: click.Context):
 @click.option(
     "--imap-host",
     default=None,
+    envvar="AIBROWSER_IMAP_HOST",
     help="IMAP server hostname for email confirmation polling.",
 )
 @click.option(
     "--imap-port",
     default=993,
     show_default=True,
+    envvar="AIBROWSER_IMAP_PORT",
     help="IMAP server port.",
 )
 @click.option(
     "--imap-username",
     default=None,
+    envvar="AIBROWSER_IMAP_USERNAME",
     help="IMAP login username (full email address).",
 )
 @click.option(
     "--imap-password",
     default=None,
-    envvar="IMAP_PASSWORD",
-    help="IMAP login password (or set IMAP_PASSWORD env var).",
+    envvar="AIBROWSER_IMAP_PASSWORD",
+    help="IMAP login password (or set AIBROWSER_IMAP_PASSWORD env var).",
 )
 @click.option(
     "--email-timeout",
@@ -211,6 +234,7 @@ def main(ctx: click.Context):
     "--ca-cert",
     default=None,
     type=click.Path(exists=True),
+    envvar="AIBROWSER_CA_CERT",
     help="Path to exported Burp CA certificate (DER/PEM) for HTTPS trust.",
 )
 @click.option(
@@ -218,6 +242,7 @@ def main(ctx: click.Context):
     default="storage/browser_states",
     show_default=True,
     type=click.Path(),
+    envvar="AIBROWSER_STORAGE_DIR",
     help="Directory for browser state persistence.",
 )
 @click.pass_context
@@ -234,6 +259,7 @@ def crawl(
     llm_model: Optional[str],
     llm_api_key: Optional[str],
     llm_base_url: Optional[str],
+    llm_max_tokens: int,
     anthropic_api_key: Optional[str],
     register: bool,
     register_email: Optional[str],
@@ -342,6 +368,7 @@ def crawl(
             llm_model=llm_model,
             llm_api_key=_llm_api_key,
             llm_base_url=llm_base_url,
+            llm_max_tokens=llm_max_tokens,
             do_register=register,
             register_email=register_email,
             register_password=register_password,
@@ -371,6 +398,7 @@ async def _run_crawl(
     llm_model: Optional[str],
     llm_api_key: Optional[str],
     llm_base_url: Optional[str],
+    llm_max_tokens: int,
     do_register: bool,
     register_email: Optional[str],
     register_password: str,
@@ -438,6 +466,7 @@ async def _run_crawl(
                 llm_model=llm_model,
                 llm_api_key=llm_api_key,
                 llm_base_url=llm_base_url or "",
+                llm_max_tokens=llm_max_tokens,
             )
             explorer = AgentExplorer(explorer_config)
 
@@ -458,13 +487,35 @@ async def _run_crawl(
                 audit_entries = await explorer.explore(session, explorer_page)
                 click.echo(f"  Agent took {len(audit_entries)} autonomous actions.")
 
+                # Collect URLs already known from Phase 1 + any --skip-existing
+                # prior runs, so we can distinguish genuinely new discoveries.
+                phase1_urls: set[str] = {
+                    Crawler._normalize(ep.url) for ep in result.endpoints
+                }
+                if prior_endpoints:
+                    phase1_urls |= {
+                        Crawler._normalize(ep["url"]) for ep in prior_endpoints
+                    }
+
                 # Add discovered URLs from agent exploration
+                agent_urls: set[str] = set()
                 for entry in audit_entries:
                     if entry.action.current_url:
+                        normalized = Crawler._normalize(entry.action.current_url)
+                        agent_urls.add(normalized)
                         result.add_endpoint(
                             entry.action.current_url,
-                            DiscoveryMethod.LINK,
+                            DiscoveryMethod.AGENT_EXPLORATION,
                         )
+
+                new_count = len(agent_urls - phase1_urls)
+                already_known_count = len(agent_urls & phase1_urls)
+                logger.info(
+                    "Agent exploration summary: %d actions taken, %d new "
+                    "endpoints discovered, %d already known",
+                    len(audit_entries), new_count, already_known_count,
+                )
+                click.echo(f"  Agent discovered {new_count} new endpoint(s).")
             finally:
                 await explorer_page.close()
 

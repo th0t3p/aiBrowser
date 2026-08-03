@@ -77,13 +77,13 @@ class ExplorerConfig(BaseModel):
         description="Custom base URL. Falls back to provider default if empty.",
     )
     llm_max_tokens: int = Field(
-        default=2048,
+        default=4096,
         ge=1,
         le=32000,
-        description="Maximum tokens for the LLM completion. Raised from the old "
-        "hardcoded 512 to accommodate reasoning/thinking-mode models "
+        description="Maximum tokens for the LLM completion. Default 4096 gives "
+        "substantial headroom for reasoning/thinking-mode models "
         "(e.g. DeepSeek v4) that consume tokens on internal reasoning "
-        "before producing the final answer.",
+        "before producing the final JSON response.",
     )
 
     # Deprecated aliases — kept for backward compat, map onto the new fields

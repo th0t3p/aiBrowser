@@ -1,5 +1,7 @@
-"""Tests for AgentExplorer — ARIA snapshot capture and about:blank guard."""
+"""Tests for AgentExplorer — ARIA snapshot capture, about:blank guard,
+per-action logging, and discovery-method tagging."""
 
+import logging
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -9,6 +11,8 @@ from ai_browser.agent_explorer.explorer import (
     MAX_ACCESSIBILITY_YAML_CHARS,
 )
 from ai_browser.agent_explorer import ExplorerConfig
+from ai_browser.agent_explorer.models import ActionType, AgentAction, AuditLogEntry
+from ai_browser.crawler import Crawler, CrawlConfig, CrawlResult, DiscoveryMethod
 
 
 # ---------------------------------------------------------------------------
@@ -250,3 +254,165 @@ class TestAboutBlankGuard:
 
         entries = await explorer.explore(session, page)
         assert entries == []
+
+
+# ---------------------------------------------------------------------------
+# Per-action INFO logging, DiscoveryMethod.AGENT_EXPLORATION, and summary
+# counts — verifies that a mocked explore() run produces the right console
+# output and correct discovery-method tagging.
+# ---------------------------------------------------------------------------
+
+
+class TestExploreLoggingAndDiscovery:
+    """Confirm per-cycle logging and discovery-method tagging after
+    a mocked explore() run that includes navigation to new URLs."""
+
+    @pytest.mark.asyncio
+    async def test_per_action_logging_and_discovery_tagging(
+        self, monkeypatch, caplog
+    ):
+        """Run explore() with mocked actions: one static click, one
+        click that navigates to a new page.  Verify:
+
+        * Per-action INFO logs show action type, target, and whether
+          the URL changed.
+        * When endpoints are added with AGENT_EXPLORATION, new vs
+          already-known counts are accurate.
+        * The output JSON correctly tags agent-discovered URLs with
+          the ``agent-exploration`` method string.
+        """
+        config = _make_config(max_actions=5)
+        explorer = AgentExplorer(config)
+        session = MagicMock()
+        session.pages = []
+
+        start_url = "https://example.com/home"
+        new_url = "https://example.com/products"
+
+        page = _make_mock_page(url=start_url)
+
+        # ------------------------------------------------------------------
+        # Mock _ask_llm: four non-done actions then "done"
+        #   (1) click  "About"     — same page, no nav
+        #   (2) scroll             — same page, no nav
+        #   (3) click  "Products"  — NAVIGATES to new URL
+        #   (4) wait               — captures the new URL
+        # ------------------------------------------------------------------
+        actions_iter = iter([
+            {"action": "click",  "target": "About",    "reasoning": "explore"},
+            {"action": "scroll", "target": "",          "reasoning": "see more"},
+            {"action": "click",  "target": "Products",  "reasoning": "nav"},
+            {"action": "wait",   "target": "",          "reasoning": "let page settle"},
+            {"action": "done",   "reasoning": "finished"},
+        ])
+
+        async def fake_ask_llm(_snapshot, _current_url):
+            try:
+                return next(actions_iter)
+            except StopIteration:
+                return {"action": "done", "reasoning": "exhausted"}
+
+        monkeypatch.setattr(explorer, "_ask_llm", fake_ask_llm)
+
+        # ------------------------------------------------------------------
+        # Mock _execute_action: only the "Products" click changes the URL.
+        # ------------------------------------------------------------------
+        async def fake_execute(_session, pg, action_raw):
+            action_type = action_raw.get("action", "")
+            target = action_raw.get("target", "")
+            url_before = pg.url
+            if action_type == "click" and target == "Products":
+                pg.url = new_url
+            return AuditLogEntry(
+                action=AgentAction(
+                    action_type=ActionType(action_type)
+                    if action_type in ActionType.__members__
+                    else ActionType.WAIT,
+                    target_text=target,
+                    current_url=url_before,
+                    reasoning=action_raw.get("reasoning", ""),
+                ),
+                success=True,
+            )
+
+        monkeypatch.setattr(explorer, "_execute_action", fake_execute)
+
+        # ------------------------------------------------------------------
+        # Run
+        # ------------------------------------------------------------------
+        with caplog.at_level(
+            logging.INFO, logger="ai_browser.agent_explorer.explorer"
+        ):
+            entries = await explorer.explore(session, page)
+
+        # --- 4 actions executed (click About, scroll, click Products, wait)
+        assert len(entries) == 4
+
+        # --- Per-action INFO logs -----------------------------------------
+        action_logs = [
+            r.message for r in caplog.records
+            if r.message.startswith("Action ")
+        ]
+        assert len(action_logs) == 4
+
+        # Action 1: click "About" — no navigation
+        assert "click" in action_logs[0]
+        assert "'About'" in action_logs[0]
+        assert "(no navigation)" in action_logs[0]
+
+        # Action 2: scroll — no navigation
+        assert "scroll" in action_logs[1]
+        assert "(no navigation)" in action_logs[1]
+
+        # Action 3: click "Products" — navigation occurred
+        assert "click" in action_logs[2]
+        assert "'Products'" in action_logs[2]
+        assert new_url in action_logs[2]
+        assert "(no navigation)" not in action_logs[2]
+
+        # Action 4: wait — already on the new page, no further nav
+        assert "wait" in action_logs[3]
+        assert "(no navigation)" in action_logs[3]
+
+        # --- DiscoveryMethod.AGENT_EXPLORATION tagging -------------------
+        result = CrawlResult(
+            config=CrawlConfig(
+                start_url=start_url,
+                seed_hostname="example.com",
+            )
+        )
+        # Simulate Phase 1: one endpoint already known
+        result.add_endpoint(start_url, DiscoveryMethod.LINK)
+
+        # Phase 2: add agent-discovered URLs
+        agent_urls: set[str] = set()
+        for entry in entries:
+            if entry.action.current_url:
+                normalized = Crawler._normalize(entry.action.current_url)
+                agent_urls.add(normalized)
+                result.add_endpoint(
+                    entry.action.current_url,
+                    DiscoveryMethod.AGENT_EXPLORATION,
+                )
+
+        # --- Summary counts: new vs already-known ------------------------
+        # Phase 1 already knows start_url, so that's "already known"
+        # new_url is genuinely new
+        phase1_urls = {Crawler._normalize(start_url)}
+        new_count = len(agent_urls - phase1_urls)
+        already_known_count = len(agent_urls & phase1_urls)
+
+        assert new_count == 1, "The new URL should be counted as new"
+        assert already_known_count == 1, "The start URL should be already known"
+
+        # --- Verify endpoint method strings in output ---------------------
+        endpoint_methods = {ep.url: ep.method.value for ep in result.endpoints}
+        assert endpoint_methods[start_url] == "link", (
+            "Phase 1 URL should keep its original LINK method"
+        )
+        assert endpoint_methods[new_url] == "agent-exploration", (
+            "Agent-discovered URL should be tagged agent-exploration"
+        )
+
+        # --- Total endpoint count: start_url (from Phase 1) + new_url ----
+        assert len(result.endpoints) == 2

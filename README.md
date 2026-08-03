@@ -90,9 +90,36 @@ Gmail, Outlook, and most major providers **block IMAP login with your
 regular account password**. You'll need a provider-generated app-specific
 password instead (e.g. Gmail: [myaccount.google.com/apppasswords](https://myaccount.google.com/apppasswords),
 requires 2-Step Verification enabled first). Custom-domain mail servers
-often don't have this restriction. Pass it via `--imap-password` or, safer,
-the `IMAP_PASSWORD` environment variable (avoids it sitting in shell
-history).
+often don't have this restriction. Pass it via `--imap-password` or,
+safer, the `AIBROWSER_IMAP_PASSWORD` environment variable (avoids it
+sitting in shell history).
+
+### Using a .env file (recommended)
+
+Instead of passing credentials on every command, copy the example file
+and fill in your settings once:
+
+```bash
+cp .env.example .env
+# Edit .env — add your API keys, IMAP credentials, etc.
+```
+
+Then invoke the CLI without repeated flags:
+
+```bash
+# Before (every flag on every command)
+ai-browser crawl example.com --authorized --agent \
+    --llm-provider deepseek --llm-model deepseek-chat \
+    --llm-api-key "sk-..." --imap-password "$AIBROWSER_IMAP_PASSWORD"
+
+# After (credentials from .env, only target-specific flags remain)
+ai-browser crawl example.com --authorized --agent \
+    --llm-provider deepseek --llm-model deepseek-chat
+```
+
+Explicit CLI flags always override `.env` values, so you can set
+defaults in `.env` and override per-invocation when needed (e.g. a
+different model for one target).
 
 ---
 
@@ -130,10 +157,14 @@ omitted, scope defaults to an exact match on `hostname`.
 ### Agent Explorer — choosing an LLM provider
 
 ```bash
-# Anthropic (default)
-export LLM_API_KEY="sk-ant-..."
+# With a .env file, no API key flag needed — it's read from AIBROWSER_LLM_API_KEY
 ai-browser crawl example.com --authorized --agent \
     --llm-provider anthropic --llm-model claude-sonnet-4-20250514
+
+# Without .env, set it per-command:
+ai-browser crawl example.com --authorized --agent \
+    --llm-provider anthropic --llm-model claude-sonnet-4-20250514 \
+    --llm-api-key "sk-ant-..."
 
 # OpenAI
 ai-browser crawl example.com --authorized --agent \
@@ -158,12 +189,17 @@ as a borderline action requiring confirmation — it will **not** register an
 account on its own unless you explicitly opt in with `--register`:
 
 ```bash
+# With a .env file (see "Using a .env file" above), this shrinks to:
+ai-browser crawl example.com --authorized --agent --register \
+    --register-password "Str0ngP@ss!"
+
+# Without .env, pass every flag explicitly:
 ai-browser crawl example.com --authorized --agent --register \
     --register-email "test+example@yourdomain.com" \
     --register-password "Str0ngP@ss!" \
     --imap-host imap.yourdomain.com \
     --imap-username "test@yourdomain.com" \
-    --imap-password "$IMAP_PASSWORD"
+    --imap-password "$AIBROWSER_IMAP_PASSWORD"
 ```
 
 With `--register` set, the agent recognizes signup-intent elements (sign
@@ -195,15 +231,26 @@ weren't created by this tool.
 ### Full pipeline example
 
 ```bash
+# With a .env file (credentials come from .env):
 ai-browser crawl example.com \
     --authorized \
     --scope "*.example.com" \
-    --agent --llm-provider anthropic --llm-api-key "$LLM_API_KEY" \
+    --agent --register \
+    --register-password "Str0ngP@ss!" \
+    --max-depth 5 --max-pages 100 \
+    --output results.json
+
+# Without .env, pass credentials explicitly:
+ai-browser crawl example.com \
+    --authorized \
+    --scope "*.example.com" \
+    --agent --llm-provider anthropic --llm-api-key "$AIBROWSER_LLM_API_KEY" \
     --register \
     --register-email "test+example@yourdomain.com" \
+    --register-password "Str0ngP@ss!" \
     --imap-host imap.yourdomain.com \
     --imap-username "test@yourdomain.com" \
-    --imap-password "$IMAP_PASSWORD" \
+    --imap-password "$AIBROWSER_IMAP_PASSWORD" \
     --max-depth 5 --max-pages 100 \
     --output results.json
 ```

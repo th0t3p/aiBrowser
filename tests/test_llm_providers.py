@@ -416,18 +416,18 @@ class TestMaxTokensConfig:
             **kwargs,
         )
 
-    def test_default_max_tokens_is_2048(self):
-        """The default llm_max_tokens is 2048 (not the old 512)."""
+    def test_default_max_tokens_is_4096(self):
+        """The default llm_max_tokens is 4096 (not the old 2048 or 512)."""
         config = ExplorerConfig(
             authorized_hostname="example.com",
             llm_api_key="test-key",
         )
-        assert config.llm_max_tokens == 2048
+        assert config.llm_max_tokens == 4096
 
     def test_custom_max_tokens_in_config(self):
         """Explicit llm_max_tokens value is stored in config."""
-        config = self._make_config(llm_max_tokens=4096)
-        assert config.llm_max_tokens == 4096
+        config = self._make_config(llm_max_tokens=8192)
+        assert config.llm_max_tokens == 8192
 
     @pytest.mark.asyncio
     async def test_anthropic_uses_configured_max_tokens(self):

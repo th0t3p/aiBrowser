@@ -205,9 +205,21 @@ class AgentExplorer:
                     continue
 
             # Execute the action
+            url_before_action = current_page.url
             entry = await self._execute_action(session, current_page, action)
             self._audit_entries.append(entry)
             actions_taken += 1
+
+            # Log what the agent did this cycle
+            action_type = action.get("action", "?")
+            target = action.get("target", "") or action.get("value", "")
+            url_after = current_page.url
+            action_changed_url = (url_after != url_before_action)
+            logger.info(
+                "Action %d/%d: %s on %r -> %s",
+                actions_taken, self.config.max_actions, action_type, target,
+                url_after if action_changed_url else "(no navigation)",
+            )
 
             # Persist audit log after each action
             self._flush_audit_log()
