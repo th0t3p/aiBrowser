@@ -131,7 +131,7 @@ class AgentExplorer:
             action = await self._ask_llm(snapshot, current_url)
 
             if action is None or action.get("action") == "done":
-                logger.info("Claude signaled exploration complete after %d actions", actions_taken)
+                logger.info("%s signaled exploration complete after %d actions", self.config.llm_provider, actions_taken)
                 break
 
             # Check denylist

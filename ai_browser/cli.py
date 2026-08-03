@@ -425,11 +425,17 @@ async def _run_crawl(
 
         # Phase 2: Agent explorer for JS-heavy pages
         if run_agent and llm_api_key:
+            if not llm_model:
+                click.echo(
+                    "ERROR: --llm-model is required when using --llm-provider.",
+                    err=True,
+                )
+                return
             click.echo(f"\n[Phase 2] Running agent explorer on {hostname}...")
             explorer_config = ExplorerConfig(
                 authorized_hostname=scope_pattern,
                 llm_provider=llm_provider,
-                llm_model=llm_model or "",
+                llm_model=llm_model,
                 llm_api_key=llm_api_key,
                 llm_base_url=llm_base_url or "",
             )
