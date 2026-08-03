@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import re
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, Callable, Awaitable
@@ -32,12 +33,19 @@ def _escape_css_string(value: str) -> str:
     return value.replace("\\", "\\\\").replace("'", "\\'").replace("\n", "\\n")
 
 
-# System prompt instructing Claude how to decide actions from an accessibility tree
+# System prompt instructing the LLM how to explore a website step by step.
+# The model receives a multi-turn conversation: it sees its own past actions,
+# their outcomes (success/failure, navigation), and the current page snapshot.
 EXPLORER_SYSTEM_PROMPT = """You are a web exploration agent. Your goal is to discover all navigable
 pages and interactive elements on a website by interacting with it step by step.
 
-You are given an accessibility tree snapshot of the current page. Your task is to choose the
-single best next action to explore the application:
+You are part of a multi-turn conversation. You will see your own past actions and their
+outcomes (whether they succeeded or failed, and what URL you ended up on). Use this memory
+to make smarter decisions — do NOT repeat an action that already failed or led nowhere
+useful; use what you've learned to explore new areas you haven't visited yet.
+
+On each turn you are given an accessibility tree snapshot of the current page. Your task
+is to choose the single best next action to explore the application:
 
 Available actions:
 - click: Click on an interactive element (link, button, menu item). Provide the element's
@@ -62,14 +70,239 @@ CRITICAL SAFETY RULES — NEVER perform these actions:
   purchase, pay now, checkout, remove all, wipe, destroy, permanently delete.
 - If you see any text matching these patterns, skip that element entirely.
 
-Respond in this exact JSON format (no markdown, no extra text):
-{"action": "<action_type>", "target": "<element_name_or_url>", "value": "<fill_value>", "reasoning": "<why this action>"}
+Use the ``take_action`` tool to respond on every turn, filling in:
+- ``action``: one of click / fill / submit / navigate / scroll / wait / done
+- ``target``: the element name, label, or URL to act on (omit if not applicable)
+- ``value``: the fill value (only for the "fill" action; omit otherwise)
+- ``reasoning``: a brief explanation of why this action was chosen
 
-For "done": {"action": "done", "reasoning": "<summary of what was explored>"}"""
+For "done": set ``action`` to "done" and provide a summary in ``reasoning``."""
 
 ACTION_SYSTEM_PROMPT = EXPLORER_SYSTEM_PROMPT  # alias for readability
 
 MAX_ACCESSIBILITY_YAML_CHARS = 8000  # max chars for aria_snapshot() YAML before truncation
+
+_ANTHROPIC_DEFAULT_MAX_TOKENS = 4096  # Anthropic API requires max_tokens on every request
+
+# Native tool definition for structured output.
+# Anthropic uses "input_schema"; OpenAI-compatible providers use "parameters".
+_ACTION_TOOL_ANTHROPIC = {
+    "name": "take_action",
+    "description": "Choose the next action to take while exploring the web application.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["click", "fill", "submit", "navigate", "scroll", "wait", "done"],
+            },
+            "target": {
+                "type": "string",
+                "description": "Element name, label, or URL to act on.",
+            },
+            "value": {
+                "type": "string",
+                "description": "Value to fill (only for the 'fill' action).",
+            },
+            "reasoning": {
+                "type": "string",
+                "description": "Why this action was chosen.",
+            },
+        },
+        "required": ["action", "reasoning"],
+    },
+}
+
+_ACTION_TOOL_OPENAI = {
+    "type": "function",
+    "function": {
+        "name": "take_action",
+        "description": "Choose the next action to take while exploring the web application.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["click", "fill", "submit", "navigate", "scroll", "wait", "done"],
+                },
+                "target": {
+                    "type": "string",
+                    "description": "Element name, label, or URL to act on.",
+                },
+                "value": {
+                    "type": "string",
+                    "description": "Value to fill (only for the 'fill' action).",
+                },
+                "reasoning": {
+                    "type": "string",
+                    "description": "Why this action was chosen.",
+                },
+            },
+            "required": ["action", "reasoning"],
+        },
+    },
+}
+
+
+# ---------------------------------------------------------------------------
+# ARIA snapshot distillation — parse, filter, re-serialize
+# ---------------------------------------------------------------------------
+
+@dataclass
+class _AriaNode:
+    """A single node in a Playwright aria_snapshot() YAML tree."""
+    role: str
+    name: str = ""
+    attrs: dict = field(default_factory=dict)
+    text: str = ""
+    children: list = field(default_factory=list)
+
+
+_ARIA_LINE_RE = re.compile(
+    r'^- (\w+)(?:\s+"([^"]*)")?(?:\s+\[([^\]]*)\])?(?::\s*(.*))?$'
+)
+
+# Roles that represent directly interactive elements (clickable / fillable).
+_INTERACTIVE_ROLES: set[str] = {
+    "button", "link", "textbox", "checkbox", "radio", "combobox",
+    "menuitem", "tab", "switch", "slider", "searchbox", "spinbutton",
+    "listbox", "option",
+}
+
+# Roles that are always kept: interactive + headings for orientation.
+_ALWAYS_KEEP: set[str] = _INTERACTIVE_ROLES | {"heading"}
+
+
+def _parse_aria_yaml(yaml_text: str) -> list[_AriaNode]:
+    """Parse Playwright ``aria_snapshot()`` YAML into a tree of ``_AriaNode``.
+
+    The format uses 2-space indentation for nesting.  Each line looks like::
+
+        - role "name" [attr=val, ...]: text content
+    """
+    lines = yaml_text.split("\n")
+    roots: list[_AriaNode] = []
+    # Stack of (children_list, indent) — the children list of the current
+    # parent at each indentation level.
+    stack: list[tuple[list[_AriaNode], int]] = [(roots, -1)]
+
+    for line in lines:
+        stripped = line.rstrip()
+        if not stripped.strip():
+            continue
+
+        indent = len(line) - len(line.lstrip())
+        m = _ARIA_LINE_RE.match(stripped.strip())
+        if not m:
+            continue
+
+        role = m.group(1)
+        name = m.group(2) or ""
+        attrs_str = m.group(3) or ""
+        text = m.group(4) or ""
+
+        # Parse ``[level=1, disabled]`` style attributes
+        attrs: dict = {}
+        if attrs_str:
+            for part in attrs_str.split(","):
+                part = part.strip()
+                if "=" in part:
+                    k, v = part.split("=", 1)
+                    attrs[k.strip()] = v.strip()
+                elif part:
+                    attrs[part] = True
+
+        node = _AriaNode(role=role, name=name, attrs=attrs, text=text)
+
+        # Pop back to the correct parent based on indentation
+        while stack[-1][1] >= indent:
+            stack.pop()
+        stack[-1][0].append(node)
+        stack.append((node.children, indent))
+
+    return roots
+
+
+def _mark_kept_nodes(nodes: list[_AriaNode]) -> None:
+    """Walk *nodes* bottom-up; set ``_keep=True`` on interactive elements,
+    headings, and any node that has a kept descendant (parent chain)."""
+    for node in nodes:
+        _mark_kept_nodes(node.children)
+        if node.role in _ALWAYS_KEEP or any(
+            getattr(c, "_keep", False) for c in node.children
+        ):
+            node._keep = True  # type: ignore[attr-defined]
+
+
+def _prune_tree(nodes: list[_AriaNode]) -> list[_AriaNode]:
+    """Return a new tree containing only nodes marked ``_keep``."""
+    result: list[_AriaNode] = []
+    for node in nodes:
+        if not getattr(node, "_keep", False):
+            continue
+        kept = _AriaNode(
+            role=node.role,
+            name=node.name,
+            attrs=dict(node.attrs),
+            text=node.text if not node.children else "",
+        )
+        kept.children = _prune_tree(node.children)
+        result.append(kept)
+    return result
+
+
+def _count_interactive(nodes: list[_AriaNode]) -> int:
+    """Count interactive elements in (filtered) tree."""
+    n = 0
+    for node in nodes:
+        if node.role in _INTERACTIVE_ROLES:
+            n += 1
+        n += _count_interactive(node.children)
+    return n
+
+
+def _serialize_aria_tree(nodes: list[_AriaNode], indent: int = 0) -> str:
+    """Serialize a filtered ARIA tree to compact YAML-like text."""
+    lines: list[str] = []
+    prefix = "  " * indent
+
+    for node in nodes:
+        line = f"{prefix}- {node.role}"
+        if node.name:
+            line += f' "{node.name}"'
+        if node.attrs:
+            attr_parts: list[str] = []
+            for k, v in node.attrs.items():
+                if v is True:
+                    attr_parts.append(k)
+                else:
+                    attr_parts.append(f"{k}={v}")
+            line += f" [{', '.join(attr_parts)}]"
+
+        if node.children:
+            line += ":"
+            lines.append(line)
+            lines.append(_serialize_aria_tree(node.children, indent + 1))
+        elif node.text:
+            line += f": {node.text}"
+            lines.append(line)
+        else:
+            lines.append(line)
+
+    return "\n".join(lines)
+
+
+def _distill_aria_snapshot(raw_yaml: str) -> tuple[str, int, int]:
+    """Parse, filter, and re-serialize an ARIA snapshot.
+
+    Returns ``(distilled_text, raw_chars, interactive_count)``.
+    """
+    nodes = _parse_aria_yaml(raw_yaml)
+    _mark_kept_nodes(nodes)
+    filtered_nodes = _prune_tree(nodes)
+    interactive_count = _count_interactive(filtered_nodes)
+    distilled = _serialize_aria_tree(filtered_nodes)
+    return distilled, len(raw_yaml), interactive_count
 
 
 def _extract_json(text: str) -> Optional[dict]:
@@ -105,6 +338,7 @@ class AgentExplorer:
         self._audit_entries: list[AuditLogEntry] = []
         self._paused: bool = False
         self._confirmation_callback: Optional[Callable[[AgentAction], Awaitable[bool]]] = None
+        self._message_history: list[dict] = []  # raw per-session multi-turn history
 
     # ------------------------------------------------------------------
     # Main exploration loop
@@ -121,6 +355,7 @@ class AgentExplorer:
             List of all AuditLogEntry records for this session.
         """
         self._audit_entries = []
+        self._message_history = []  # fresh history per explore() call
         current_page = start_page
         actions_taken = 0
 
@@ -145,17 +380,43 @@ class AgentExplorer:
 
             current_url = current_page.url
 
-            # Ask LLM what to do
-            action = await self._ask_llm(snapshot, current_url)
+            # Build user turn: outcome of previous action (if any) + current snapshot
+            user_content = self._build_user_turn(snapshot, current_url, actions_taken)
+            self._message_history.append({"role": "user", "content": user_content})
+
+            # Manage context window before sending to LLM
+            managed_messages = self._manage_context()
+
+            # Ask LLM with full multi-turn history
+            action = await self._ask_llm(managed_messages)
 
             if action is None or action.get("action") == "done":
                 logger.info("%s signaled exploration complete after %d actions", self.config.llm_provider, actions_taken)
                 break
 
+            # Record assistant response in raw history
+            self._message_history.append(
+                {"role": "assistant", "content": json.dumps(action)}
+            )
+
             # Check denylist
             if self._is_denied(action):
                 logger.warning("Action blocked by denylist: %s on '%s'",
                                action.get("action"), action.get("target"))
+                # Record the denied action as a failed entry so the model
+                # knows it was rejected and can learn from it.
+                self._audit_entries.append(AuditLogEntry(
+                    action=AgentAction(
+                        action_type=ActionType(action.get("action", "click"))
+                        if action.get("action", "") in ActionType.__members__
+                        else ActionType.WAIT,
+                        target_text=action.get("target", ""),
+                        current_url=current_url,
+                        reasoning=action.get("reasoning", ""),
+                    ),
+                    success=False,
+                    error_message="Blocked by denylist",
+                ))
                 continue
 
             # Check for registration forms (separate from destructive denylist):
@@ -169,6 +430,16 @@ class AgentExplorer:
                         approved = await self._request_confirmation(action)
                         if not approved:
                             logger.info("Registration action denied (no callback)")
+                            self._audit_entries.append(AuditLogEntry(
+                                action=AgentAction(
+                                    action_type=ActionType.CLICK,
+                                    target_text=action.get("target", ""),
+                                    current_url=current_url,
+                                    reasoning=action.get("reasoning", ""),
+                                ),
+                                success=False,
+                                error_message="Registration action denied",
+                            ))
                             continue
                 elif self.config.registration_config:
                     logger.info("Registration form detected; delegating to RegistrationHandler")
@@ -202,6 +473,18 @@ class AgentExplorer:
                 approved = await self._request_confirmation(action)
                 if not approved:
                     logger.info("Human denied action: %s", action)
+                    self._audit_entries.append(AuditLogEntry(
+                        action=AgentAction(
+                            action_type=ActionType(action.get("action", "click"))
+                            if action.get("action", "") in ActionType.__members__
+                            else ActionType.CLICK,
+                            target_text=action.get("target", ""),
+                            current_url=current_url,
+                            reasoning=action.get("reasoning", ""),
+                        ),
+                        success=False,
+                        error_message="Denied by human confirmation",
+                    ))
                     continue
 
             # Execute the action
@@ -242,24 +525,39 @@ class AgentExplorer:
     # ------------------------------------------------------------------
 
     async def _capture_accessibility_tree(self, page: Page) -> Optional[str]:
-        """Capture an ARIA snapshot of the page as YAML text.
+        """Capture, distill, and return the page's interactive-element summary.
 
-        Uses Playwright's ``locator.aria_snapshot()`` (the replacement for
-        the removed ``page.accessibility.snapshot()``), scoped to the page
-        body.  The result is truncated to ``MAX_ACCESSIBILITY_YAML_CHARS``
-        with a clear marker so the LLM context stays bounded.
+        1. Fetches the raw ``aria_snapshot()`` YAML.
+        2. Distills it to interactive elements + headings + parent chains.
+        3. Applies ``MAX_ACCESSIBILITY_YAML_CHARS`` as a final safety ceiling
+           on the *filtered* output (rarely hit after distillation).
         """
         try:
-            snapshot = await page.locator("body").aria_snapshot()
-            if snapshot is None or not snapshot.strip():
+            raw = await page.locator("body").aria_snapshot()
+            if raw is None or not raw.strip():
                 return None
 
-            if len(snapshot) > MAX_ACCESSIBILITY_YAML_CHARS:
-                snapshot = (
-                    snapshot[:MAX_ACCESSIBILITY_YAML_CHARS]
-                    + "\n\n... (ARIA snapshot truncated to fit context window)"
+            distilled, raw_len, interactive_count = _distill_aria_snapshot(raw)
+
+            logger.info(
+                "Accessibility tree: %d chars raw -> %d chars after "
+                "distillation (%d interactive elements found)",
+                raw_len, len(distilled), interactive_count,
+            )
+
+            if len(distilled) > MAX_ACCESSIBILITY_YAML_CHARS:
+                logger.warning(
+                    "Distilled accessibility tree still exceeds %d chars "
+                    "(%d chars, %d interactive elements). Truncating — this "
+                    "page has an extraordinarily large interactive surface.",
+                    MAX_ACCESSIBILITY_YAML_CHARS, len(distilled), interactive_count,
                 )
-            return snapshot
+                distilled = (
+                    distilled[:MAX_ACCESSIBILITY_YAML_CHARS]
+                    + "\n\n... (truncated after distillation)"
+                )
+
+            return distilled
         except Exception as exc:
             logger.warning("Failed to capture accessibility tree: %s", exc)
             return None
@@ -268,18 +566,14 @@ class AgentExplorer:
     # LLM interaction (multi-provider via httpx)
     # ------------------------------------------------------------------
 
-    async def _ask_llm(self, snapshot: str, current_url: str) -> Optional[dict]:
-        """Send the ARIA snapshot YAML text to the configured LLM provider."""
-        snapshot_text = snapshot
-        if len(snapshot_text) > 100_000:
-            snapshot_text = snapshot_text[:100_000] + "\n... (truncated)"
+    async def _ask_llm(self, messages: list[dict]) -> Optional[dict]:
+        """Send the accumulated multi-turn conversation to the configured LLM provider.
 
-        message = (
-            f"Current URL: {current_url}\n\n"
-            f"Accessibility tree snapshot:\n{snapshot_text}\n\n"
-            "What is the next action to explore this application?"
-        )
-
+        Args:
+            messages: List of ``{"role": ..., "content": ...}`` dicts forming
+                      the full conversation (user / assistant turns only —
+                      system prompt is added per-provider by the callee).
+        """
         provider = self.config.llm_provider.lower()
         api_key = self.config.llm_api_key
         model = self.config.llm_model
@@ -287,9 +581,9 @@ class AgentExplorer:
 
         try:
             if provider == "anthropic":
-                resp = await self._call_anthropic(api_key, model, base_url, message)
+                resp = await self._call_anthropic(api_key, model, base_url, messages)
             elif provider in ("openai", "deepseek"):
-                resp = await self._call_openai_compatible(provider, api_key, model, base_url, message)
+                resp = await self._call_openai_compatible(provider, api_key, model, base_url, messages)
             else:
                 logger.error("Unknown LLM provider: %s", provider)
                 return None
@@ -310,7 +604,7 @@ class AgentExplorer:
             logger.error("LLM API error (%s): %s", provider, exc)
             return None
 
-    async def _call_anthropic(self, api_key, model, base_url, message):
+    async def _call_anthropic(self, api_key, model, base_url, messages: list[dict]):
         url = base_url or "https://api.anthropic.com"
         url = url.rstrip("/") + "/v1/messages"
         headers = {
@@ -320,13 +614,15 @@ class AgentExplorer:
         }
         body = {
             "model": model,
-            "max_tokens": self.config.llm_max_tokens,
+            "max_tokens": self.config.llm_max_tokens or _ANTHROPIC_DEFAULT_MAX_TOKENS,
             "system": ACTION_SYSTEM_PROMPT,
-            "messages": [{"role": "user", "content": message}],
+            "messages": messages,
+            "tools": [_ACTION_TOOL_ANTHROPIC],
+            "tool_choice": {"type": "tool", "name": "take_action"},
         }
         return await self._client.post(url, json=body, headers=headers)
 
-    async def _call_openai_compatible(self, provider, api_key, model, base_url, message):
+    async def _call_openai_compatible(self, provider, api_key, model, base_url, messages: list[dict]):
         if base_url:
             url = base_url.rstrip("/") + "/chat/completions"
         elif provider == "openai":
@@ -337,30 +633,89 @@ class AgentExplorer:
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
         }
+        # Prepend system prompt as the first message
+        full_messages = [{"role": "system", "content": ACTION_SYSTEM_PROMPT}] + messages
         body = {
             "model": model,
-            "max_tokens": self.config.llm_max_tokens,
-            "messages": [
-                {"role": "system", "content": ACTION_SYSTEM_PROMPT},
-                {"role": "user", "content": message},
-            ],
+            "messages": full_messages,
         }
+        # Only OpenAI uses native tool calling.
+        # DeepSeek's tool-calling support is not confirmed — it stays on
+        # the text-extraction path (see _parse_llm_response).
+        if provider == "openai":
+            body["tools"] = [_ACTION_TOOL_OPENAI]
+            body["tool_choice"] = {
+                "type": "function",
+                "function": {"name": "take_action"},
+            }
+        if self.config.llm_max_tokens is not None:
+            body["max_tokens"] = self.config.llm_max_tokens
         return await self._client.post(url, json=body, headers=headers)
 
     def _parse_llm_response(self, provider, response) -> Optional[dict]:
-        """Extract action JSON from provider-specific API response."""
+        """Extract the action dict from a provider-specific API response.
+
+        Priority order per provider:
+
+        * **Anthropic** — native ``tool_use`` content block (guaranteed by
+          ``tool_choice``).
+        * **OpenAI** — native ``tool_calls`` in the message (guaranteed by
+          ``tool_choice``).
+        * **DeepSeek** — text-extraction fallback (tool-calling support is
+          not confirmed for DeepSeek's API, so we keep the existing
+          ``_extract_json`` path).
+        * Any provider — if the structured field is absent for any reason,
+          fall back to text extraction on the first text / content block.
+        """
         data = response.json()
+
+        # ---- Anthropic: tool_use block ----------------------------------
         if provider == "anthropic":
             content = data.get("content", [])
-            text = content[0]["text"].strip() if content else ""
-        else:
-            choices = data.get("choices", [])
-            text = choices[0].get("message", {}).get("content", "").strip() if choices else ""
+            for block in content:
+                if block.get("type") == "tool_use":
+                    parsed = block.get("input")
+                    if parsed:
+                        logger.debug("LLM (anthropic) tool-use: %s", parsed)
+                        return parsed
+            # Fallback: text content (should rarely happen with tool_choice)
+            text = next(
+                (b.get("text", "") for b in content if b.get("type") == "text"), ""
+            ).strip()
+            if text:
+                parsed = _extract_json(text)
+                if parsed is not None:
+                    logger.debug("LLM (anthropic) text fallback: %s", parsed)
+                    return parsed
+            logger.warning(
+                "Could not parse Anthropic response. Content blocks: %s", content
+            )
+            return None
 
+        # ---- OpenAI / DeepSeek -------------------------------------------
+        choices = data.get("choices", [])
+        msg = choices[0].get("message", {}) if choices else {}
+
+        # OpenAI: tool_calls in the message
+        tool_calls = msg.get("tool_calls", [])
+        if tool_calls:
+            try:
+                raw_args = tool_calls[0]["function"]["arguments"]
+                parsed = json.loads(raw_args)
+                logger.debug("LLM (%s) tool-call: %s", provider, parsed)
+                return parsed
+            except (json.JSONDecodeError, KeyError, IndexError) as exc:
+                logger.warning(
+                    "Failed to parse %s tool-call arguments: %s", provider, exc
+                )
+
+        # Text-extraction fallback (DeepSeek + any unexpected response shape)
+        text = msg.get("content", "").strip()
         parsed = _extract_json(text)
         if parsed is not None:
-            logger.debug("LLM (%s) response: %s", provider, parsed)
+            logger.debug("LLM (%s) text: %s", provider, parsed)
             return parsed
+
         logger.warning(
             "Could not parse JSON from %s response. Extracted content "
             "length=%d, content=%r. Full raw response: %s",
@@ -372,10 +727,113 @@ class AgentExplorer:
     async def _ask_claude(self, snapshot, current_url):
         import warnings
         warnings.warn("_ask_claude is deprecated; use _ask_llm", DeprecationWarning, stacklevel=2)
-        return await self._ask_llm(snapshot, current_url)
+        user_msg = (
+            f"Current URL: {current_url}\n\n"
+            f"Accessibility tree snapshot:\n{snapshot}\n\n"
+            "What is the next action to explore this application?"
+        )
+        return await self._ask_llm([{"role": "user", "content": user_msg}])
 
     # ------------------------------------------------------------------
-    # Action execution
+    # Multi-turn conversation building & context window management
+    # ------------------------------------------------------------------
+
+    def _build_user_turn(self, snapshot: str, current_url: str, actions_taken: int) -> str:
+        """Build the user-message content for this turn.
+
+        On the very first turn (actions_taken == 0) this is just the
+        current snapshot.  On subsequent turns it prepends the outcome
+        of the *previous* action so the model learns what happened.
+        """
+        base = (
+            f"Current URL: {current_url}\n\n"
+            f"Accessibility tree snapshot:\n{snapshot}\n\n"
+            "What is the next action to explore this application?"
+        )
+
+        if actions_taken == 0:
+            return base
+
+        # Prepend outcome of the previous action
+        prev_entry = self._audit_entries[-1]
+        action_type = prev_entry.action.action_type.value
+        target = prev_entry.action.target_text or ""
+
+        outcome = f"Your previous action ({action_type}"
+        if target:
+            outcome += f" on '{target}'"
+        outcome += f") {'succeeded' if prev_entry.success else 'failed'}"
+        if prev_entry.error_message:
+            outcome += f": {prev_entry.error_message}"
+        outcome += "."
+
+        # Note URL change if the page navigated
+        prev_url = prev_entry.action.current_url
+        if current_url != prev_url:
+            outcome += f" Navigated to {current_url}."
+
+        return outcome + "\n\n" + base
+
+    def _manage_context(self) -> list[dict]:
+        """Return a windowed copy of ``_message_history`` suitable for the LLM.
+
+        - The most recent ``history_snapshot_window`` user messages keep
+          their full accessibility-tree YAML.
+        - Older user messages are condensed to one-line summaries.
+        - A hard ``max_history_chars`` ceiling is enforced by dropping
+          the oldest (already-condensed) user+assistant pairs from the
+          front.
+        """
+        msgs = [dict(m) for m in self._message_history]
+        if not msgs:
+            return msgs
+
+        window = self.config.history_snapshot_window
+        max_chars = self.config.max_history_chars
+
+        # ---- phase 1: condense old snapshots --------------------------------
+        user_indices = [i for i, m in enumerate(msgs) if m["role"] == "user"]
+
+        if len(user_indices) > window:
+            keep_full = set(user_indices[-window:])
+            for step_num, idx in enumerate(user_indices, start=1):
+                if idx in keep_full:
+                    continue
+                msgs[idx]["content"] = self._condense_snapshot_message(
+                    msgs[idx]["content"], step_num
+                )
+
+        # ---- phase 2: enforce hard character ceiling ------------------------
+        total = sum(len(m["content"]) for m in msgs)
+        while total > max_chars and len(msgs) >= 2:
+            removed = msgs.pop(0)  # oldest user
+            total -= len(removed["content"])
+            if msgs and msgs[0]["role"] == "assistant":
+                removed = msgs.pop(0)
+                total -= len(removed["content"])
+
+        return msgs
+
+    @staticmethod
+    def _condense_snapshot_message(content: str, step_num: int) -> str:
+        """Replace a full-snapshot user message with a compact one-liner.
+
+        Splits on the ``Accessibility tree snapshot:`` marker, keeps only
+        the outcome/URL prefix, and formats it as ``Step N: …``.
+        """
+        parts = content.split("\n\nAccessibility tree snapshot:", 1)
+        outcome = parts[0].strip() if parts else content
+
+        # Normalise whitespace and strip the trailing prompt
+        outcome = outcome.replace("Current URL:", "URL:")
+        outcome = " ".join(outcome.split())
+        outcome = outcome.replace("\n\nWhat is the next action to explore this application?", "")
+        # Also handle the case where it was on the same "line" after collapse
+        if "What is the next action" in outcome:
+            outcome = outcome.split("What is the next action")[0].strip()
+
+        return f"Step {step_num}: {outcome}"
+
     # ------------------------------------------------------------------
 
     async def _execute_action(

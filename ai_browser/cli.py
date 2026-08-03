@@ -133,13 +133,12 @@ def main(ctx: click.Context):
 @click.option(
     "--llm-max-tokens",
     type=int,
-    default=4096,
-    show_default=True,
+    default=None,
     envvar="AIBROWSER_LLM_MAX_TOKENS",
-    help="Max tokens for LLM API calls during agent exploration. "
-    "Reasoning-enabled models (e.g. DeepSeek v4) consume tokens "
-    "on internal reasoning before the final answer — too low a "
-    "value can result in empty responses.",
+    help="Max tokens for LLM API calls. If unset, Anthropic still "
+    "requires a value (falls back to 4096 internally, since "
+    "its API mandates this field); OpenAI/DeepSeek omit the "
+    "field entirely and use the provider's own default.",
 )
 @click.option(
     "--anthropic-api-key",
@@ -265,7 +264,7 @@ def crawl(
     llm_model: Optional[str],
     llm_api_key: Optional[str],
     llm_base_url: Optional[str],
-    llm_max_tokens: int,
+    llm_max_tokens: Optional[int],
     anthropic_api_key: Optional[str],
     register: bool,
     register_email: Optional[str],
@@ -447,7 +446,7 @@ async def _run_crawl(
     llm_model: Optional[str],
     llm_api_key: Optional[str],
     llm_base_url: Optional[str],
-    llm_max_tokens: int,
+    llm_max_tokens: Optional[int],
     do_register: bool,
     register_email: Optional[str],
     register_password: str,

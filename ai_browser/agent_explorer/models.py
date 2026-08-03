@@ -76,14 +76,29 @@ class ExplorerConfig(BaseModel):
         default="",
         description="Custom base URL. Falls back to provider default if empty.",
     )
-    llm_max_tokens: int = Field(
-        default=4096,
+    llm_max_tokens: Optional[int] = Field(
+        default=None,
+        description="Maximum tokens for the LLM completion. If None, the value "
+        "is chosen per-provider: Anthropic always requires max_tokens "
+        "(falls back to 4096 internally); OpenAI/DeepSeek omit the "
+        "field entirely and use the provider's own default.",
+    )
+
+    # Context window management for multi-turn conversation memory
+    history_snapshot_window: int = Field(
+        default=3,
         ge=1,
-        le=32000,
-        description="Maximum tokens for the LLM completion. Default 4096 gives "
-        "substantial headroom for reasoning/thinking-mode models "
-        "(e.g. DeepSeek v4) that consume tokens on internal reasoning "
-        "before producing the final JSON response.",
+        le=20,
+        description="Number of most recent steps whose full ARIA snapshots "
+        "are kept in the LLM conversation history. Older steps are "
+        "condensed to one-line summaries to save context.",
+    )
+    max_history_chars: int = Field(
+        default=40_000,
+        ge=200,
+        description="Hard ceiling on total characters in the LLM conversation "
+        "history. When exceeded, the oldest (already-condensed) steps "
+        "are dropped from the front of the message list.",
     )
 
     # Deprecated aliases — kept for backward compat, map onto the new fields

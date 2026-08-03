@@ -60,7 +60,8 @@ class TestLLMProviderRequests:
 
 
 class TestLLMResponseParsing:
-    """Test that _parse_llm_response normalizes across providers."""
+    """Test that _parse_llm_response normalizes across providers —
+    including the new structured-output (tool-use / tool-calls) paths."""
 
     @staticmethod
     def _make_config(**kwargs):
@@ -70,62 +71,142 @@ class TestLLMResponseParsing:
             **kwargs,
         )
 
-    def test_parse_anthropic_response(self):
-        """Anthropic response shape is parsed correctly."""
+    # -- Anthropic tool-use (native structured output) --------------------
+
+    def test_parse_anthropic_tool_use(self):
+        """Anthropic tool_use block is extracted directly — no text parsing."""
         explorer = AgentExplorer(self._make_config(llm_provider="anthropic"))
         resp = MagicMock(spec=httpx.Response)
         resp.json.return_value = {
-            "content": [{"type": "text", "text": '{"action": "click", "target": "Login"}'}],
+            "content": [{
+                "type": "tool_use",
+                "id": "toolu_01",
+                "name": "take_action",
+                "input": {"action": "click", "target": "Login", "reasoning": "test"},
+            }],
         }
         result = explorer._parse_llm_response("anthropic", resp)
-        assert result == {"action": "click", "target": "Login"}
+        assert result == {"action": "click", "target": "Login", "reasoning": "test"}
 
-    def test_parse_openai_response(self):
-        """OpenAI response shape is parsed correctly."""
+    def test_parse_anthropic_text_fallback(self):
+        """If tool_use is absent (unusual), Anthropic falls back to text extraction."""
+        explorer = AgentExplorer(self._make_config(llm_provider="anthropic"))
+        resp = MagicMock(spec=httpx.Response)
+        resp.json.return_value = {
+            "content": [{
+                "type": "text",
+                "text": '{"action": "click", "target": "Fallback"}',
+            }],
+        }
+        result = explorer._parse_llm_response("anthropic", resp)
+        assert result == {"action": "click", "target": "Fallback"}
+
+    # -- OpenAI tool-calls (native structured output) ---------------------
+
+    def test_parse_openai_tool_calls(self):
+        """OpenAI tool_calls are parsed directly — no text extraction."""
         explorer = AgentExplorer(self._make_config(llm_provider="openai"))
         resp = MagicMock(spec=httpx.Response)
         resp.json.return_value = {
-            "choices": [{"message": {"content": '{"action": "scroll", "target": ""}'}}],
+            "choices": [{
+                "message": {
+                    "tool_calls": [{
+                        "id": "call_01",
+                        "type": "function",
+                        "function": {
+                            "name": "take_action",
+                            "arguments": '{"action": "scroll", "target": "", "reasoning": "see more"}',
+                        },
+                    }],
+                },
+            }],
         }
         result = explorer._parse_llm_response("openai", resp)
-        assert result == {"action": "scroll", "target": ""}
+        assert result == {"action": "scroll", "target": "", "reasoning": "see more"}
 
-    def test_parse_deepseek_response(self):
-        """DeepSeek response shape (same as OpenAI) is parsed correctly."""
-        explorer = AgentExplorer(self._make_config(llm_provider="deepseek"))
+    def test_parse_openai_tool_calls_invalid_json(self):
+        """If tool_calls arguments are not valid JSON, parsing returns None."""
+        explorer = AgentExplorer(self._make_config(llm_provider="openai"))
         resp = MagicMock(spec=httpx.Response)
         resp.json.return_value = {
-            "choices": [{"message": {"content": '{"action": "fill", "target": "email", "value": "x@y.com"}'}}],
-        }
-        result = explorer._parse_llm_response("deepseek", resp)
-        assert result == {"action": "fill", "target": "email", "value": "x@y.com"}
-
-    def test_parse_returns_none_on_invalid_json(self):
-        """Malformed response returns None."""
-        explorer = AgentExplorer(self._make_config())
-        resp = MagicMock(spec=httpx.Response)
-        resp.json.return_value = {
-            "choices": [{"message": {"content": "not valid json at all"}}],
+            "choices": [{
+                "message": {
+                    "tool_calls": [{
+                        "id": "call_01",
+                        "type": "function",
+                        "function": {
+                            "name": "take_action",
+                            "arguments": "not valid json {{{",
+                        },
+                    }],
+                },
+            }],
         }
         result = explorer._parse_llm_response("openai", resp)
         assert result is None
 
-    def test_all_providers_produce_same_normalized_dict(self):
-        """Regardless of provider, the output dict has the same shape."""
-        explorer = AgentExplorer(self._make_config())
-        action_json = '{"action": "click", "target": "About Us", "reasoning": "explore"}'
+    # -- DeepSeek: text-extraction fallback -------------------------------
 
-        # Anthropic
+    def test_parse_deepseek_text_extraction(self):
+        """DeepSeek stays on text-extraction path (tool-calling not confirmed)."""
+        explorer = AgentExplorer(self._make_config(llm_provider="deepseek"))
+        resp = MagicMock(spec=httpx.Response)
+        resp.json.return_value = {
+            "choices": [{
+                "message": {
+                    "content": '{"action": "fill", "target": "email", "value": "x@y.com", "reasoning": "test"}',
+                },
+            }],
+        }
+        result = explorer._parse_llm_response("deepseek", resp)
+        assert result == {
+            "action": "fill", "target": "email", "value": "x@y.com", "reasoning": "test",
+        }
+
+    def test_deepseek_invalid_json_returns_none(self):
+        """Malformed DeepSeek text content returns None."""
+        explorer = AgentExplorer(self._make_config(llm_provider="deepseek"))
+        resp = MagicMock(spec=httpx.Response)
+        resp.json.return_value = {
+            "choices": [{"message": {"content": "not valid json at all"}}],
+        }
+        result = explorer._parse_llm_response("deepseek", resp)
+        assert result is None
+
+    def test_all_providers_produce_same_normalized_dict(self):
+        """Regardless of provider and response shape, the output dict has
+        the same structure."""
+        explorer = AgentExplorer(self._make_config())
+        action = {"action": "click", "target": "About Us", "reasoning": "explore"}
+
+        # Anthropic — tool_use
         resp_a = MagicMock(spec=httpx.Response)
-        resp_a.json.return_value = {"content": [{"type": "text", "text": action_json}]}
+        resp_a.json.return_value = {
+            "content": [{"type": "tool_use", "name": "take_action", "input": action}],
+        }
         result_a = explorer._parse_llm_response("anthropic", resp_a)
 
-        # OpenAI
+        # OpenAI — tool_calls
         resp_o = MagicMock(spec=httpx.Response)
-        resp_o.json.return_value = {"choices": [{"message": {"content": action_json}}]}
+        resp_o.json.return_value = {
+            "choices": [{
+                "message": {
+                    "tool_calls": [{
+                        "function": {"name": "take_action", "arguments": json.dumps(action)},
+                    }],
+                },
+            }],
+        }
         result_o = explorer._parse_llm_response("openai", resp_o)
 
-        assert result_a == result_o
+        # DeepSeek — text extraction
+        resp_d = MagicMock(spec=httpx.Response)
+        resp_d.json.return_value = {
+            "choices": [{"message": {"content": json.dumps(action)}}],
+        }
+        result_d = explorer._parse_llm_response("deepseek", resp_d)
+
+        assert result_a == result_o == result_d
         assert result_a["action"] == "click"
         assert result_a["target"] == "About Us"
 
@@ -156,7 +237,7 @@ class TestHTTPErrorHandling:
 
         # Mock the internal call to skip actual HTTP
         with patch.object(explorer, "_call_openai_compatible", AsyncMock(return_value=resp)):
-            result = await explorer._ask_llm({"role": "test"}, "https://example.com")
+            result = await explorer._ask_llm([{"role": "user", "content": "test"}])
             # Should return None (error handled, not raised)
             assert result is None
 
@@ -173,7 +254,7 @@ class TestHTTPErrorHandling:
         )
 
         with patch.object(explorer, "_call_anthropic", AsyncMock(return_value=resp)):
-            result = await explorer._ask_llm({"role": "test"}, "https://example.com")
+            result = await explorer._ask_llm([{"role": "user", "content": "test"}])
             assert result is None
 
 
@@ -291,12 +372,13 @@ class TestNestedJSONParsing:
         assert result == {"first": 1}
 
     def test_end_to_end_parse_nested_via_explorer(self):
-        """Full _parse_llm_response path handles a nested JSON response."""
+        """Full _parse_llm_response path handles nested JSON via DeepSeek
+        text-extraction fallback (the only provider still on that path)."""
         from unittest.mock import MagicMock
 
         import httpx
 
-        explorer = AgentExplorer(self._make_config())
+        explorer = AgentExplorer(self._make_config(llm_provider="deepseek"))
         resp = MagicMock(spec=httpx.Response)
         resp.json.return_value = {
             "choices": [
@@ -310,7 +392,7 @@ class TestNestedJSONParsing:
                 }
             ]
         }
-        result = explorer._parse_llm_response("openai", resp)
+        result = explorer._parse_llm_response("deepseek", resp)
         assert result == {
             "action": "fill",
             "target": "signup",
@@ -416,13 +498,13 @@ class TestMaxTokensConfig:
             **kwargs,
         )
 
-    def test_default_max_tokens_is_4096(self):
-        """The default llm_max_tokens is 4096 (not the old 2048 or 512)."""
+    def test_default_max_tokens_is_none(self):
+        """The default llm_max_tokens is None — the field is genuinely optional."""
         config = ExplorerConfig(
             authorized_hostname="example.com",
             llm_api_key="test-key",
         )
-        assert config.llm_max_tokens == 4096
+        assert config.llm_max_tokens is None
 
     def test_custom_max_tokens_in_config(self):
         """Explicit llm_max_tokens value is stored in config."""
@@ -442,7 +524,7 @@ class TestMaxTokensConfig:
             explorer._client, "post", AsyncMock(return_value=mock_resp)
         ) as mock_post:
             await explorer._call_anthropic(
-                "key", "claude-model", None, "test message"
+                "key", "claude-model", None, [{"role": "user", "content": "test message"}]
             )
             call_body = mock_post.call_args[1]["json"]
             assert call_body["max_tokens"] == 3000
@@ -459,7 +541,7 @@ class TestMaxTokensConfig:
             explorer._client, "post", AsyncMock(return_value=mock_resp)
         ) as mock_post:
             await explorer._call_openai_compatible(
-                "openai", "key", "gpt-4o", None, "test"
+                "openai", "key", "gpt-4o", None, [{"role": "user", "content": "test"}]
             )
             call_body = mock_post.call_args[1]["json"]
             assert call_body["max_tokens"] == 4096
@@ -478,7 +560,67 @@ class TestMaxTokensConfig:
             explorer._client, "post", AsyncMock(return_value=mock_resp)
         ) as mock_post:
             await explorer._call_openai_compatible(
-                "deepseek", "key", "deepseek-chat", None, "test"
+                "deepseek", "key", "deepseek-chat", None, [{"role": "user", "content": "test"}]
             )
             call_body = mock_post.call_args[1]["json"]
             assert call_body["max_tokens"] == 2048
+
+    @pytest.mark.asyncio
+    async def test_anthropic_falls_back_when_none(self):
+        """When llm_max_tokens is None, _call_anthropic includes the
+        internal fallback of 4096 in the request body."""
+        explorer = AgentExplorer(
+            self._make_config(llm_max_tokens=None)
+        )
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+
+        with patch.object(
+            explorer._client, "post", AsyncMock(return_value=mock_resp)
+        ) as mock_post:
+            await explorer._call_anthropic(
+                "key", "claude-model", None, [{"role": "user", "content": "test message"}]
+            )
+            call_body = mock_post.call_args[1]["json"]
+            assert call_body["max_tokens"] == 4096
+
+    @pytest.mark.asyncio
+    async def test_openai_omits_max_tokens_when_none(self):
+        """When llm_max_tokens is None, _call_openai_compatible omits
+        the max_tokens key entirely from the request body."""
+        explorer = AgentExplorer(
+            self._make_config(llm_max_tokens=None)
+        )
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+
+        with patch.object(
+            explorer._client, "post", AsyncMock(return_value=mock_resp)
+        ) as mock_post:
+            await explorer._call_openai_compatible(
+                "openai", "key", "gpt-4o", None, [{"role": "user", "content": "test"}]
+            )
+            call_body = mock_post.call_args[1]["json"]
+            assert "max_tokens" not in call_body
+
+    @pytest.mark.asyncio
+    async def test_explicit_value_still_works_for_openai(self):
+        """With an explicit llm_max_tokens, _call_openai_compatible
+        includes exactly that value."""
+        explorer = AgentExplorer(
+            self._make_config(llm_max_tokens=100)
+        )
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+
+        with patch.object(
+            explorer._client, "post", AsyncMock(return_value=mock_resp)
+        ) as mock_post:
+            await explorer._call_openai_compatible(
+                "openai", "key", "gpt-4o", None, [{"role": "user", "content": "test"}]
+            )
+            call_body = mock_post.call_args[1]["json"]
+            assert call_body["max_tokens"] == 100
