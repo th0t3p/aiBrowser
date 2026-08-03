@@ -20,6 +20,7 @@ from ai_browser.crawler import Crawler, CrawlConfig, DiscoveryMethod
 from ai_browser.agent_explorer import AgentExplorer, ExplorerConfig
 from ai_browser.registration_handler import RegistrationHandler, RegistrationConfig, IMAPConfig
 from ai_browser.login_handler import LoginHandler, LoginConfig
+from ai_browser.traffic_capture import TrafficCapture
 
 from dotenv import load_dotenv
 
@@ -44,8 +45,8 @@ AUTHORIZATION_REMINDER = """
 ║  illegal and could result in criminal/civil penalties.       ║
 ║                                                              ║
 ║  All traffic is proxied through Burp Suite (127.0.0.1:8080) ║
-║  for capture via aiScraper. This tool does NOT log traffic   ║
-║  itself — Burp Suite is the source of truth.                ║
+║  and captured to output/traffic/<hostname>/ by default for    ║
+║  direct consumption by other tools (e.g. aiSSRF).            ║
 ║                                                              ║
 ║  --scope accepts glob patterns (e.g. '*.tiktok.com') to      ║
 ║  follow links across subdomains. Defaults to exact-match     ║
@@ -250,6 +251,20 @@ def main(ctx: click.Context):
     envvar="AIBROWSER_STORAGE_DIR",
     help="Directory for browser state persistence.",
 )
+@click.option(
+    "--traffic-dir",
+    default=None,
+    type=click.Path(),
+    envvar="AIBROWSER_TRAFFIC_DIR",
+    help="Directory for traffic capture output. "
+    "Defaults to output/traffic/<hostname>/.",
+)
+@click.option(
+    "--no-traffic-capture",
+    is_flag=True,
+    default=False,
+    help="Disable traffic capture entirely.",
+)
 @click.pass_context
 def crawl(
     ctx: click.Context,
@@ -283,6 +298,8 @@ def crawl(
     headless: bool,
     ca_cert: Optional[str],
     storage_dir: str,
+    traffic_dir: Optional[str],
+    no_traffic_capture: bool,
 ):
     """Crawl HOSTNAME through Burp proxy, discovering URLs and endpoints.
 
@@ -396,6 +413,8 @@ def crawl(
             output_file=output,
             hostname=hostname,
             scope_pattern=scope_pattern,
+            traffic_dir=traffic_dir,
+            no_traffic_capture=no_traffic_capture,
         )
     )
 
@@ -462,10 +481,21 @@ async def _run_crawl(
     output_file: Optional[str],
     hostname: str,
     scope_pattern: str,
+    traffic_dir: Optional[str],
+    no_traffic_capture: bool,
 ) -> None:
     """Run the full crawl pipeline."""
 
     async with BrowserSession(session_config) as session:
+        # -- traffic capture -------------------------------------------
+        capture: Optional[TrafficCapture] = None
+        if not no_traffic_capture:
+            _traffic_dir = traffic_dir or f"output/traffic/{hostname}"
+            capture = TrafficCapture(Path(_traffic_dir))
+            capture.ensure_dirs()
+            await capture.attach_to_session(session, scope_pattern)
+            click.echo(f"  Traffic capture enabled -> {_traffic_dir}/")
+
         # Phase 0: Login (before crawl, if requested)
         if do_login:
             _email = login_email or register_email
@@ -627,6 +657,10 @@ async def _run_crawl(
                     password=register_password,
                     confirmed=handler.confirmed,
                 )
+
+        # -- traffic capture summary ----------------------------------
+        if capture is not None:
+            click.echo(f"\n  {capture.summary}")
 
         # Output results
         # Deduplicate new endpoints against prior endpoints so skipped

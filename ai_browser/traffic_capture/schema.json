@@ -1,0 +1,86 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ai-browser/traffic_capture/schema.json",
+  "title": "aiBrowser Traffic Capture Record",
+  "description": "Schema for a single HTTP request/response pair captured by aiBrowser's TrafficCapture module. Other tools (e.g. aiSSRF) can read index.jsonl and validate records against this schema.",
+  "type": "object",
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "1.0",
+      "description": "Schema version identifier — always \"1.0\" for this revision."
+    },
+    "request_id": {
+      "type": "string",
+      "description": "SHA-256 hex digest of the string '{method}:{url}:{captured_at}', serving as a deterministic unique identifier for each captured request/response pair."
+    },
+    "captured_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO 8601 UTC timestamp at which the response was captured."
+    },
+    "method": {
+      "type": "string",
+      "description": "HTTP method (GET, POST, PUT, DELETE, PATCH, etc.)."
+    },
+    "url": {
+      "type": "string",
+      "format": "uri",
+      "description": "Full absolute URL of the request."
+    },
+    "query_params": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "array",
+        "items": { "type": "string" }
+      },
+      "description": "Parsed query-string parameters, where each key maps to a list of values (dict[str, list[str]]). Empty object if no query string was present."
+    },
+    "request_headers": {
+      "type": "object",
+      "additionalProperties": { "type": "string" },
+      "description": "Request headers as sent by the browser (dict[str, str]). Header names are in their original casing per the HTTP spec."
+    },
+    "request_body_ref": {
+      "type": ["string", "null"],
+      "description": "Relative path to the content-addressed request body file (e.g. 'bodies/<sha256>.bin'), or null if the body was unavailable (already consumed, network error, or no body present)."
+    },
+    "request_body_sha256": {
+      "type": ["string", "null"],
+      "description": "SHA-256 hex digest of the raw request body bytes, or null if the body was unavailable."
+    },
+    "response_status": {
+      "type": ["integer", "null"],
+      "description": "HTTP response status code (e.g. 200, 404), or null if the response was never received (e.g. network error)."
+    },
+    "response_headers": {
+      "type": "object",
+      "additionalProperties": { "type": "string" },
+      "description": "Response headers as received (dict[str, str]). Empty object if headers could not be read."
+    },
+    "response_body_ref": {
+      "type": ["string", "null"],
+      "description": "Relative path to the content-addressed response body file (e.g. 'bodies/<sha256>.bin'), or null if the body was unavailable (already consumed, network error)."
+    },
+    "response_body_sha256": {
+      "type": ["string", "null"],
+      "description": "SHA-256 hex digest of the raw response body bytes, or null if the body was unavailable."
+    }
+  },
+  "required": [
+    "schema_version",
+    "request_id",
+    "captured_at",
+    "method",
+    "url",
+    "query_params",
+    "request_headers",
+    "request_body_ref",
+    "request_body_sha256",
+    "response_status",
+    "response_headers",
+    "response_body_ref",
+    "response_body_sha256"
+  ],
+  "additionalProperties": false
+}
