@@ -507,3 +507,170 @@ class TestCrawlResultSubresourceFields:
         result = CrawlResult(config=config)
         assert result.blocked_subresource_count == 0
         assert result.blocked_subresource_hostnames == []
+
+
+class TestGuardNavigationRaceFix:
+    """Test that _guard_navigation (framenavigated handler) doesn't crash
+    when its remediation goto('about:blank') loses a race to another
+    concurrent framenavigated handler already doing the same thing."""
+
+    @staticmethod
+    def _make_config(hostname="example.com"):
+        return BrowserSessionConfig(authorized_hostname=hostname)
+
+    @staticmethod
+    def _make_mock_page_with_framenavigated_capture():
+        """Return a mock page whose page.on('framenavigated', ...) captures the
+        handler, mirroring the existing .route() capture pattern."""
+        page = AsyncMock()
+        page.url = "https://example.com"
+        page.main_frame = MagicMock()
+        page.main_frame.url = "https://example.com"
+        page._routes = {}
+        page._event_handlers = {}
+
+        async def mock_route(pattern, handler):
+            page._routes[pattern] = handler
+
+        def mock_on(event_name, handler):
+            page._event_handlers[event_name] = handler
+
+        page.route = mock_route
+        page.on = mock_on
+        page.goto = AsyncMock()
+        return page
+
+    @staticmethod
+    def _make_mock_context(page):
+        ctx = AsyncMock()
+        ctx.new_page = AsyncMock(return_value=page)
+        ctx.pages = [page]
+        ctx.add_cookies = AsyncMock()
+        ctx.storage_state = AsyncMock(return_value={"cookies": [], "origins": []})
+        ctx.close = AsyncMock()
+        return ctx
+
+    @staticmethod
+    def _make_session(config, context):
+        session = BrowserSession(config)
+        session._playwright = AsyncMock()
+        session._playwright.stop = AsyncMock()
+        session._context = context
+        session._browser = context
+        return session
+
+    async def _install_guard(self, session, page):
+        await session._install_scope_guard(page)
+
+    async def _get_framenavigated_handler(self, page):
+        """Retrieve the captured framenavigated handler installed by
+        _install_scope_guard."""
+        handler = page._event_handlers.get("framenavigated")
+        assert handler is not None, "framenavigated handler was not installed"
+        return handler
+
+    @pytest.mark.asyncio
+    async def test_goto_race_does_not_propagate_exception(self):
+        """When goto('about:blank') raises (simulating the race), the
+        framenavigated handler must NOT propagate the exception."""
+        config = self._make_config()
+        page = self._make_mock_page_with_framenavigated_capture()
+        context = self._make_mock_context(page)
+        session = self._make_session(config, context)
+        await self._install_guard(session, page)
+
+        # Simulate the race: goto("about:blank") raises
+        page.goto = AsyncMock(
+            side_effect=Exception(
+                'Page.goto: Navigation to "about:blank" is interrupted '
+                'by another navigation to "about:blank"'
+            )
+        )
+
+        handler = await self._get_framenavigated_handler(page)
+
+        # _guard_navigation checks `frame == page.main_frame` (identity).
+        # Set url on the actual main_frame to an out-of-scope domain
+        # so the handler fires its violation + remediation path.
+        page.main_frame.url = "https://lifeattiktok.com/"
+
+        # This must NOT raise — the try/except in _guard_navigation
+        # catches the goto error
+        await handler(page.main_frame)
+
+        # The handler returned without error — pass
+
+    @pytest.mark.asyncio
+    async def test_violation_recorded_even_when_goto_raises(self):
+        """The violation is still recorded in session.violations even when
+        the remediation goto raises — losing the cleanup race must never
+        mean losing the violation record."""
+        config = self._make_config()
+        page = self._make_mock_page_with_framenavigated_capture()
+        context = self._make_mock_context(page)
+        session = self._make_session(config, context)
+        await self._install_guard(session, page)
+
+        page.goto = AsyncMock(side_effect=Exception("interrupted by another navigation"))
+
+        handler = await self._get_framenavigated_handler(page)
+        page.main_frame.url = "https://lifeattiktok.com/"
+
+        await handler(page.main_frame)
+
+        # The key property: violation must be recorded regardless of goto outcome
+        assert len(session.violations) == 1
+        violation = session.violations[0]
+        assert isinstance(violation, ScopeGuardError)
+        assert violation.attempted_hostname == "lifeattiktok.com"
+        assert violation.authorized_hostname == "example.com"
+
+        # Violation event is also set
+        assert session._get_violation_event().is_set()
+
+        # goto was attempted (but raised)
+        page.goto.assert_called_once_with("about:blank")
+
+    @pytest.mark.asyncio
+    async def test_normal_goto_succeeds_violation_recorded(self):
+        """Sanity check: when goto succeeds (normal/non-race case), the
+        existing behavior is unchanged — violation recorded, goto called."""
+        config = self._make_config()
+        page = self._make_mock_page_with_framenavigated_capture()
+        context = self._make_mock_context(page)
+        session = self._make_session(config, context)
+        await self._install_guard(session, page)
+
+        # Normal case: goto works fine
+        page.goto = AsyncMock()
+
+        handler = await self._get_framenavigated_handler(page)
+        page.main_frame.url = "https://evil.com/"
+
+        await handler(page.main_frame)
+
+        # Standard behavior: violation recorded
+        assert len(session.violations) == 1
+        assert session.violations[0].attempted_hostname == "evil.com"
+
+        # goto was called
+        page.goto.assert_called_once_with("about:blank")
+
+    @pytest.mark.asyncio
+    async def test_in_scope_navigation_no_goto_called(self):
+        """When the navigation is in-scope, neither violation nor goto happens."""
+        config = self._make_config()
+        page = self._make_mock_page_with_framenavigated_capture()
+        context = self._make_mock_context(page)
+        session = self._make_session(config, context)
+        await self._install_guard(session, page)
+
+        page.goto = AsyncMock()
+
+        handler = await self._get_framenavigated_handler(page)
+        page.main_frame.url = "https://example.com/dashboard"
+
+        await handler(page.main_frame)
+
+        assert session.violations == []
+        page.goto.assert_not_called()

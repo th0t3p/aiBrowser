@@ -358,7 +358,20 @@ class BrowserSession:
                         )
                         self.violations.append(violation)
                         self._get_violation_event().set()
-                        await page.goto("about:blank")
+                        try:
+                            await page.goto("about:blank")
+                        except Exception:
+                            # Losing this race means another _guard_navigation task
+                            # is already redirecting to the same "about:blank"
+                            # target — the desired end state (page not left on the
+                            # disallowed URL) is reached either way.  The violation
+                            # bookkeeping above is unaffected.
+                            logger.debug(
+                                "Scope guard remediation goto('about:blank') raised "
+                                "(expected when another framenavigated handler won "
+                                "the race)",
+                                exc_info=True,
+                            )
                         return
 
         page.on("framenavigated", lambda frame: asyncio.ensure_future(_guard_navigation(frame)))

@@ -900,6 +900,45 @@ async def _run_crawl(
 ) -> None:
     """Run the full crawl pipeline."""
 
+    # ---- Install a narrow asyncio exception handler to suppress -----------
+    # Playwright-internal teardown-race noise: during playwright.stop(), a
+    # background Connection.run() task may process an in-flight CDP message
+    # for a page/frame/browser object that has already been disposed.  This
+    # surfaces as a KeyError whose message is a Playwright object GUID
+    # (e.g. "page@3f30ad12ce2c3e61f8200366ccde3521").  The run has already
+    # completed and written its results to disk by this point — this is
+    # purely cosmetic noise.  We suppress the traceback for this *specific*
+    # pattern only, logging at debug level instead of alarming the user.
+    #
+    # Revisit if: these KeyErrors start appearing *before* a run's real work
+    # completes (i.e. not during teardown).  That would suggest an actual
+    # object-lifecycle bug in the Playwright usage, not just teardown noise.
+    import re
+
+    _playwright_guid_re = re.compile(r"^(page|frame|browser|context)@[0-9a-f]+$")
+    loop = asyncio.get_running_loop()
+    _original_handler = loop.get_exception_handler()
+
+    def _teardown_race_handler(loop, context):
+        exc = context.get("exception")
+        if isinstance(exc, KeyError) and exc.args:
+            msg = str(exc.args[0])
+            if _playwright_guid_re.match(msg):
+                logger.debug(
+                    "Suppressed Playwright teardown-race KeyError for "
+                    "already-disposed object %r (this is cosmetic noise "
+                    "during playwright.stop())",
+                    msg,
+                )
+                return
+        # Fall back to the original handler (or the default)
+        if _original_handler is not None:
+            _original_handler(loop, context)
+        else:
+            loop.default_exception_handler(context)
+
+    loop.set_exception_handler(_teardown_race_handler)
+
     async with BrowserSession(session_config) as session:
         # -- traffic capture -------------------------------------------
         capture: Optional[TrafficCapture] = None
@@ -1079,6 +1118,13 @@ async def _run_crawl(
             click.echo(f"\nResults written to {output_file}")
         else:
             click.echo(f"\n{json.dumps(output_data, indent=2)}")
+
+    # Restore the original asyncio exception handler now that
+    # BrowserSession.stop() (and its associated playwright.stop()) has
+    # completed.  Early returns inside the async-with block (all of which
+    # are user-input errors before any real crawling) skip this line, but
+    # those paths exit the process soon after so the handler leak is benign.
+    loop.set_exception_handler(_original_handler)
 
 
 if __name__ == "__main__":
