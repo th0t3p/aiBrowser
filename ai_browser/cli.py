@@ -44,9 +44,10 @@ AUTHORIZATION_REMINDER = """
 ║  written authorization to test. Unauthorized testing is      ║
 ║  illegal and could result in criminal/civil penalties.       ║
 ║                                                              ║
-║  All traffic is proxied through Burp Suite (127.0.0.1:8080) ║
-║  and captured to output/traffic/<hostname>/ by default for    ║
-║  direct consumption by other tools (e.g. aiSSRF).            ║
+║  By default, traffic is proxied through Burp Suite            ║
+║  (127.0.0.1:8080) — use --no-proxy to route directly.         ║
+║  Traffic is captured to output/traffic/<hostname>/ by default  ║
+║  independently for other tools (e.g. aiSSRF).                 ║
 ║                                                              ║
 ║  --scope accepts glob patterns (e.g. '*.tiktok.com') to      ║
 ║  follow links across subdomains. Defaults to exact-match     ║
@@ -60,7 +61,8 @@ AUTHORIZATION_REMINDER = """
 def main(ctx: click.Context):
     """ai_browser: Automated web browsing for bug bounty reconnaissance.
 
-    All traffic is routed through Burp Suite proxy (default 127.0.0.1:8080).
+    By default, traffic is routed through Burp Suite proxy (127.0.0.1:8080)
+    via --proxy-server. Use --no-proxy to route directly to targets.
     aiScraper polls Burp's proxy history to capture and normalize traffic.
     """
     ctx.ensure_object(dict)
@@ -86,6 +88,16 @@ def main(ctx: click.Context):
     show_default=True,
     envvar="AIBROWSER_PROXY_SERVER",
     help="Burp Suite proxy address.",
+)
+@click.option(
+    "--no-proxy",
+    is_flag=True,
+    default=False,
+    envvar="AIBROWSER_NO_PROXY",
+    help="Route traffic directly to the target instead of through Burp. "
+    "Use this when Burp isn't running or you don't need live Burp "
+    "inspection for this run. aiBrowser's own traffic capture is "
+    "unaffected either way.",
 )
 @click.option(
     "--max-depth",
@@ -123,6 +135,21 @@ def main(ctx: click.Context):
     show_default=True,
     help="Maximum autonomous actions (clicks, scrolls, etc.) for "
     "the Phase 2 agent explorer.",
+)
+@click.option(
+    "--agent-task",
+    default=None,
+    envvar="AIBROWSER_AGENT_TASK",
+    help="Override the Phase 2 agent's task/instructions. Only used by "
+    "--agent-backend browser-use (the 'custom' backend is driven by a "
+    "per-step decision loop, not a single task string, so this has no "
+    "effect there). If unset, falls back to a generic "
+    "'explore thoroughly' task. Useful for pointing the agent at "
+    "something specific, e.g. "
+    "'Click through the left sidebar navigation on every documentation "
+    "page and report all linked pages' — a directive task tends to "
+    "waste less of --max-actions on re-exploring already-crawled pages "
+    "than the generic default.",
 )
 @click.option(
     "--llm-provider",
@@ -291,11 +318,13 @@ def crawl(
     authorized: bool,
     scope: Optional[str],
     proxy_server: str,
+    no_proxy: bool,
     max_depth: int,
     max_pages: int,
     agent: bool,
     agent_backend: str,
     max_actions: int,
+    agent_task: Optional[str],
     llm_provider: str,
     llm_model: Optional[str],
     llm_api_key: Optional[str],
@@ -322,10 +351,11 @@ def crawl(
     traffic_dir: Optional[str],
     no_traffic_capture: bool,
 ):
-    """Crawl HOSTNAME through Burp proxy, discovering URLs and endpoints.
+    """Crawl HOSTNAME, discovering URLs and endpoints.
 
-    HOSTNAME is the target hostname to crawl (e.g. example.com).
-    The --authorized flag MUST be provided.
+    Traffic is routed through Burp proxy by default — use --no-proxy
+    to route directly. HOSTNAME is the target hostname to crawl
+    (e.g. example.com).  The --authorized flag MUST be provided.
     """
     if not authorized:
         click.echo(AUTHORIZATION_REMINDER, err=True)
@@ -367,10 +397,20 @@ def crawl(
                 err=True,
             )
 
+    # Print proxy routing status — always visible so anyone reading
+    # a run's output can tell at a glance which mode was used.
+    if no_proxy:
+        click.echo(
+            "Running WITHOUT a proxy — traffic goes direct to the target, "
+            "not through Burp. aiBrowser's own traffic capture is unaffected."
+        )
+    else:
+        click.echo(f"Routing through proxy: {proxy_server}")
+
     # Build browser session config
     session_config = BrowserSessionConfig(
         authorized_hostname=scope_pattern,
-        proxy=ProxyConfig(server=proxy_server),
+        proxy=None if no_proxy else ProxyConfig(server=proxy_server),
         headless=headless,
         storage_dir=Path(storage_dir),
         ca_cert_path=Path(ca_cert) if ca_cert else None,
@@ -417,6 +457,7 @@ def crawl(
             run_agent=agent,
             agent_backend=agent_backend,
             max_actions=max_actions,
+            agent_task=agent_task,
             llm_provider=llm_provider,
             llm_model=llm_model,
             llm_api_key=_llm_api_key,
@@ -562,6 +603,7 @@ async def _run_phase2_browser_use(
     llm_api_key: str,
     llm_base_url: Optional[str],
     max_actions: int,
+    agent_task: Optional[str],
     hostname: str,
     scope_pattern: str,
 ) -> None:
@@ -679,14 +721,27 @@ async def _run_phase2_browser_use(
             pass
 
     # ---- Task ---------------------------------------------------------
-    task = (
-        f"Explore {hostname} thoroughly. Look for API documentation, "
-        f"developer resources, webhook/callback configuration pages, "
-        f"and other technical endpoints. Click through navigation menus, "
-        f"expand collapsed sections, and follow links that seem likely "
-        f"to reveal more of the site's structure. Do not submit any "
-        f"forms or attempt to register/sign up for anything."
+    # The no-forms/no-registration instruction is appended unconditionally,
+    # even to a custom --agent-task. Unlike the 'custom' backend
+    # (AgentExplorer), which has a separate denylist check independent of
+    # its prompt, this task string is currently the ONLY thing preventing
+    # the browser-use agent from submitting forms or registering accounts.
+    # A custom task forgetting to mention this would otherwise silently
+    # drop that constraint.
+    _no_forms_instruction = (
+        "Do not submit any forms or attempt to register/sign up for "
+        "anything, regardless of any other instructions in this task."
     )
+    if agent_task:
+        task = f"{agent_task.rstrip()} {_no_forms_instruction}"
+    else:
+        task = (
+            f"Explore {hostname} thoroughly. Look for API documentation, "
+            f"developer resources, webhook/callback configuration pages, "
+            f"and other technical endpoints. Click through navigation menus, "
+            f"expand collapsed sections, and follow links that seem likely "
+            f"to reveal more of the site's structure. {_no_forms_instruction}"
+        )
 
     bu_agent = BrowserUseAgent(
         task=task,
@@ -783,6 +838,7 @@ async def _run_crawl(
     run_agent: bool,
     agent_backend: str,
     max_actions: int,
+    agent_task: Optional[str],
     llm_provider: str,
     llm_model: Optional[str],
     llm_api_key: Optional[str],
@@ -883,6 +939,7 @@ async def _run_crawl(
                     llm_api_key=llm_api_key,
                     llm_base_url=llm_base_url,
                     max_actions=max_actions,
+                    agent_task=agent_task,
                     hostname=hostname,
                     scope_pattern=scope_pattern,
                 )

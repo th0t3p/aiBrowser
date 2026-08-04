@@ -214,6 +214,24 @@ is new and requires `browser-use==0.1.48` pinned. Control agent verbosity
 with `--max-actions` (default 20) — lower is cheaper, higher explores
 more of the site.
 
+Override the agent's task with `--agent-task` to focus exploration on
+specific pages or patterns, reducing wasted budget on re-discovering
+what the crawler already found:
+
+```bash
+# Directive task — wastes less budget than the generic default
+ai-browser crawl example.com --authorized --agent \
+    --agent-backend browser-use \
+    --agent-task "Click through the left sidebar navigation on every
+    documentation page and report all linked pages. Do not scroll
+    aimlessly — use the sidebar to discover every linked doc page."
+```
+
+The no-forms/no-registration constraint is appended automatically, so
+custom tasks don't need to include it. Only meaningful for
+`--agent-backend browser-use` (the `custom` backend uses a per-step
+decision loop, not a single task string).
+
 #### Verify browser-use safety before pointing it at a real target
 
 `--agent-backend browser-use` connects browser-use to the **same**

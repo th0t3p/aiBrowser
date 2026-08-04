@@ -47,9 +47,10 @@ class BrowserSessionConfig(BaseModel):
         description="The only hostname this session is permitted to navigate to. "
         "Any attempt to navigate to a different hostname raises ScopeGuardError.",
     )
-    proxy: ProxyConfig = Field(
+    proxy: Optional[ProxyConfig] = Field(
         default_factory=ProxyConfig,
-        description="Proxy configuration (defaults to Burp Suite on localhost:8080).",
+        description="Proxy configuration (defaults to Burp Suite on localhost:8080). "
+        "Set to None to run without any proxy — traffic goes direct to the target.",
     )
     headless: bool = Field(
         default=True,
