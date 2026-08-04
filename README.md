@@ -214,6 +214,38 @@ is new and requires `browser-use==0.1.48` pinned. Control agent verbosity
 with `--max-actions` (default 20) — lower is cheaper, higher explores
 more of the site.
 
+#### Verify browser-use safety before pointing it at a real target
+
+`--agent-backend browser-use` connects browser-use to the **same**
+Chromium process aiBrowser already launched, via CDP, rather than letting
+it spawn its own browser. Before trusting that against a real,
+adversarial-by-design target, run the standalone safety verification:
+
+```bash
+pip install -e ".[browser-use]"
+export DEEPSEEK_API_KEY="sk-..."
+export NO_PROXY=127.0.0.1,localhost   # avoid Burp intercepting the CDP handshake
+export no_proxy=127.0.0.1,localhost   # some libs only check the lowercase form
+
+python scripts/verify_browser_use_safety.py
+```
+
+This runs two independent checks and prints a PASS/FAIL verdict for each
+(overall pass requires both):
+
+1. **`allowed_domains` enforcement** — 5 repeated runs confirming a
+   disallowed domain never gets contacted, verified via Playwright's own
+   network observation (not browser-use's self-reported logs).
+2. **HTTPS through an untrusted cert + context reuse** — confirms the
+   browser accepts an untrusted/self-signed certificate (standing in for
+   Burp's MITM cert) without blocking navigation, and that browser-use is
+   genuinely reusing aiBrowser's pre-created browser context rather than
+   spinning up its own (the assumption the CDP-sharing design depends on).
+
+If either check fails, don't run `--agent-backend browser-use` against a
+real target until you understand why — see "Key design decisions" below
+for what each check is actually protecting against.
+
 `--anthropic-api-key` still works as a deprecated alias for backward
 compatibility, but new setups should use `--llm-provider` / `--llm-api-key`.
 
@@ -382,6 +414,41 @@ the denylist first, but before actually clicking or submitting anything,
 the resolved DOM element's real visible text is checked again. This
 matters because page content — the very thing being security-tested —
 can't be trusted to accurately describe itself back to the model.
+
+### browser-use connects via CDP to the same browser, not a second one
+
+`launch_persistent_context()` — used for the default `custom` backend —
+internally adds Chromium's `--remote-debugging-pipe` flag, which
+conflicts with the explicit `--remote-debugging-port` needed to expose a
+CDP endpoint (a reproducible SIGBUS). The `browser-use` backend path
+instead uses `launch()` + `new_context()`, and pre-creates that context
+**before** handing off the CDP URL — so when browser-use connects, it
+finds an existing context and reuses it rather than creating its own
+(verified directly, not assumed — see `scripts/verify_browser_use_safety.py`).
+
+HTTPS through Burp's MITM cert is handled by a Chromium-wide
+`--ignore-certificate-errors` launch argument, not by browser-use's own
+`disable_security` option. `disable_security=True` bypasses CSP and cert
+validation entirely — browser-use's own source flags this as a
+cookie-theft/malicious-iframe risk — and it's a no-op in this
+architecture anyway, since it only takes effect in the branch of
+browser-use's context setup that runs when a context is *not* already
+being reused. Given the reuse branch is what's actually exercised here,
+it's deliberately left unset rather than added "just in case."
+
+### Orphaned Chromium processes are reaped, not left to accumulate
+
+A crashed or killed run using the `browser-use` backend (the SIGBUS above
+being the original example) can leave a Chromium process running with no
+owner. Each such session records its browser's OS PID to
+`storage/pids/<hostname>.pid` (fetched via CDP's
+`SystemInfo.getProcessInfo`, since Playwright doesn't expose it
+directly). The next run for that hostname checks for a stale PID file: if
+the recorded process is still alive **and** independently confirmed to
+still look like Chromium (never trusted blindly — a PID getting recycled
+by the OS for something unrelated is a real if rare scenario), it's
+terminated before a fresh browser launches. The file is cleared on every
+clean shutdown.
 
 ### Registration is opt-in, not incidental
 
