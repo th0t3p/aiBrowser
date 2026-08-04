@@ -16,7 +16,7 @@ from urllib.parse import urlparse
 
 from playwright.async_api import async_playwright, Browser, BrowserContext, Page
 
-from ai_browser._scope import hostname_matches_scope
+from ai_browser._scope import hostname_matches_any_scope, hostname_matches_scope
 
 from .models import BrowserSessionConfig, ProxyConfig, ScopeGuardError, BlockedSubresource
 
@@ -286,7 +286,7 @@ class BrowserSession:
         async def _guard(route):
             url = route.request.url
             hostname = urlparse(url).hostname or ""
-            if not hostname_matches_scope(hostname, authorized):
+            if not hostname_matches_any_scope(hostname, authorized):
                 resource_type = getattr(route.request, "resource_type", None) or "unknown"
 
                 if resource_type == "document":
@@ -347,7 +347,7 @@ class BrowserSession:
                 url = frame.url
                 if url and url != "about:blank":
                     hostname = urlparse(url).hostname or ""
-                    if not hostname_matches_scope(hostname, authorized):
+                    if not hostname_matches_any_scope(hostname, authorized):
                         logger.warning(
                             "Scope guard detected navigation to %s via client-side redirect",
                             url,
@@ -367,10 +367,33 @@ class BrowserSession:
     # Storage state persistence (cookies, localStorage per hostname)
     # ------------------------------------------------------------------
 
+    def _resolve_storage_key(self) -> str:
+        """Return a filesystem-safe key for file/folder naming.
+
+        Uses ``storage_key`` if explicitly set.  Otherwise falls back to
+        ``authorized_hostname`` — but only when it is a plain ``str``.
+        When ``authorized_hostname`` is a list and no ``storage_key`` is
+        set, that is a programming error — raises ``ValueError`` rather
+        than silently producing a broken filename.
+        """
+        if self.config.storage_key:
+            return self.config.storage_key
+        if isinstance(self.config.authorized_hostname, str):
+            return self.config.authorized_hostname
+        raise ValueError(
+            "BrowserSessionConfig.authorized_hostname is a list, but "
+            "storage_key is not set.  Pass storage_key=<seed_hostname> when "
+            "constructing the config."
+        )
+
+    def _storage_key_safe(self) -> str:
+        """Return the storage key with colons/slashes replaced for safe filename use."""
+        return self._resolve_storage_key().replace(":", "_").replace("/", "_")
+
     def _resolve_storage_file(self) -> Path:
         """Storage file path, keyed by authorized hostname."""
         self.config.storage_dir.mkdir(parents=True, exist_ok=True)
-        safe_name = self.config.authorized_hostname.replace(":", "_").replace("/", "_")
+        safe_name = self._storage_key_safe()
         return self.config.storage_dir / f"{safe_name}.json"
 
     async def _save_storage_state(self) -> None:
@@ -484,7 +507,7 @@ class BrowserSession:
         self.config.storage_dir.mkdir(parents=True, exist_ok=True)
         pids_dir = self.config.storage_dir / "pids"
         pids_dir.mkdir(parents=True, exist_ok=True)
-        safe_name = self.config.authorized_hostname.replace(":", "_").replace("/", "_")
+        safe_name = self._storage_key_safe()
         return pids_dir / f"{safe_name}.pid"
 
     @staticmethod

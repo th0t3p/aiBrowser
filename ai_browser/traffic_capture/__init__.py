@@ -14,12 +14,12 @@ import json
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Union, List
 from urllib.parse import parse_qs, urlparse
 
 from playwright.async_api import Page, Response
 
-from ai_browser._scope import hostname_matches_scope
+from ai_browser._scope import hostname_matches_any_scope
 
 logger = logging.getLogger(__name__)
 
@@ -45,7 +45,7 @@ class TrafficCapture:
         self.bodies_dir = self.traffic_dir / "bodies"
         self.index_path = self.traffic_dir / "index.jsonl"
 
-        self._scope_pattern: Optional[str] = None
+        self._scope_pattern: Optional[Union[str, List[str]]] = None
         self._record_count: int = 0
         self._body_hashes_seen: set[str] = set()
         self._deduped_count: int = 0
@@ -59,7 +59,7 @@ class TrafficCapture:
         self.traffic_dir.mkdir(parents=True, exist_ok=True)
         self.bodies_dir.mkdir(parents=True, exist_ok=True)
 
-    async def attach_to_page(self, page: Page, scope_pattern: str) -> None:
+    async def attach_to_page(self, page: Page, scope_pattern: Union[str, List[str]]) -> None:
         """Register a ``page.on('response')`` handler that captures every
         in-scope response to the traffic store.
 
@@ -75,7 +75,7 @@ class TrafficCapture:
         page.on("response", _on_response)
 
     async def attach_to_session(
-        self, session: object, scope_pattern: str
+        self, session: object, scope_pattern: Union[str, List[str]]
     ) -> None:
         """Attach to all current and future pages in a BrowserSession.
 
@@ -121,7 +121,7 @@ class TrafficCapture:
         if not self._scope_pattern:
             return False
         hostname = urlparse(url).hostname or ""
-        return hostname_matches_scope(hostname, self._scope_pattern)
+        return hostname_matches_any_scope(hostname, self._scope_pattern)
 
     async def _capture(self, response: Response) -> None:
         request = response.request

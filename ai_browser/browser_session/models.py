@@ -1,7 +1,7 @@
 """Pydantic models for browser_session."""
 
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional, Union
 
 from pydantic import BaseModel, Field
 
@@ -42,10 +42,18 @@ class ProxyConfig(BaseModel):
 class BrowserSessionConfig(BaseModel):
     """Configuration for a BrowserSession."""
 
-    authorized_hostname: str = Field(
+    authorized_hostname: Union[str, List[str]] = Field(
         ...,
-        description="The only hostname this session is permitted to navigate to. "
-        "Any attempt to navigate to a different hostname raises ScopeGuardError.",
+        description="The hostname(s) this session is permitted to navigate to. "
+        "A single string like 'example.com' or '*.example.com', or a list of such patterns. "
+        "Any attempt to navigate to a hostname not matching ANY pattern raises ScopeGuardError.",
+    )
+    storage_key: Optional[str] = Field(
+        default=None,
+        description="Optional key for filesystem file/folder naming. "
+        "When None, falls back to authorized_hostname (only when it is a plain str). "
+        "Required when authorized_hostname is a list — used to derive safe filenames "
+        "for storage states, PID files, and credentials directories.",
     )
     proxy: Optional[ProxyConfig] = Field(
         default_factory=ProxyConfig,
@@ -95,7 +103,7 @@ class BrowserSessionConfig(BaseModel):
 class ScopeGuardError(Exception):
     """Raised when the browser attempts to navigate outside the authorized hostname."""
 
-    def __init__(self, attempted_hostname: str, authorized_hostname: str):
+    def __init__(self, attempted_hostname: str, authorized_hostname: Union[str, List[str]]):
         self.attempted_hostname = attempted_hostname
         self.authorized_hostname = authorized_hostname
         super().__init__(

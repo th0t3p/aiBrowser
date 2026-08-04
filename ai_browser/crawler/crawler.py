@@ -14,7 +14,7 @@ from urllib.robotparser import RobotFileParser
 from bs4 import BeautifulSoup
 
 from ai_browser.browser_session import BrowserSession, BrowserSessionConfig
-from ai_browser._scope import hostname_matches_scope
+from ai_browser._scope import hostname_matches_any_scope
 
 from .models import CrawlConfig, CrawlResult, DiscoveredEndpoint, DiscoveryMethod
 
@@ -170,7 +170,7 @@ class Crawler:
                 loc = sm.find("loc")
                 if loc and loc.text:
                     parsed = urlparse(loc.text)
-                    if parsed.hostname and hostname_matches_scope(parsed.hostname, self.config.scope_pattern):
+                    if parsed.hostname and hostname_matches_any_scope(parsed.hostname, self.config.scope_pattern):
                         await self._parse_sitemap(loc.text)
 
             # Extract URLs
@@ -284,7 +284,7 @@ class Crawler:
             absolute = urljoin(current_url, href)
             parsed = urlparse(absolute)
 
-            if not parsed.hostname or not hostname_matches_scope(parsed.hostname, self.config.scope_pattern):
+            if not parsed.hostname or not hostname_matches_any_scope(parsed.hostname, self.config.scope_pattern):
                 continue
             # Skip non-http schemes
             if parsed.scheme not in ("http", "https"):
@@ -317,7 +317,7 @@ class Crawler:
         """)
         for js_url in linked_scripts:
             parsed = urlparse(js_url)
-            if parsed.hostname and not hostname_matches_scope(parsed.hostname, self.config.scope_pattern):
+            if parsed.hostname and not hostname_matches_any_scope(parsed.hostname, self.config.scope_pattern):
                 continue
             try:
                 js_page = await self._session.new_page()  # type: ignore[union-attr]
@@ -339,7 +339,7 @@ class Crawler:
                     continue
                 if path.startswith("http"):
                     parsed = urlparse(path)
-                    if parsed.hostname and not hostname_matches_scope(parsed.hostname, self.config.scope_pattern):
+                    if parsed.hostname and not hostname_matches_any_scope(parsed.hostname, self.config.scope_pattern):
                         continue
                     full_url = path
                 else:

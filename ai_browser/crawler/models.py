@@ -2,7 +2,7 @@
 
 from datetime import datetime
 from enum import Enum
-from typing import Optional
+from typing import List, Optional, Union
 from urllib.parse import urlparse
 
 from pydantic import BaseModel, Field, model_validator
@@ -64,10 +64,11 @@ class CrawlConfig(BaseModel):
         description="Concrete hostname to start crawling from, e.g. 'developers.tiktok.com'. "
         "Must be a real resolvable host, not a glob pattern.",
     )
-    scope_pattern: str = Field(
+    scope_pattern: Union[str, List[str]] = Field(
         default="",
-        description="Glob pattern for which discovered hostnames are in-scope to follow, "
-        "e.g. '*.tiktok.com'. Defaults to seed_hostname (exact match) if not set.",
+        description="Glob pattern(s) for which discovered hostnames are in-scope to follow. "
+        "A single string like '*.tiktok.com', or a list of such patterns. "
+        "Defaults to seed_hostname (exact match) if not set.",
     )
     max_depth: int = Field(default=3, ge=0, le=20)
     max_pages: int = Field(default=50, ge=1, le=500)

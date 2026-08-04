@@ -15,7 +15,7 @@ import httpx
 from playwright.async_api import Page
 
 from ai_browser.browser_session import BrowserSession
-from ai_browser._scope import page_url_matches_scope
+from ai_browser._scope import page_url_matches_any_scope, display_scope
 from ai_browser.registration_handler.models import CaptchaDetected
 
 from .models import (
@@ -1317,10 +1317,10 @@ class AgentExplorer:
         """
         from ai_browser._scope import ScopeError
 
-        if not page_url_matches_scope(page.url, self.config.authorized_hostname):
+        if not page_url_matches_any_scope(page.url, self.config.authorized_hostname):
             raise ScopeError(
                 f"AgentExplorer scope violation: page at '{page.url}' "
-                f"is outside authorized scope '{self.config.authorized_hostname}'"
+                f"is outside authorized scope {display_scope(self.config.authorized_hostname)}"
             )
 
     # ------------------------------------------------------------------
@@ -1334,7 +1334,18 @@ class AgentExplorer:
 
         self.config.audit_log_path.mkdir(parents=True, exist_ok=True)
         timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-        hostname = self.config.authorized_hostname.replace(":", "_").replace("/", "_")
+
+        # Derive hostname for filename from storage_key (when set) or
+        # authorized_hostname (only when it's a plain str)
+        if self.config.storage_key:
+            hostname = self.config.storage_key.replace(":", "_").replace("/", "_")
+        elif isinstance(self.config.authorized_hostname, str):
+            hostname = self.config.authorized_hostname.replace(":", "_").replace("/", "_")
+        else:
+            raise ValueError(
+                "ExplorerConfig.authorized_hostname is a list, but "
+                "storage_key is not set."
+            )
         log_file = self.config.audit_log_path / f"{hostname}_{timestamp}.jsonl"
 
         with open(log_file, "w") as f:

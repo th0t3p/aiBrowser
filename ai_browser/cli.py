@@ -11,7 +11,7 @@ import stat
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional, Union
 
 import click
 
@@ -21,6 +21,7 @@ from ai_browser.agent_explorer import AgentExplorer, ExplorerConfig
 from ai_browser.registration_handler import RegistrationHandler, RegistrationConfig, IMAPConfig
 from ai_browser.login_handler import LoginHandler, LoginConfig
 from ai_browser.traffic_capture import TrafficCapture
+from ai_browser._scope import as_scope_list
 
 from dotenv import load_dotenv
 
@@ -81,6 +82,16 @@ def main(ctx: click.Context):
     default=None,
     help="Glob pattern for in-scope hostnames (e.g. '*.tiktok.com'). "
     "Defaults to the seed hostname (exact match only) if not provided.",
+)
+@click.option(
+    "--scope-file",
+    type=click.Path(exists=True, dir_okay=False),
+    default=None,
+    help="Path to a file with one glob scope pattern per line "
+    "(e.g. '*.tiktok.com', 'careers.tiktok.com'). Lines starting with "
+    "'#' and blank lines are ignored. Combines with --scope if both are "
+    "given (union of patterns, not override). A hostname is in-scope if "
+    "it matches ANY pattern from the combined set.",
 )
 @click.option(
     "--proxy-server",
@@ -317,6 +328,7 @@ def crawl(
     hostname: str,
     authorized: bool,
     scope: Optional[str],
+    scope_file: Optional[str],
     proxy_server: str,
     no_proxy: bool,
     max_depth: int,
@@ -384,15 +396,37 @@ def crawl(
         register_password = secrets.token_urlsafe(16)
 
     start_url = f"https://{hostname}"
-    scope_pattern = scope or hostname
+    scope_pattern: Union[str, List[str]]
+
+    # Build the combined scope pattern list
+    if scope_file:
+        _raw = Path(scope_file).read_text()
+        _file_patterns = [
+            line.strip() for line in _raw.splitlines()
+            if line.strip() and not line.strip().startswith("#")
+        ]
+        if not _file_patterns:
+            click.echo(
+                f"ERROR: --scope-file {scope_file} contains no usable patterns "
+                f"(all lines are blank or comments).",
+                err=True,
+            )
+            sys.exit(1)
+        if scope:
+            _file_patterns.append(scope)
+        scope_pattern = _file_patterns
+    elif scope:
+        scope_pattern = scope
+    else:
+        scope_pattern = hostname
 
     # If --scope is provided, warn if the seed hostname doesn't match
     if scope and hostname != scope:
-        from ai_browser._scope import hostname_matches_scope
-        if not hostname_matches_scope(hostname, scope):
+        from ai_browser._scope import hostname_matches_any_scope
+        if not hostname_matches_any_scope(hostname, scope_pattern):
             click.echo(
                 f"⚠ Warning: seed hostname '{hostname}' does not match "
-                f"scope pattern '{scope}'. The crawl will start outside its "
+                f"any scope pattern. The crawl will start outside its "
                 f"own declared scope.",
                 err=True,
             )
@@ -410,6 +444,7 @@ def crawl(
     # Build browser session config
     session_config = BrowserSessionConfig(
         authorized_hostname=scope_pattern,
+        storage_key=hostname,
         proxy=None if no_proxy else ProxyConfig(server=proxy_server),
         headless=headless,
         storage_dir=Path(storage_dir),
@@ -536,12 +571,13 @@ async def _run_phase2_custom(
     llm_base_url: Optional[str],
     llm_max_tokens: Optional[int],
     hostname: str,
-    scope_pattern: str,
+    scope_pattern: Union[str, List[str]],
 ) -> None:
     """Run aiBrowser's own AgentExplorer (default, stable)."""
     click.echo(f"\n[Phase 2] Running agent explorer on {hostname}...")
     explorer_config = ExplorerConfig(
         authorized_hostname=scope_pattern,
+        storage_key=hostname,
         llm_provider=llm_provider,
         llm_model=llm_model,
         llm_api_key=llm_api_key,
@@ -605,7 +641,7 @@ async def _run_phase2_browser_use(
     max_actions: int,
     agent_task: Optional[str],
     hostname: str,
-    scope_pattern: str,
+    scope_pattern: Union[str, List[str]],
 ) -> None:
     """Run browser-use as the Phase 2 agent engine, connected to the same
     browser process via CDP (--remote-debugging-port)."""
@@ -694,7 +730,7 @@ async def _run_phase2_browser_use(
         headless=True,
     )
     bu_context_config = BrowserContextConfig(
-        allowed_domains=[scope_pattern],
+        allowed_domains=as_scope_list(scope_pattern),
         # disable_security is deliberately NOT set here.  When cdp_url
         # is in use and the connected browser already has a context
         # (which it does — aiBrowser creates it before hand-off),
@@ -858,7 +894,7 @@ async def _run_crawl(
     email_timeout: int,
     output_file: Optional[str],
     hostname: str,
-    scope_pattern: str,
+    scope_pattern: Union[str, List[str]],
     traffic_dir: Optional[str],
     no_traffic_capture: bool,
 ) -> None:

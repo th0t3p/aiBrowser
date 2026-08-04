@@ -1,0 +1,70 @@
+# TikTok HackerOne program — in-scope hostnames/wildcards
+#
+# Extracted from: scopes_for_tiktok_at_2026-07-04_08:15:14_UTC (program scope
+# export screenshot). Includes only rows where BOTH eligible_for_bounty=TRUE
+# AND eligible_for_submission=TRUE, and asset_type is URL or WILDCARD
+# (i.e. an actual hostname pattern — mobile app store IDs and the generic
+# "Other Asset (Campaigns)" entry are excluded; see notes at the bottom).
+#
+# Format: one glob pattern per line. `*.example.com` matches subdomains;
+# it does NOT match the apex `example.com` — list that separately if it's
+# also in scope (see tiktok.com below).
+#
+# Re-verify against the live HackerOne scope before any real engagement —
+# this is a point-in-time extraction, not a live sync.
+
+*.tiktok.com
+tiktok.com
+business.tiktok.com
+ads.tiktok.com
+careers.tiktok.com
+creatormarketplace.tiktok.com
+developers.tiktok.com
+effecthouse.tiktok.com
+live-backstage.tiktok.com
+academy-outbound-ads.tiktok.com
+shop.tiktok.com
+partner.tiktokshop.com
+*.tiktokv.com
+fp-sg.tiktokv.com
+*.tiktokcdn.com
+*.tiktokpublishers.com
+*.pipopay.com
+www.pangleglobal.com
+affiliate-id.tokopedia.com
+seller-id.tokopedia.com
+shop-id.tokopedia.com
+pay.tokopediax.com
+www.soundon.global
+*.soundon.global
+
+# --- Excluded: NOT eligible (eligible_for_bounty=FALSE and/or
+# eligible_for_submission=FALSE in the source sheet) ---------------------
+# https://developers.tiktok.com/minis/
+# *.tiktokv.us
+# *us.tiktokv.com
+# p16-bg.tiktokcdn-us.com
+# p16-sign.tiktokcdn-us.com
+# p16-webcast.tiktokcdn-us.com
+# p19-sign.tiktokcdn-us.com
+# p19-webcast.tiktokcdn-us.com
+# usdsjv.tiktok.com
+# usds.tiktok.com
+# *us.tiktok.com
+
+# --- Excluded: not a hostname pattern (mobile app store IDs, or a
+# non-hostname generic scope entry — can't be used with aiBrowser's
+# hostname-based scope matching) -----------------------------------------
+# com.zhiliaoapp.musically           (GOOGLE_PLAY_APP_ID)
+# 835599320                          (APPLE_STORE_APP_ID — TikTok)
+# 1235601864                         (APPLE_STORE_APP_ID)
+# com.ss.android.ugc.trill           (GOOGLE_PLAY_APP_ID)
+# com.ss.android.ugc.now             (GOOGLE_PLAY_APP_ID)
+# 641062073                          (APPLE_STORE_APP_ID)
+# com.tiktok.tv                      (GOOGLE_PLAY_APP_ID)
+# com.zhiliao.musically.livewallpaper (GOOGLE_PLAY_APP_ID)
+# 1591003012                         (APPLE_STORE_APP_ID — TikTok Shop Seller Center)
+# com.tiktokshop.seller              (GOOGLE_PLAY_APP_ID)
+# "Other Asset (Campaigns)"          (OTHER — generic campaign-report catch-all,
+#                                      explicitly not a scope guarantee per its
+#                                      own instruction text)

@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional, Union
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -54,9 +54,16 @@ class AuditLogEntry(BaseModel):
 class ExplorerConfig(BaseModel):
     """Configuration for the AgentExplorer."""
 
-    authorized_hostname: str = Field(
+    authorized_hostname: Union[str, List[str]] = Field(
         ...,
-        description="Same scope guard as BrowserSession.",
+        description="Same scope guard as BrowserSession. "
+        "A single string like '*.example.com' or a list of such patterns.",
+    )
+    storage_key: Optional[str] = Field(
+        default=None,
+        description="Optional key for filesystem file/folder naming. "
+        "When None, falls back to authorized_hostname (only when it is a plain str). "
+        "Used for deriving audit-log filenames.",
     )
 
     # New multi-provider LLM fields (preferred)
