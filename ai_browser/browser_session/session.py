@@ -5,7 +5,10 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
+import signal
 import socket
+import subprocess
 import tempfile
 from pathlib import Path
 from typing import Optional
@@ -66,6 +69,10 @@ class BrowserSession:
     async def start(self) -> None:
         """Launch the browser, create a persistent context with proxy and scope guard."""
         logger.info("Starting BrowserSession for %s", self.config.authorized_hostname)
+
+        # ---- PID-file orphan reaping (CDP path only) --------------------
+        if self.config.expose_cdp:
+            await self._reap_orphan_if_needed()
 
         self._playwright = await async_playwright().start()
 
@@ -140,6 +147,8 @@ class BrowserSession:
         if cdp_port is not None:
             self.cdp_url = f"http://localhost:{cdp_port}"
             logger.info("CDP endpoint available at %s", self.cdp_url)
+            # Best-effort PID file write for orphan reaping on next run
+            await self._write_pid_file()
 
         # Restore persisted storage state if available
         await self._restore_storage_state()
@@ -151,6 +160,11 @@ class BrowserSession:
 
     async def stop(self) -> None:
         """Persist storage state and tear down the browser."""
+        # Clean PID file on a normal shutdown (CDP path only) so the
+        # next run doesn't mistake this for an orphaned process.
+        if self.config.expose_cdp:
+            self._clear_pid_file()
+
         if self._context:
             await self._save_storage_state()
             await self._context.close()
@@ -460,6 +474,130 @@ class BrowserSession:
             return path
         self._temp_dir = tempfile.TemporaryDirectory(prefix="ai_browser_")
         return Path(self._temp_dir.name)
+
+    # ------------------------------------------------------------------
+    # PID file (CDP-path only) — prevents orphaned Chromium accumulation
+    # ------------------------------------------------------------------
+
+    def _pid_file_path(self) -> Path:
+        """Path for the PID file, keyed by hostname (mirrors _resolve_storage_file)."""
+        self.config.storage_dir.mkdir(parents=True, exist_ok=True)
+        pids_dir = self.config.storage_dir / "pids"
+        pids_dir.mkdir(parents=True, exist_ok=True)
+        safe_name = self.config.authorized_hostname.replace(":", "_").replace("/", "_")
+        return pids_dir / f"{safe_name}.pid"
+
+    @staticmethod
+    def _is_process_alive(pid: int) -> bool:
+        """Return True if a process with *pid* exists (best-effort)."""
+        try:
+            os.kill(pid, 0)
+            return True
+        except (OSError, ProcessLookupError):
+            return False
+
+    @staticmethod
+    def _is_chromium_process(pid: int) -> bool:
+        """Return True if *pid* appears to be a Chromium/Chrome process.
+
+        Checks the process command line via ``ps`` (works on macOS and
+        Linux).  Returns False if the check can't be performed or the
+        process doesn't look like Chromium/Chrome.
+        """
+        try:
+            result = subprocess.run(
+                ["ps", "-p", str(pid), "-o", "command="],
+                capture_output=True, text=True, timeout=5,
+            )
+            cmdline = result.stdout.lower()
+            return "chrome" in cmdline or "chromium" in cmdline
+        except Exception:
+            return False
+
+    async def _write_pid_file(self) -> None:
+        """Write the browser process PID to a PID file via CDP.
+
+        Uses CDP's ``SystemInfo.getProcessInfo`` to find the PID of the
+        ``"browser"``-type process.  Best-effort — failure here is logged
+        and does not break the session.
+        """
+        try:
+            cdp = await self._browser.new_browser_cdp_session()  # type: ignore[union-attr]
+            info = await cdp.send("SystemInfo.getProcessInfo")
+            for entry in info.get("processInfo", []):
+                if entry.get("type") == "browser":
+                    pid = entry["id"]
+                    self._pid_file_path().write_text(str(pid))
+                    logger.debug("PID file written: %s (pid=%d)", self._pid_file_path(), pid)
+                    return
+            logger.debug("SystemInfo.getProcessInfo did not include a 'browser' entry")
+        except Exception as exc:
+            logger.debug("Failed to write PID file: %s", exc)
+
+    async def _reap_orphan_if_needed(self) -> None:
+        """Check for a leftover PID file from a previous crashed run and
+        terminate the process if it's still alive and confirmed Chromium.
+
+        Safety property: never sends a termination signal to a PID that
+        hasn't been independently confirmed to be a Chromium process
+        (guarding against PID recycling by the OS between runs).
+        """
+        pid_file = self._pid_file_path()
+        if not pid_file.exists():
+            return
+
+        try:
+            stale_pid = int(pid_file.read_text().strip())
+        except (ValueError, OSError):
+            pid_file.unlink(missing_ok=True)
+            return
+
+        if not self._is_process_alive(stale_pid):
+            logger.debug("Stale PID file for pid=%d (no longer alive) — removing", stale_pid)
+            pid_file.unlink(missing_ok=True)
+            return
+
+        if not self._is_chromium_process(stale_pid):
+            logger.warning(
+                "PID file for pid=%d exists and process is alive, but it does "
+                "NOT appear to be a Chromium process (PID likely recycled by "
+                "the OS).  Leaving the process alone and removing the stale "
+                "record.", stale_pid,
+            )
+            pid_file.unlink(missing_ok=True)
+            return
+
+        # Alive and confirmed Chromium — reap it
+        logger.warning(
+            "Orphaned Chromium process detected (pid=%d) — attempting graceful "
+            "shutdown", stale_pid,
+        )
+        try:
+            os.kill(stale_pid, signal.SIGTERM)
+        except OSError:
+            pass
+
+        # Poll for up to ~2s, then escalate
+        for _ in range(10):
+            await asyncio.sleep(0.2)
+            if not self._is_process_alive(stale_pid):
+                logger.info("Orphaned Chromium (pid=%d) terminated cleanly", stale_pid)
+                break
+        else:
+            logger.warning(
+                "Orphaned Chromium (pid=%d) did not respond to SIGTERM — "
+                "sending SIGKILL", stale_pid,
+            )
+            try:
+                os.kill(stale_pid, signal.SIGKILL)
+            except OSError:
+                pass
+
+        pid_file.unlink(missing_ok=True)
+
+    def _clear_pid_file(self) -> None:
+        """Remove the PID file on a clean shutdown (not an orphan)."""
+        self._pid_file_path().unlink(missing_ok=True)
 
     @property
     def context(self) -> Optional[BrowserContext]:

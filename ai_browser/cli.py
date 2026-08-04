@@ -653,7 +653,14 @@ async def _run_phase2_browser_use(
     )
     bu_context_config = BrowserContextConfig(
         allowed_domains=[scope_pattern],
-        disable_security=True,  # Burp CA cert — allow HTTPS through proxy
+        # disable_security is deliberately NOT set here.  When cdp_url
+        # is in use and the connected browser already has a context
+        # (which it does — aiBrowser creates it before hand-off),
+        # browser-use's _create_context() reuses browser.contexts[0]
+        # and skips the branch where disable_security would apply.
+        # The actual HTTPS-through-Burp fix is the
+        # --ignore-certificate-errors Chromium launch arg in
+        # BrowserSession.start().
         wait_for_network_idle_page_load_time=1.0,
         minimum_wait_page_load_time=0.5,
         maximum_wait_page_load_time=5.0,
@@ -729,8 +736,7 @@ async def _run_phase2_browser_use(
 
     agent_urls: set[str] = set()
     for url in visited_urls:
-        if not url or url == "about:blank":
-            continue
+        # Empty/blank filtering is handled by _extract_urls_from_browser_use_result
         normalized = Crawler._normalize(url)
         agent_urls.add(normalized)
         result.add_endpoint(url, DiscoveryMethod.AGENT_EXPLORATION)
@@ -751,12 +757,21 @@ def _extract_urls_from_browser_use_result(bu_result) -> list[str]:
 
     Uses the ``urls()`` method confirmed correct via verify_browser_use_safety.py
     testing — it returns ``[h.state.url for h in self.history]``.
+
+    Filters out None entries, empty strings, and ``"about:blank"``.
+    ``urls()`` has been observed to include a leading empty string, and
+    failed/initial navigation state is often ``"about:blank"`` rather
+    than ``None``.  The caller should handle deduplication — this
+    function returns URLs in the order they were visited, including
+    duplicates.
     """
     if bu_result is None:
         return []
     if hasattr(bu_result, "urls"):
-        # AgentHistoryList.urls() returns list[str | None]
-        return [u for u in bu_result.urls() if u is not None]
+        return [
+            u for u in bu_result.urls()
+            if u is not None and u != "" and u != "about:blank"
+        ]
     return []
 
 
