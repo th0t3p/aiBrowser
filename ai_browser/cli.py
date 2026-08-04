@@ -653,6 +653,7 @@ async def _run_phase2_browser_use(
     )
     bu_context_config = BrowserContextConfig(
         allowed_domains=[scope_pattern],
+        disable_security=True,  # Burp CA cert — allow HTTPS through proxy
         wait_for_network_idle_page_load_time=1.0,
         minimum_wait_page_load_time=0.5,
         maximum_wait_page_load_time=5.0,
@@ -728,7 +729,7 @@ async def _run_phase2_browser_use(
 
     agent_urls: set[str] = set()
     for url in visited_urls:
-        if url == "about:blank":
+        if not url or url == "about:blank":
             continue
         normalized = Crawler._normalize(url)
         agent_urls.add(normalized)

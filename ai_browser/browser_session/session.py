@@ -85,6 +85,11 @@ class BrowserSession:
                 s.bind(("127.0.0.1", 0))
                 cdp_port = s.getsockname()[1]
             launch_options["args"].append(f"--remote-debugging-port={cdp_port}")
+            # Chromium-wide cert ignore — needed because browser-use
+            # reuses our CDP context but creates its own pages through
+            # a separate Playwright connection that doesn't inherit our
+            # per-context ignore_https_errors setting.
+            launch_options["args"].append("--ignore-certificate-errors")
 
         # If a CA cert path is provided, add it via --ignore-certificate-errors-spki-list
         # or set the NSS cert db via --user-data-dir. The primary method is
@@ -95,20 +100,40 @@ class BrowserSession:
             )
             logger.info("Burp CA cert configured from %s", self.config.ca_cert_path)
 
-        self._browser = await self._playwright.chromium.launch_persistent_context(
-            user_data_dir=str(user_data_dir),
-            headless=launch_options["headless"],
-            args=launch_options["args"],
-            proxy=self.config.proxy.playwright_proxy if self.config.proxy else None,
-            viewport={
-                "width": self.config.viewport_width,
-                "height": self.config.viewport_height,
-            },
-            locale=self.config.locale,
-            timezone_id=self.config.timezone_id,
-            ignore_https_errors=self.config.ignore_https_errors,
-        )
-        self._context = self._browser
+        # launch_persistent_context() internally adds --remote-debugging-pipe
+        # which conflicts with --remote-debugging-port (SIGBUS on chromium-1228).
+        # When CDP is needed, use launch() + new_context() instead —
+        # the same pattern verified working in scripts/verify_browser_use_safety.py.
+        if self.config.expose_cdp:
+            self._browser = await self._playwright.chromium.launch(
+                headless=launch_options["headless"],
+                args=launch_options["args"],
+                proxy=self.config.proxy.playwright_proxy if self.config.proxy else None,
+            )
+            self._context = await self._browser.new_context(
+                viewport={
+                    "width": self.config.viewport_width,
+                    "height": self.config.viewport_height,
+                },
+                locale=self.config.locale,
+                timezone_id=self.config.timezone_id,
+                ignore_https_errors=self.config.ignore_https_errors,
+            )
+        else:
+            self._browser = await self._playwright.chromium.launch_persistent_context(
+                user_data_dir=str(user_data_dir),
+                headless=launch_options["headless"],
+                args=launch_options["args"],
+                proxy=self.config.proxy.playwright_proxy if self.config.proxy else None,
+                viewport={
+                    "width": self.config.viewport_width,
+                    "height": self.config.viewport_height,
+                },
+                locale=self.config.locale,
+                timezone_id=self.config.timezone_id,
+                ignore_https_errors=self.config.ignore_https_errors,
+            )
+            self._context = self._browser
 
         # Expose the CDP URL for external tools (e.g. browser-use) to
         # attach to the same browser process.
@@ -130,6 +155,11 @@ class BrowserSession:
             await self._save_storage_state()
             await self._context.close()
             self._context = None
+
+        # When using launch() (CDP path), the browser is separate from
+        # the context and must be closed independently.
+        if self._browser is not None and self._browser is not self._context:
+            await self._browser.close()
 
         if self._playwright:
             await self._playwright.stop()
