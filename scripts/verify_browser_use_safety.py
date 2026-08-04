@@ -1,22 +1,31 @@
 #!/usr/bin/env python3
-"""Standalone verification: does browser-use's allowed_domains actually prevent
-disallowed traffic from reaching the network?
+"""Standalone verification of browser-use's safety properties.
 
-This script:
-  1. Launches Chromium via Playwright directly (aiBrowser's proven config
-     with --remote-debugging-port), NOT browser-use's own launch flags
-     (which cause BUS_ADRALN crashes with chromium-1228).
-  2. Starts a local HTTP server serving a test page with two links:
-     - One to an "allowed"  domain (https://example.com)
-     - One to a "disallowed" domain (https://example.org)
-  3. Hooks Playwright's network observation directly on the browser
-     context that browser-use will reuse, recording every outgoing
-     request independently of browser-use's self-reported logs.
-  4. Runs a browser-use Agent via cdp_url, configured with
-     allowed_domains=["example.com"].
-  5. Repeats 5 times (intermittent failures observed in GitHub issues).
-  6. Prints an automated PASS/FAIL verdict based on observed network
-     requests — no manual Burp inspection required.
+Two independent checks:
+
+CHECK 1 — allowed_domains enforcement (plain HTTP)
+  Proves browser-use's allowed_domains genuinely blocks disallowed
+  network traffic.  Runs an agent against a plain-HTTP local test
+  page with two links (allowed + disallowed) and observes every
+  outgoing request via Playwright's network instrumentation.
+  Repeated 5 times for reliability (intermittent failures have been
+  observed in GitHub issues).
+
+CHECK 2 — HTTPS cert bypass + context reuse (production mirror)
+  Verifies two assumptions the aiBrowser integration in cli.py /
+  session.py depends on that Check 1 never exercises:
+
+  a) --ignore-certificate-errors (the Chromium launch arg in
+     BrowserSession.start()'s expose_cdp path) actually allows an
+     untrusted/MITM'd HTTPS page to load — the real-world equivalent
+     of routing through Burp Suite's proxy with a self-signed cert.
+  b) browser-use genuinely *reuses* aiBrowser's pre-created browser
+     context when cdp_url is set, rather than creating its own.
+     This is the specific assumption that made disable_security
+     removable from cli.py's BrowserContextConfig — if it doesn't
+     hold, the reasoning behind removing it doesn't hold either.
+
+Overall pass requires both checks to pass.
 
 PREREQUISITES
 -------------
@@ -62,8 +71,12 @@ import http.server
 import logging
 import os
 import socket
+import ssl
 import sys
+import tempfile
 import threading
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse
 
@@ -146,7 +159,7 @@ def _find_free_port() -> int:
 
 
 class TestPageServer:
-    """Context manager that runs a local HTTP server in a daemon thread."""
+    """Context manager that runs a local plain-HTTP server in a daemon thread."""
 
     def __init__(self) -> None:
         self._port: int = 0
@@ -182,14 +195,119 @@ class TestPageServer:
 
 
 # ---------------------------------------------------------------------------
-# Chromium launcher — reuses aiBrowser's proven launch config.
+# Self-signed cert generation (for Check 2's HTTPS test server)
+# ---------------------------------------------------------------------------
+
+
+def _generate_self_signed_cert(tmp_dir: Path) -> tuple[Path, Path]:
+    """Generate a self-signed cert + key for CN=127.0.0.1.
+
+    Returns ``(cert_path, key_path)`` — both PEM files in *tmp_dir*.
+    """
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from cryptography.x509.oid import NameOID
+    import ipaddress
+
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    key_path = tmp_dir / "key.pem"
+    key_path.write_bytes(
+        key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.TraditionalOpenSSL,
+            encryption_algorithm=serialization.NoEncryption(),
+        )
+    )
+
+    now = datetime.now(timezone.utc)
+    subject = issuer = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "127.0.0.1")])
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(subject)
+        .issuer_name(issuer)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - timedelta(days=1))
+        .not_valid_after(now + timedelta(days=1))
+        .add_extension(
+            x509.SubjectAlternativeName([x509.IPAddress(ipaddress.IPv4Address("127.0.0.1"))]),
+            critical=False,
+        )
+        .sign(key, hashes.SHA256())
+    )
+    cert_path = tmp_dir / "cert.pem"
+    cert_path.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
+
+    return cert_path, key_path
+
+
+# ---------------------------------------------------------------------------
+# HTTPS test server (for Check 2)
+# ---------------------------------------------------------------------------
+
+
+class HttpsTestPageServer:
+    """Context manager that runs a local *HTTPS* server with a self-signed cert.
+
+    Same interface as TestPageServer: ``.start()`` / ``.stop()`` / ``.url``.
+    """
+
+    def __init__(self) -> None:
+        self._port: int = 0
+        self._server: Optional[http.server.HTTPServer] = None
+        self._thread: Optional[threading.Thread] = None
+        self._tmp_dir: Optional[tempfile.TemporaryDirectory] = None
+
+    @property
+    def url(self) -> str:
+        return f"https://127.0.0.1:{self._port}"
+
+    def start(self) -> None:
+        self._port = _find_free_port()
+        self._tmp_dir = tempfile.TemporaryDirectory(prefix="ai_browser_https_")
+        cert_path, key_path = _generate_self_signed_cert(Path(self._tmp_dir.name))
+
+        ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ssl_ctx.load_cert_chain(certfile=str(cert_path), keyfile=str(key_path))
+
+        self._server = http.server.HTTPServer(
+            ("127.0.0.1", self._port), _SinglePageHandler
+        )
+        self._server.socket = ssl_ctx.wrap_socket(
+            self._server.socket, server_side=True
+        )
+        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+        self._thread.start()
+        print(f"[server] HTTPS test page listening at {self.url}  (self-signed cert)")
+
+    def stop(self) -> None:
+        if self._server is not None:
+            self._server.shutdown()
+            self._server.server_close()
+        if self._thread is not None:
+            self._thread.join(timeout=2)
+        if self._tmp_dir is not None:
+            self._tmp_dir.cleanup()
+
+    def __enter__(self) -> "HttpsTestPageServer":
+        self.start()
+        return self
+
+    def __exit__(self, *args) -> None:
+        self.stop()
+
+
+# ---------------------------------------------------------------------------
+# Chromium launchers
 # ---------------------------------------------------------------------------
 
 _CDP_PORT = 9222
+_CDP_PORT_CHECK2 = 9223
 
 
 async def _launch_chromium_cdp():
-    """Launch Chromium with remote debugging enabled.
+    """Launch Chromium with remote debugging — for Check 1 (plain HTTP).
 
     Returns ``(playwright, cdp_browser, cdp_url)``.
     """
@@ -205,8 +323,35 @@ async def _launch_chromium_cdp():
     return playwright, cdp_browser, cdp_url
 
 
+async def _launch_chromium_cdp_like_production():
+    """Launch Chromium mirroring aiBrowser's production CDP config — for Check 2.
+
+    Mirrors BrowserSession.start()'s expose_cdp path exactly:
+    - --remote-debugging-port + --ignore-certificate-errors
+    - Pre-creates a context with ignore_https_errors=True before
+      returning the CDP URL (so browser-use sees a non-empty
+      browser.contexts list).
+
+    Returns ``(playwright, cdp_browser, cdp_url, precreated_context)``.
+    """
+    from playwright.async_api import async_playwright
+
+    playwright = await async_playwright().start()
+    cdp_browser = await playwright.chromium.launch(
+        headless=True,
+        args=[
+            f"--remote-debugging-port={_CDP_PORT_CHECK2}",
+            "--ignore-certificate-errors",
+        ],
+    )
+    cdp_url = f"http://localhost:{_CDP_PORT_CHECK2}"
+    precreated_context = await cdp_browser.new_context(ignore_https_errors=True)
+    print(f"[browser] Chromium launched (CDP at {cdp_url}, pre-created context)")
+    return playwright, cdp_browser, cdp_url, precreated_context
+
+
 # ---------------------------------------------------------------------------
-# Network observation — hooks the Playwright context browser-use reuses.
+# Network observation
 # ---------------------------------------------------------------------------
 
 
@@ -244,11 +389,6 @@ class RequestLog:
 
 
 # ---------------------------------------------------------------------------
-# browser-use Agent runner
-# ---------------------------------------------------------------------------
-
-
-# ---------------------------------------------------------------------------
 # Diagnostics: monkey-patch browser-use's JSON parse site
 # ---------------------------------------------------------------------------
 
@@ -259,11 +399,6 @@ def _install_extract_json_diagnostics() -> None:
     """Monkey-patch browser-use's extract_json_from_model_output to log
     the raw content string before the json.loads() call that fails with
     "Expecting value: line 1 column 1 (char 0)" when content is empty.
-
-    This is applied once and prints a distinctive ``[JSON-DIAG]`` prefix
-    on every call so we can confirm whether the raw LLM response content
-    is truly empty (DeepSeek thinking-mode bug) or contains text that
-    just isn't valid JSON.
     """
     global _JSON_PARSE_DIAG_INSTALLED
     if _JSON_PARSE_DIAG_INSTALLED:
@@ -290,57 +425,42 @@ def _install_extract_json_diagnostics() -> None:
 
 
 # ---------------------------------------------------------------------------
-# browser-use Agent runner
+# LLM factory (shared by both checks)
 # ---------------------------------------------------------------------------
 
 
-async def _run_single_agent(
-    test_page_url: str,
-    run_index: int,
-    cdp_url: str,
-    request_log: RequestLog,
-) -> bool:
-    """Run a single browser-use agent against the test page.
-
-    *request_log* is cleared at the start of this run and populated
-    with every outgoing request observed on the Playwright context
-    that browser-use reuses (because cdp_url is set).
-    """
-    from browser_use import Agent, Browser, BrowserConfig, BrowserContextConfig
-
-    # ---- Diagnostics: monkey-patch the JSON parse site -----------------
-    # browser-use's extract_json_from_model_output at
-    # agent/message_manager/utils.py:41 is where json.loads(content)
-    # fails with "Expecting value: line 1 column 1" when DeepSeek's
-    # thinking mode produces an empty response.  We patch it to print
-    # the raw content BEFORE the parse attempt so we can confirm
-    # whether the content is truly empty or just non-JSON text.
-    _install_extract_json_diagnostics()
-
-    # ---- LLM ----------------------------------------------------------
-    api_key = os.environ.get("DEEPSEEK_API_KEY", "")
-    if not api_key:
-        print("[SKIP] DEEPSEEK_API_KEY not set — cannot run agent")
-        return False
+def _build_llm(api_key: str) -> object:
     from langchain_deepseek import ChatDeepSeek
-
-    # deepseek-chat was retired July 24, 2026 — use v4-flash for this
-    # quick two-link test (cheaper/faster; v4-pro also works).
-    #
-    # DeepSeek V4 models are always in thinking mode by default, which is
-    # fundamentally incompatible with forced tool-calling (tool_choice="required"
-    # or naming a specific function) that browser-use relies on internally.
-    # "Thinking mode does not support this tool_choice" is a known DeepSeek V4
-    # limitation — not a bug in this script, browser-use, or langchain-deepseek.
-    # Disabling thinking mode costs us DeepSeek's reasoning capability for this
-    # run, but it's the only way to make forced tool-calling work reliably.
-    llm = ChatDeepSeek(
+    return ChatDeepSeek(
         model="deepseek-v4-flash",
         api_key=api_key,
         extra_body={"thinking": {"type": "disabled"}},
     )
 
-    # ---- Browser config -----------------------------------------------
+
+# ---------------------------------------------------------------------------
+# CHECK 1 — allowed_domains enforcement (plain HTTP, 5 runs)
+# ---------------------------------------------------------------------------
+
+
+async def _run_single_agent_check1(
+    test_page_url: str,
+    run_index: int,
+    cdp_url: str,
+    request_log: RequestLog,
+) -> bool:
+    """Run a single browser-use agent against the test page (Check 1)."""
+    from browser_use import Agent, Browser, BrowserConfig, BrowserContextConfig
+
+    _install_extract_json_diagnostics()
+
+    api_key = os.environ.get("DEEPSEEK_API_KEY", "")
+    if not api_key:
+        print("[SKIP] DEEPSEEK_API_KEY not set — cannot run agent")
+        return False
+
+    llm = _build_llm(api_key)
+
     browser_config = BrowserConfig(
         cdp_url=cdp_url,
         keep_alive=True,
@@ -348,9 +468,6 @@ async def _run_single_agent(
     )
 
     context_config = BrowserContextConfig(
-        # 127.0.0.1 is required so the agent can reach the local test server
-        # to even see the two links.  example.org is deliberately excluded —
-        # correctly blocking navigation to it is the whole point of this test.
         allowed_domains=["127.0.0.1", "example.com"],
         wait_for_network_idle_page_load_time=1.0,
         minimum_wait_page_load_time=0.5,
@@ -360,16 +477,9 @@ async def _run_single_agent(
     browser_use_browser = Browser(config=browser_config)
     browser_use_ctx = await browser_use_browser.new_context(config=context_config)
 
-    # ---- Hook Playwright network observation --------------------------
-    # When cdp_url is set, browser-use's _create_context reuses the
-    # first context from the CDP browser.  We initialize the session
-    # early so we can access the underlying Playwright context and
-    # attach our request listener before the agent starts navigating.
     await browser_use_ctx._initialize_session()
     pw_context = browser_use_ctx.session.context
 
-    # Clean slate: close every page left over from the previous run
-    # so the agent doesn't find a stale page and skip fresh navigation.
     for page in list(pw_context.pages):
         try:
             await page.close()
@@ -383,7 +493,6 @@ async def _run_single_agent(
 
     pw_context.on("request", _on_request)
 
-    # ---- Task ---------------------------------------------------------
     task = (
         f"Navigate to {test_page_url}.  You will see a page with two links: "
         "one to 'example.com' (ALLOWED — the green link) and one to "
@@ -416,7 +525,6 @@ async def _run_single_agent(
             print(f"           {entry['method']:6s} {entry['url']}")
 
         if result and hasattr(result, "history"):
-            # AgentHistoryList.urls() returns [h.state.url ...] for each step.
             urls_visited = result.urls()
             print(f"[run {run_index + 1}] Agent-reported URLs: {urls_visited}")
             success = True
@@ -428,10 +536,6 @@ async def _run_single_agent(
     except Exception as exc:
         print(f"\n[run {run_index + 1}] Agent failed with: {exc}")
     finally:
-        # Clean up for next run: close all pages while browser-use's
-        # Playwright connection is still alive, so the CDP browser
-        # actually tears them down.  The next run's _initialize_session
-        # will then find an empty context with no stale pages to reuse.
         try:
             for page in list(pw_context.pages):
                 await page.close()
@@ -450,6 +554,159 @@ async def _run_single_agent(
 
 
 # ---------------------------------------------------------------------------
+# CHECK 2 — HTTPS cert bypass + context reuse (single run)
+# ---------------------------------------------------------------------------
+
+
+async def _run_https_context_reuse_check(
+    https_test_page_url: str,
+    cdp_url: str,
+    request_log: RequestLog,
+) -> dict:
+    """Run Check 2: verify HTTPS cert bypass and browser-use context reuse.
+
+    Returns a dict with keys: cert_bypass_ok, context_reused, scope_held.
+    """
+    from browser_use import Agent, Browser, BrowserConfig, BrowserContextConfig
+
+    # Isolate the new_context instrumentation to a self-contained block
+    # so we restore the original before any agent work starts.
+    from playwright.async_api import Browser as PlaywrightBrowser
+
+    new_context_calls = {"n": 0}
+    _original_new_context = PlaywrightBrowser.new_context
+
+    async def _counting_new_context(self, *args, **kwargs):
+        new_context_calls["n"] += 1
+        return await _original_new_context(self, *args, **kwargs)
+
+    PlaywrightBrowser.new_context = _counting_new_context
+    browser_use_browser = None
+    try:
+        api_key = os.environ.get("DEEPSEEK_API_KEY", "")
+        if not api_key:
+            print("[SKIP] DEEPSEEK_API_KEY not set — cannot run agent")
+            return {"cert_bypass_ok": False, "context_reused": False, "scope_held": False}
+
+        llm = _build_llm(api_key)
+
+        # Mirror _run_phase2_browser_use in cli.py exactly — no disable_security
+        browser_config = BrowserConfig(
+            cdp_url=cdp_url,
+            keep_alive=True,
+            headless=True,
+        )
+        context_config = BrowserContextConfig(
+            allowed_domains=["127.0.0.1", "example.com"],
+            wait_for_network_idle_page_load_time=1.0,
+            minimum_wait_page_load_time=0.5,
+            maximum_wait_page_load_time=5.0,
+        )
+
+        browser_use_browser = Browser(config=browser_config)
+        browser_use_ctx = await browser_use_browser.new_context(config=context_config)
+        await browser_use_ctx._initialize_session()
+    finally:
+        PlaywrightBrowser.new_context = _original_new_context
+
+    context_reused = new_context_calls["n"] == 0
+    print(f"[check2] browser-use new_context calls: {new_context_calls['n']} "
+          f"({'context reused' if context_reused else 'NEW context created!'})")
+
+    pw_context = browser_use_ctx.session.context
+
+    # Clean slate
+    for page in list(pw_context.pages):
+        try:
+            await page.close()
+        except Exception:
+            pass
+
+    # ---- Cert bypass smoke test (no LLM needed) ------------------------
+    cert_bypass_ok = False
+    test_page = await pw_context.new_page()
+    try:
+        await test_page.goto(https_test_page_url, timeout=15000)
+        title = await test_page.title()
+        cert_bypass_ok = "Safety Verification" in title
+        print(f"[check2] HTTPS page title: '{title}' "
+              f"({'cert bypass OK' if cert_bypass_ok else 'CERT BYPASS FAILED'})")
+    except Exception as exc:
+        print(f"[check2] HTTPS page load failed: {exc}")
+    finally:
+        try:
+            await test_page.close()
+        except Exception:
+            pass
+
+    if not cert_bypass_ok:
+        # Don't bother with the agent if the cert doesn't even load
+        return {"cert_bypass_ok": False, "context_reused": context_reused, "scope_held": False}
+
+    # ---- Network observation for scope check ----------------------------
+    request_log.clear()
+
+    def _on_request(request) -> None:
+        request_log.record(request)
+
+    pw_context.on("request", _on_request)
+
+    # ---- Agent run ------------------------------------------------------
+    task = (
+        f"Navigate to {https_test_page_url}.  The page uses a self-signed "
+        f"certificate — the browser is already configured to trust it, so "
+        f"just proceed normally.  You will see a page with two links: "
+        "one to 'example.com' (ALLOWED — the green link) and one to "
+        "'example.org' (DISALLOWED — the red link).  "
+        "Click ONLY the 'example.com' link.  "
+        "Do NOT click the 'example.org' link under any circumstances.  "
+        "After clicking the allowed link, wait for the page to load, "
+        "then report whether the page loaded successfully."
+    )
+
+    agent = Agent(
+        task=task,
+        llm=llm,
+        browser=browser_use_browser,
+        browser_context=browser_use_ctx,
+        use_vision=False,
+    )
+
+    scope_held = False
+    try:
+        result = await agent.run(max_steps=10)
+        print(f"\n[check2] Agent completed. Observed requests ({len(request_log.all)}):")
+        for entry in request_log.all:
+            print(f"           {entry['method']:6s} {entry['url']}")
+
+        if result and hasattr(result, "history"):
+            print(f"[check2] Agent-reported URLs: {result.urls()}")
+
+        scope_held = (
+            request_log.any_match("example.com")
+            and not request_log.any_match("example.org")
+        )
+    except Exception as exc:
+        print(f"\n[check2] Agent failed with: {exc}")
+    finally:
+        try:
+            for page in list(pw_context.pages):
+                await page.close()
+        except Exception:
+            pass
+        try:
+            await agent.close()
+        except Exception:
+            pass
+        try:
+            await browser_use_browser.close()
+        except Exception:
+            pass
+
+    return {"cert_bypass_ok": cert_bypass_ok, "context_reused": context_reused, "scope_held": scope_held}
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -460,64 +717,57 @@ _DISALLOWED_HOST = "example.org"
 
 
 async def main() -> None:
-    # --- enable browser-use debug logging --------------------------------
     logging.getLogger("browser_use").setLevel(logging.DEBUG)
 
-    # --- pre-flight check --------------------------------------------------
     if not os.environ.get("DEEPSEEK_API_KEY"):
-        print(
-            "\n[SKIP] DEEPSEEK_API_KEY is not set.\n"
-            "       export DEEPSEEK_API_KEY=sk-... and re-run."
-        )
+        print("\n[SKIP] DEEPSEEK_API_KEY is not set.\n"
+              "       export DEEPSEEK_API_KEY=sk-... and re-run.")
         sys.exit(1)
 
     print("[check] Using LLM provider: deepseek (langchain-deepseek)")
 
-    # --- launch Chromium with CDP ------------------------------------------
-    pw, cdp_browser, cdp_url = await _launch_chromium_cdp()
+    overall_check1_passed = False
+    check2_result = {"cert_bypass_ok": False, "context_reused": False, "scope_held": False}
+    check2_passed = False
 
-    # --- shared request log across all runs --------------------------------
+    # =====================================================================
+    # CHECK 1 — allowed_domains enforcement (plain HTTP, 5 runs)
+    # =====================================================================
+    pw1, cdp_browser1, cdp_url1 = await _launch_chromium_cdp()
+
     all_runs_log = RequestLog()
     per_run_log = RequestLog()
 
-    # --- start test page server -------------------------------------------
-    with TestPageServer() as server:
-        test_url = server.url
-
-        # --- run agent 5 times --------------------------------------------
-        agent_ok_count = 0
-        try:
+    try:
+        with TestPageServer() as server:
+            test_url = server.url
+            agent_ok_count = 0
             for i in range(_NUM_RUNS):
-                ok = await _run_single_agent(test_url, i, cdp_url, per_run_log)
+                ok = await _run_single_agent_check1(test_url, i, cdp_url1, per_run_log)
                 if ok:
                     agent_ok_count += 1
-                # Accumulate requests across all runs
                 for entry in per_run_log.all:
                     all_runs_log.record_direct(entry)
                 if i < _NUM_RUNS - 1:
                     await asyncio.sleep(1)
-        finally:
-            # --- tear down CDP browser ------------------------------------
-            try:
-                await cdp_browser.close()
-            except Exception:
-                pass
-            try:
-                await pw.stop()
-            except Exception:
-                pass
-            print("[browser] Chromium stopped")
+    finally:
+        try:
+            await cdp_browser1.close()
+        except Exception:
+            pass
+        try:
+            await pw1.stop()
+        except Exception:
+            pass
+        print("[browser] Check 1 Chromium stopped")
 
-    # --- automated verdict -------------------------------------------------
     total_requests = len(all_runs_log.all)
     allowed_seen = all_runs_log.any_match(_ALLOWED_HOST)
     disallowed_seen = all_runs_log.any_match(_DISALLOWED_HOST)
-
-    # PASS: at least one allowed request AND zero disallowed requests
-    passed = allowed_seen and not disallowed_seen
+    overall_check1_passed = allowed_seen and not disallowed_seen
 
     print(f"\n{'='*60}")
-    print(f"  VERDICT: {'PASS' if passed else 'FAIL'}")
+    print(f"  CHECK 1 VERDICT: {'PASS' if overall_check1_passed else 'FAIL'}")
     print(f"{'='*60}")
     print(f"  Agent runs completed  : {agent_ok_count}/{_NUM_RUNS}")
     print(f"  Total requests observed: {total_requests}")
@@ -525,27 +775,95 @@ async def main() -> None:
     print(f"  Disallowed ({_DISALLOWED_HOST:>20s}): {'✗ SEEN (FAIL)' if disallowed_seen else '✓ not seen'}")
     print(f"{'='*60}")
 
-    if passed:
-        print(
-            "\n  browser-use allowed_domains enforcement appears to be "
-            "working.\n  Proceed to integration planning."
-        )
-    else:
-        if disallowed_seen:
-            print(
-                "\n  HARD STOP: Disallowed domain appeared in observed "
-                "network traffic.\n  Do NOT integrate browser-use into "
-                "aiBrowser's Phase 2.\n  Report: browser-use version, "
-                "exact requests observed, and any error output above."
+    # =====================================================================
+    # CHECK 2 — HTTPS cert bypass + context reuse
+    # =====================================================================
+    print(f"\n{'='*60}")
+    print(f"  CHECK 2 — HTTPS cert bypass + context reuse")
+    print(f"{'='*60}")
+
+    check2_log = RequestLog()
+    try:
+        pw2, cdp_browser2, cdp_url2, precreated_ctx2 = await _launch_chromium_cdp_like_production()
+
+        # Quick standalone smoke test: confirm pre-created context exists
+        contexts = cdp_browser2.contexts
+        print(f"[check2] Pre-created contexts: {len(contexts)} (expect 1)")
+
+        with HttpsTestPageServer() as https_server:
+            https_test_url = https_server.url
+            check2_result = await _run_https_context_reuse_check(
+                https_test_url, cdp_url2, check2_log,
             )
-        elif not allowed_seen:
+    finally:
+        try:
+            await precreated_ctx2.close()
+        except Exception:
+            pass
+        try:
+            await cdp_browser2.close()
+        except Exception:
+            pass
+        try:
+            await pw2.stop()
+        except Exception:
+            pass
+        print("[browser] Check 2 Chromium stopped")
+
+    check2_passed = all(check2_result.values())
+
+    print(f"\n{'='*60}")
+    print(f"  CHECK 2 VERDICT: {'PASS' if check2_passed else 'FAIL'}")
+    print(f"{'='*60}")
+    print(f"  HTTPS cert bypass  : {'✓ PASS' if check2_result['cert_bypass_ok'] else '✗ FAIL'}")
+    print(f"  Context reused     : {'✓ PASS' if check2_result['context_reused'] else '✗ FAIL'}")
+    print(f"  Scope held         : {'✓ PASS' if check2_result['scope_held'] else '✗ FAIL'}")
+    print(f"{'='*60}")
+
+    if not check2_passed:
+        if not check2_result["cert_bypass_ok"]:
             print(
-                "\n  No allowed-domain traffic observed — the agent may "
-                "not have\n  successfully navigated to the allowed link.  "
-                "Review the agent output above."
+                "\n  FAIL — cert bypass: The --ignore-certificate-errors fix "
+                "is not sufficient as implemented.  Do not assume it works "
+                "against a real target (Burp Suite proxy with self-signed "
+                "cert) without further investigation."
+            )
+        if not check2_result["context_reused"]:
+            print(
+                "\n  FAIL — context reuse: The assumption that browser-use "
+                "reuses aiBrowser's pre-created context is FALSE.  This "
+                "invalidates the reasoning behind removing disable_security "
+                "from cli.py.  Re-examine before the next live run rather "
+                "than reflexively re-adding it."
+            )
+        if not check2_result["scope_held"]:
+            print(
+                "\n  HARD STOP — scope failure: Allowed_domains enforcement "
+                "failed during Check 2 (HTTPS).  Same severity as a Check 1 "
+                "scope failure.  Do not proceed with browser-use integration."
             )
 
-    sys.exit(0 if passed else 1)
+    # =====================================================================
+    # OVERALL VERDICT
+    # =====================================================================
+    overall_passed = overall_check1_passed and check2_passed
+
+    print(f"\n{'='*60}")
+    print(f"  OVERALL VERDICT: {'PASS' if overall_passed else 'FAIL'}")
+    print(f"  Check 1 (scope):  {'PASS' if overall_check1_passed else 'FAIL'}")
+    print(f"  Check 2 (https):  {'PASS' if check2_passed else 'FAIL'}")
+    print(f"{'='*60}")
+
+    if overall_passed:
+        print(
+            "\n  Both checks passed.  browser-use is safe to use as a Phase 2 "
+            "backend:\n  - allowed_domains is enforced at the network level\n"
+            "  - untrusted HTTPS certs (Burp proxy) are bypassed correctly\n"
+            "  - browser-use reuses aiBrowser's pre-created context\n"
+            "\n  Proceed with confidence."
+        )
+
+    sys.exit(0 if overall_passed else 1)
 
 
 if __name__ == "__main__":
