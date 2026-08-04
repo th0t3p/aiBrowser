@@ -26,7 +26,7 @@ from ai_browser.cli import main
 
 @pytest.fixture
 def tiktok_scope_file() -> Path:
-    return Path(__file__).parent.parent / "tiktok_scope.txt"
+    return Path(__file__).parent.parent / "scope" / "tiktok_scope.txt"
 
 
 # ---------------------------------------------------------------------------

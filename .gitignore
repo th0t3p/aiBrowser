@@ -3,6 +3,7 @@ __pycache__
 *.pyc
 storage/
 output/
+scope/
 .DS_Store
 
 # Local environment config — never commit real secrets
