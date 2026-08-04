@@ -5,9 +5,12 @@ Automated web browsing for bug bounty reconnaissance. Drives a real browser
 browser makes — links followed, forms submitted, accounts registered — lands
 in Burp's proxy history automatically.
 
-> **This tool produces no traffic logs of its own.** Burp Suite is the
-> source of truth for captured traffic. Point `aiScraper` at Burp's MCP
-> server separately to poll, normalize, and store what gets captured here.
+> **This tool captures traffic directly via Playwright.** Every in-scope
+> request/response pair is saved to `output/traffic/<hostname>/index.jsonl`
+> with content-addressed body files under `bodies/`. Burp Suite remains the
+> proxy (all browser traffic still routes through it), but aiBrowser now
+> records its own traffic for direct consumption by other tools (e.g. aiSSRF)
+> without requiring aiScraper's Burp-ingestion endpoint.
 
 ---
 
@@ -26,6 +29,12 @@ Three layers, each usable independently:
    and persists the resulting session so later runs skip straight to an
    authenticated crawl.
 
+4. **Traffic Capture** — hooks Playwright's `page.on("response")` to record
+   every in-scope request/response pair as JSON Lines with content-addressed
+   body files. Always on by default (opt-out with `--no-traffic-capture`),
+   writes to `output/traffic/<hostname>/` for direct consumption by other
+   tools (e.g. aiSSRF) with no Burp-ingestion dependency.
+
 ```
                     ┌──────────────┐
                     │  ai_browser  │
@@ -34,12 +43,16 @@ Three layers, each usable independently:
                            │ all traffic proxied
                            ▼
                    ┌───────────────┐
-                   │  Burp Suite   │◄── aiScraper polls this separately
+                   │  Burp Suite   │
                    │ 127.0.0.1:8080│
                    └───────────────┘
                            │
                            ▼
                      Target Host(s)
+
+        Traffic also captured directly to
+        output/traffic/<hostname>/index.jsonl
+        (self-contained, no Burp dependency)
 ```
 
 ---
@@ -52,6 +65,7 @@ Three layers, each usable independently:
 | **Burp Suite** (Community or Pro) | Everything | Proxy listener running, target in scope |
 | **Playwright** (Chromium) | Everything | Installed separately from the pip package — see below |
 | **An LLM API key** (Anthropic, OpenAI, or DeepSeek) | `--agent` only | Skip this and pass `--no-agent` to run crawler-only |
+| **`browser-use` + `langchain-deepseek`** | `--agent-backend browser-use` only | `pip install -e ".[browser-use]"` — optional extra, not installed by default |
 | **An IMAP-accessible inbox** | `--register` / `--login` with email confirmation | Needs an app-specific password on most providers — see below |
 
 ### Installing
@@ -154,7 +168,7 @@ itself be a wildcard. `--scope` governs which *discovered links* the
 crawler and agent are allowed to follow once exploring. If `--scope` is
 omitted, scope defaults to an exact match on `hostname`.
 
-### Agent Explorer — choosing an LLM provider
+### Agent Explorer — choosing an LLM provider and backend
 
 ```bash
 # With a .env file, no API key flag needed — it's read from AIBROWSER_LLM_API_KEY
@@ -178,6 +192,27 @@ ai-browser crawl example.com --authorized --agent \
 ai-browser crawl example.com --authorized --agent \
     --llm-provider openai --llm-base-url "http://localhost:8000/v1" --llm-api-key "unused"
 ```
+
+By default, `--agent-backend custom` uses aiBrowser's own AgentExplorer.
+You can switch to **browser-use** (an external agent library with richer
+action capabilities) by passing `--agent-backend browser-use`. This
+requires the optional `[browser-use]` extra:
+
+```bash
+pip install -e ".[browser-use]"
+
+# browser-use as the Phase 2 engine — connects to the SAME Chromium
+# process via CDP (no second browser launch)
+ai-browser crawl example.com --authorized --agent \
+    --agent-backend browser-use \
+    --max-actions 15 \
+    --llm-provider deepseek --llm-model deepseek-v4-flash
+```
+
+`--agent-backend custom` (the default) is stable and tested. `browser-use`
+is new and requires `browser-use==0.1.48` pinned. Control agent verbosity
+with `--max-actions` (default 20) — lower is cheaper, higher explores
+more of the site.
 
 `--anthropic-api-key` still works as a deprecated alias for backward
 compatibility, but new setups should use `--llm-provider` / `--llm-api-key`.
@@ -303,7 +338,11 @@ ai_browser/
 ├── login_handler/
 │   ├── handler.py             # Login form fill, session persistence
 │   └── models.py               # LoginConfig
-└── cli.py                      # Click CLI entrypoint (crawl command)
+├── traffic_capture/
+│   ├── __init__.py              # TrafficCapture — page.on("response") hooks,
+│   │                             #   content-addressed body storage, index.jsonl
+│   └── schema.json               # JSON Schema v1.0 — source of truth for record format
+└── cli.py                       # Click CLI entrypoint (crawl command)
 ```
 
 ---
@@ -322,13 +361,19 @@ against `aiScraper`'s output). Scope violations are recorded on
 `session.violations`; call `session.check_violations()` to raise if any
 occurred.
 
-### No traffic logging, by design
+### Traffic capture is self-contained, not Burp-dependent
 
-Burp captures everything at the proxy level; `aiScraper` polls Burp
-separately to normalize and store it. This module stays stateless on the
-traffic side — the only things it persists are cookies/localStorage
-(for session reuse) and audit logs of its own actions (not the HTTP
-traffic itself).
+aiBrowser records every in-scope request/response pair to a file-based
+format under `output/traffic/<hostname>/`: one `index.jsonl` per run
+with content-addressed body files under `bodies/<sha256>.bin`. This is
+always on by default — opt out with `--no-traffic-capture` — and meant
+for direct consumption by other tools (e.g. aiSSRF) without requiring
+Burp Suite or aiScraper's ingestion endpoint. Burp remains the proxy;
+the capture is an independent second record.
+
+The JSON Schema at `ai_browser/traffic_capture/schema.json` is the
+source of truth for the record format (schema version `"1.0"`). Other
+tools should validate against it directly.
 
 ### The action denylist checks the real element, not just the LLM's claim
 
@@ -360,10 +405,18 @@ resumes manually after solving it.
 storage/
 ├── browser_states/         # Per-hostname cookies/localStorage (session reuse)
 │   └── example.com.json
+├── pids/                   # Per-hostname CDP browser PID files (orphan reaping)
+│   └── example.com.pid
 ├── audit_logs/              # Newline-delimited JSON audit log per crawl session
 │   └── example.com_20260718_120000.jsonl
 └── captcha_screenshots/     # Saved on every CAPTCHA pause
     └── captcha_https_example.com_signup_submit_20260718_120000.png
+
+output/
+└── traffic/
+    └── <hostname>/          # Traffic capture (on by default)
+        ├── index.jsonl       # One JSON line per captured request/response
+        └── bodies/           # Content-addressed body files (<sha256>.bin)
 ```
 
 ---
