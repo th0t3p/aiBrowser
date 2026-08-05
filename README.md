@@ -168,6 +168,27 @@ itself be a wildcard. `--scope` governs which *discovered links* the
 crawler and agent are allowed to follow once exploring. If `--scope` is
 omitted, scope defaults to an exact match on `hostname`.
 
+**Multi-pattern scope via `--scope-file`**: when a single glob pattern
+isn't enough (e.g. you need to cover both `*.tiktok.com` and
+`careers.tiktok.com` as distinct patterns), put one pattern per line in
+a file:
+
+```bash
+# scope.txt — one pattern per line, '#' comments and blank lines ignored
+*.tiktok.com
+careers.tiktok.com
+```
+
+Then pass it with `--scope-file`:
+
+```bash
+ai-browser crawl developers.tiktok.com --authorized --scope-file scope.txt
+```
+
+`--scope` and `--scope-file` combine when both are given (union of
+patterns, not override). A hostname is in-scope if it matches **any**
+pattern from the combined set.
+
 ### Agent Explorer — choosing an LLM provider and backend
 
 ```bash
