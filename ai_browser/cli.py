@@ -322,6 +322,26 @@ def main(ctx: click.Context):
     default=False,
     help="Disable traffic capture entirely.",
 )
+@click.option(
+    "--email-backend",
+    type=click.Choice(["imap", "disposable"]),
+    default="imap",
+    show_default=True,
+    help="Email confirmation backend. 'imap' uses a pre-configured IMAP "
+    "inbox (default). 'disposable' provisions a fresh AgentMail inbox "
+    "per run.",
+)
+@click.option(
+    "--disposable-inbox-api-key",
+    default=None,
+    envvar="AIBROWSER_DISPOSABLE_INBOX_API_KEY",
+    help="API key for the disposable inbox provider (AgentMail).",
+)
+@click.option(
+    "--disposable-inbox-domain",
+    default=None,
+    help="Custom domain for disposable inbox, if supported by the provider.",
+)
 @click.pass_context
 def crawl(
     ctx: click.Context,
@@ -362,6 +382,9 @@ def crawl(
     storage_dir: str,
     traffic_dir: Optional[str],
     no_traffic_capture: bool,
+    email_backend: str,
+    disposable_inbox_api_key: Optional[str],
+    disposable_inbox_domain: Optional[str],
 ):
     """Crawl HOSTNAME, discovering URLs and endpoints.
 
@@ -515,6 +538,9 @@ def crawl(
             scope_pattern=scope_pattern,
             traffic_dir=traffic_dir,
             no_traffic_capture=no_traffic_capture,
+            email_backend=email_backend,
+            disposable_inbox_api_key=disposable_inbox_api_key,
+            disposable_inbox_domain=disposable_inbox_domain,
         )
     )
 
@@ -897,6 +923,9 @@ async def _run_crawl(
     scope_pattern: Union[str, List[str]],
     traffic_dir: Optional[str],
     no_traffic_capture: bool,
+    email_backend: str,
+    disposable_inbox_api_key: Optional[str],
+    disposable_inbox_domain: Optional[str],
 ) -> None:
     """Run the full crawl pipeline."""
 
@@ -1027,14 +1056,34 @@ async def _run_crawl(
 
         # Phase 3: Registration
         if do_register:
-            if not register_email:
-                click.echo(
-                    "ERROR: --register-email is required when --register is set.",
-                    err=True,
-                )
-                return
+            # ---- Validate email backend configuration --------------------------
+            if email_backend == "disposable":
+                if imap_host or imap_username or imap_password:
+                    click.echo(
+                        "ERROR: --email-backend disposable is mutually exclusive "
+                        "with --imap-host/--imap-username/--imap-password.",
+                        err=True,
+                    )
+                    return
+                if not disposable_inbox_api_key:
+                    click.echo(
+                        "ERROR: --disposable-inbox-api-key is required when "
+                        "--email-backend disposable is set.",
+                        err=True,
+                    )
+                    return
+            else:
+                # IMAP/static mode — email is still required
+                if not register_email:
+                    click.echo(
+                        "ERROR: --register-email is required when --register is set "
+                        "(or use --email-backend disposable for dynamic provisioning).",
+                        err=True,
+                    )
+                    return
 
-            click.echo(f"\n[Phase 3] Attempting registration for {register_email}...")
+            email_display = register_email or "(will be provisioned)"
+            click.echo(f"\n[Phase 3] Attempting registration for {email_display}...")
 
             imap_config = None
             if imap_host and imap_username and imap_password:
@@ -1045,6 +1094,14 @@ async def _run_crawl(
                     password=imap_password,
                 )
 
+            disposable_config = None
+            if email_backend == "disposable":
+                from ai_browser.registration_handler.models import DisposableInboxConfig
+                disposable_config = DisposableInboxConfig(
+                    api_key=disposable_inbox_api_key,  # type: ignore[arg-type]
+                    domain=disposable_inbox_domain,
+                )
+
             reg_config = RegistrationConfig(
                 signup_url=result.endpoints[0].url if result.endpoints else f"https://{hostname}",
                 email=register_email,
@@ -1052,12 +1109,42 @@ async def _run_crawl(
                 name=register_name,
                 imap_config=imap_config,
                 email_poll_timeout_seconds=email_timeout,
+                # Pass Phase 1 crawl endpoints for signup-page discovery
+                candidate_endpoints=[ep.url for ep in result.endpoints],
+                # LLM fields for AI judge (reuse the crawl's LLM config)
+                llm_provider=llm_provider,
+                llm_model=llm_model or "",
+                llm_api_key=llm_api_key or "",
+                llm_base_url=llm_base_url or "",
+                disposable_inbox_config=disposable_config,
             )
             handler = RegistrationHandler(reg_config)
 
             try:
                 page = await handler.register(session)
-                if handler.confirmed:
+                if not handler.submitted:
+                    # No email field found — this page does not look like a
+                    # registration form at all (could be a newsletter box,
+                    # login form, or a completely unrelated page).
+                    click.echo(
+                        f"  No registration form found — this page does not "
+                        f"appear to have a signup form. "
+                        f"Registration was NOT attempted.",
+                        err=True,
+                    )
+                elif handler.registration_looked_real is False:
+                    # Form was submitted but the AI judge says the result
+                    # doesn't look like a real registration (e.g. newsletter
+                    # signup, login, error page, no visible change).
+                    click.echo(
+                        f"  Form submitted, but the result does not look like "
+                        f"a real registration (AI judge verdict: NOT a "
+                        f"registration). This may have been a newsletter "
+                        f"subscribe box, login form, or something else. "
+                        f"Current URL: {page.url}",
+                        err=True,
+                    )
+                elif handler.confirmed:
                     click.echo(f"  Registration complete and confirmed! Current URL: {page.url}")
                 else:
                     click.echo(
@@ -1072,13 +1159,16 @@ async def _run_crawl(
                 # Save credentials so the account is recoverable.
                 # Always save even if confirmation failed — the password
                 # is still needed to complete confirmation manually later.
-                _save_credentials(
-                    storage_dir=session_config.storage_dir,
-                    hostname=hostname,
-                    email=register_email,
-                    password=register_password,
-                    confirmed=handler.confirmed,
-                )
+                # Only save if the form was actually submitted (not when no
+                # registration form was found at all).
+                if handler.submitted:
+                    _save_credentials(
+                        storage_dir=session_config.storage_dir,
+                        hostname=hostname,
+                        email=handler.provisioned_email or register_email or "",
+                        password=register_password,
+                        confirmed=handler.confirmed,
+                    )
 
         # -- traffic capture summary ----------------------------------
         if capture is not None:

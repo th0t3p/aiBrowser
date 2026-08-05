@@ -17,6 +17,8 @@ from playwright.async_api import Page
 from ai_browser.browser_session import BrowserSession
 from ai_browser._scope import page_url_matches_any_scope, display_scope
 from ai_browser.registration_handler.models import CaptchaDetected
+from ai_browser._llm_client import _call_anthropic as _shared_call_anthropic
+from ai_browser._llm_client import _call_openai_compatible as _shared_call_openai
 
 from .models import (
     ActionType,
@@ -720,52 +722,36 @@ class AgentExplorer:
             return None
 
     async def _call_anthropic(self, api_key, model, base_url, messages: list[dict]):
-        url = base_url or "https://api.anthropic.com"
-        url = url.rstrip("/") + "/v1/messages"
-        headers = {
-            "x-api-key": api_key,
-            "anthropic-version": "2023-06-01",
-            "Content-Type": "application/json",
-        }
-        body = {
-            "model": model,
-            "max_tokens": self.config.llm_max_tokens or _ANTHROPIC_DEFAULT_MAX_TOKENS,
-            "system": ACTION_SYSTEM_PROMPT,
-            "messages": messages,
-            "tools": [_ACTION_TOOL_ANTHROPIC],
-            "tool_choice": {"type": "tool", "name": "take_action"},
-        }
-        return await self._client.post(url, json=body, headers=headers)
+        return await _shared_call_anthropic(
+            api_key=api_key,
+            model=model,
+            messages=messages,
+            system_prompt=ACTION_SYSTEM_PROMPT,
+            max_tokens=self.config.llm_max_tokens or _ANTHROPIC_DEFAULT_MAX_TOKENS,
+            tools=[_ACTION_TOOL_ANTHROPIC],
+            tool_choice={"type": "tool", "name": "take_action"},
+            base_url=base_url,
+            client=self._client,
+        )
 
     async def _call_openai_compatible(self, provider, api_key, model, base_url, messages: list[dict]):
-        if base_url:
-            url = base_url.rstrip("/") + "/chat/completions"
-        elif provider == "openai":
-            url = "https://api.openai.com/v1/chat/completions"
-        else:
-            url = "https://api.deepseek.com/chat/completions"
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        }
-        # Prepend system prompt as the first message
-        full_messages = [{"role": "system", "content": ACTION_SYSTEM_PROMPT}] + messages
-        body = {
-            "model": model,
-            "messages": full_messages,
-        }
-        # Only OpenAI uses native tool calling.
-        # DeepSeek's tool-calling support is not confirmed — it stays on
-        # the text-extraction path (see _parse_llm_response).
-        if provider == "openai":
-            body["tools"] = [_ACTION_TOOL_OPENAI]
-            body["tool_choice"] = {
-                "type": "function",
-                "function": {"name": "take_action"},
-            }
-        if self.config.llm_max_tokens is not None:
-            body["max_tokens"] = self.config.llm_max_tokens
-        return await self._client.post(url, json=body, headers=headers)
+        openai_tools = [_ACTION_TOOL_OPENAI] if provider == "openai" else None
+        openai_tool_choice = (
+            {"type": "function", "function": {"name": "take_action"}}
+            if provider == "openai" else None
+        )
+        return await _shared_call_openai(
+            provider=provider,
+            api_key=api_key,
+            model=model,
+            messages=messages,
+            system_prompt=ACTION_SYSTEM_PROMPT,
+            max_tokens=self.config.llm_max_tokens,
+            tools=openai_tools,
+            tool_choice=openai_tool_choice,
+            base_url=base_url,
+            client=self._client,
+        )
 
     def _parse_llm_response(self, provider, response) -> Optional[dict]:
         """Extract the action dict from a provider-specific API response.

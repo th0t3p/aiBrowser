@@ -163,7 +163,12 @@ class TestRegistrationConfirmed:
         async def _noop(*_a, **_kw):
             return None
         monkeypatch.setattr(handler, "_check_captcha", _noop)
-        monkeypatch.setattr(handler, "_fill_signup_form", _noop)
+        # _fill_signup_form must return a list with "email" so the submit path
+        # is taken (otherwise register() returns early, skipping IMAP polling)
+        monkeypatch.setattr(
+            handler, "_fill_signup_form",
+            AsyncMock(return_value=["email", "password"]),
+        )
         monkeypatch.setattr(handler, "_submit_form", _noop)
 
         # Return a fake confirmation link
@@ -190,7 +195,10 @@ class TestRegistrationConfirmed:
         async def _noop(*_a, **_kw):
             return None
         monkeypatch.setattr(handler, "_check_captcha", _noop)
-        monkeypatch.setattr(handler, "_fill_signup_form", _noop)
+        monkeypatch.setattr(
+            handler, "_fill_signup_form",
+            AsyncMock(return_value=["email", "password"]),
+        )
         monkeypatch.setattr(handler, "_submit_form", _noop)
 
         # Polling returns None — no confirmation email arrived
@@ -220,7 +228,10 @@ class TestRegistrationConfirmed:
         async def _noop(*_a, **_kw):
             return None
         monkeypatch.setattr(handler, "_check_captcha", _noop)
-        monkeypatch.setattr(handler, "_fill_signup_form", _noop)
+        monkeypatch.setattr(
+            handler, "_fill_signup_form",
+            AsyncMock(return_value=["email", "password"]),
+        )
         monkeypatch.setattr(handler, "_submit_form", _noop)
 
         page = AsyncMock()

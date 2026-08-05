@@ -28,13 +28,19 @@ def _escape_css_string(value: str) -> str:
 async def fill_form_fields(
     page: Page,
     field_mappings: list[tuple[list[str], str]],
-) -> None:
+) -> list[str]:
     """Heuristically fill form fields on *page* using name/id/placeholder patterns.
 
     *field_mappings* is a list of (field_names, value) tuples where field_names
     is a list of possible name/id/placeholder values to try.
+
+    Returns the list of primary field names (first entry of each name group)
+    that were successfully filled — an empty list if none matched.  Callers can
+    check this to determine whether anything meaningful was actually filled.
     """
+    filled: list[str] = []
     for names, value in field_mappings:
+        primary = names[0]
         for name in names:
             try:
                 escaped = _escape_css_string(name)
@@ -45,9 +51,11 @@ async def fill_form_fields(
                 if field and await field.is_visible():
                     await field.fill(value)
                     logger.debug("Filled field '%s'", name)
+                    filled.append(primary)
                     break
             except Exception:
                 continue
+    return filled
 
 
 async def submit_form(page: Page, extra_selectors: Optional[list[str]] = None) -> None:
