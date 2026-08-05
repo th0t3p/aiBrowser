@@ -505,38 +505,50 @@ class RegistrationHandler:
                 return None
 
             message_ids = messages[0].split()
-            latest_id = message_ids[-1]
 
-            result, msg_data = await imap.fetch(latest_id, "(RFC822)")
+            # Check up to the last 20 UNSEEN messages (newest first) instead
+            # of only the single latest one.  On a shared personal inbox, an
+            # unrelated unread email arriving during the poll window shouldn't
+            # mask the real confirmation email sitting right behind it.
+            _max_to_check = 20
+            _to_check = message_ids[-_max_to_check:]  # newest first
+            found_link = None
+
+            for msg_id in reversed(_to_check):
+                result, msg_data = await imap.fetch(msg_id, "(RFC822)")
+
+                if result != "OK" or not msg_data or not msg_data[0]:
+                    continue
+
+                raw_email = msg_data[1]
+                if isinstance(raw_email, tuple):
+                    raw_email = raw_email[1]
+
+                msg = email.message_from_bytes(raw_email)
+
+                if target_domain:
+                    from_header = msg.get("From", "")
+                    if target_domain.lower() not in from_header.lower():
+                        logger.debug("Skipping email from %s (id=%s)", from_header, msg_id.decode() if isinstance(msg_id, bytes) else msg_id)
+                        continue
+
+                date_str = msg.get("Date", "")
+                if date_str and self._signup_submitted_at > 0:
+                    try:
+                        from email.utils import parsedate_to_datetime
+                        msg_date = parsedate_to_datetime(date_str)
+                        if msg_date.timestamp() < self._signup_submitted_at:
+                            logger.debug("Skipping old email from %s", date_str)
+                            continue
+                    except Exception:
+                        pass
+
+                found_link = self._extract_link_from_email(msg, target_domain)
+                if found_link:
+                    break
+
             await imap.logout()
-
-            if result != "OK" or not msg_data or not msg_data[0]:
-                return None
-
-            raw_email = msg_data[1]
-            if isinstance(raw_email, tuple):
-                raw_email = raw_email[1]
-
-            msg = email.message_from_bytes(raw_email)
-
-            if target_domain:
-                from_header = msg.get("From", "")
-                if target_domain.lower() not in from_header.lower():
-                    logger.debug("Skipping email from %s", from_header)
-                    return None
-
-            date_str = msg.get("Date", "")
-            if date_str and self._signup_submitted_at > 0:
-                try:
-                    from email.utils import parsedate_to_datetime
-                    msg_date = parsedate_to_datetime(date_str)
-                    if msg_date.timestamp() < self._signup_submitted_at:
-                        logger.debug("Skipping old email from %s", date_str)
-                        return None
-                except Exception:
-                    pass
-
-            return self._extract_link_from_email(msg, target_domain)
+            return found_link
 
         except ImportError:
             logger.error("aioimaplib is required for IMAP polling")

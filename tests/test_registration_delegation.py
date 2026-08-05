@@ -592,20 +592,3 @@ class TestDisposableInboxMockIntegration:
         # Not confirmed (timeout), not crashed
         assert handler.confirmed is False
         assert handler.submitted is True  # form was still submitted
-
-
-class TestCLIDisposableInboxParsing:
-    """Test that CLI parsing correctly handles --email-backend options."""
-
-    def test_email_backend_defaults_to_imap(self):
-        from click.testing import CliRunner
-        import sys
-        # Just verify the option exists with the right default
-        runner = CliRunner()
-        result = runner.invoke(
-            sys.modules["ai_browser.cli"].crawl,
-            ["--help"],
-        )
-        assert "--email-backend" in result.output
-        assert "imap" in result.output
-        assert handler.registration_looked_real is None

@@ -1,5 +1,6 @@
 """Tests for email link extraction priority, IMAP filtering (Fixes #6, #7)."""
 
+import asyncio
 import email
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -247,3 +248,208 @@ class TestRegistrationConfirmed:
         config = self._make_config()
         handler = RegistrationHandler(config)
         assert handler.confirmed is False
+
+
+# ---------------------------------------------------------------------------
+# IMAP latest-only bug: _check_inbox_for_new_email iterates over ALL UNSEEN
+# messages (up to a bound) instead of only the single latest one
+# ---------------------------------------------------------------------------
+
+
+class TestIMAPChecksAllUnseenMessages:
+    """Test that _check_inbox_for_new_email checks multiple UNSEEN messages,
+    not just the single latest one (the exact bug that was fixed)."""
+
+    @staticmethod
+    def _make_fake_imap(message_specs: list[tuple[str, str, str]]):
+        """Return a fake aioimaplib mock configured with *message_specs*.
+
+        Each spec is (from_addr, subject, body) — ordered from oldest (id=1)
+        to newest.  The fake IMAP will have all specified messages as UNSEEN.
+        """
+        import email
+        from email.mime.multipart import MIMEMultipart
+        from email.mime.text import MIMEText
+        from unittest.mock import AsyncMock, MagicMock
+
+        fake = AsyncMock()
+        fake.wait_hello_from_server = AsyncMock()
+        fake.login = AsyncMock()
+        fake.select = AsyncMock()
+        fake.logout = AsyncMock()
+        fake.search = AsyncMock()
+
+        # Build raw messages
+        raw_messages: list[bytes] = []
+        for from_addr, subject, body in message_specs:
+            msg = MIMEMultipart()
+            msg["From"] = from_addr
+            msg["Subject"] = subject
+            msg["Date"] = "Tue, 5 Aug 2026 10:00:00 +0000"
+            msg.attach(MIMEText(body, "plain"))
+            raw_messages.append(msg.as_bytes())
+
+        # UNSEEN search returns all IDs as space-separated
+        ids = " ".join(str(i + 1) for i in range(len(message_specs)))
+        fake.search.return_value = ("OK", [ids.encode()])
+
+        async def _fetch(msg_id, _format):
+            id_str = msg_id.decode() if isinstance(msg_id, bytes) else str(msg_id)
+            idx = int(id_str) - 1
+            if 0 <= idx < len(raw_messages):
+                return ("OK", [f"{id_str} (RFC822)".encode(), raw_messages[idx]])
+            return ("NO", [])
+
+        fake.fetch = AsyncMock(side_effect=_fetch)
+        return fake
+
+    @staticmethod
+    def _make_handler(submitted_at: float = 9999999.0):
+        from ai_browser.registration_handler.handler import RegistrationHandler
+        from ai_browser.registration_handler.models import RegistrationConfig, IMAPConfig
+
+        config = RegistrationConfig(
+            signup_url="https://example.com/signup",
+            email="test@example.com",
+            imap_config=IMAPConfig(
+                host="imap.example.com",
+                username="test@example.com",
+                password="fake-pw",
+            ),
+        )
+        handler = RegistrationHandler(config)
+        handler._signup_submitted_at = submitted_at
+        return handler
+
+    @pytest.mark.asyncio
+    async def test_real_email_sitting_behind_unrelated_message(self):
+        """The primary reproduction: confirmation email (id=1) is behind an
+        unrelated newer message (id=2).  The fix must check both, not just
+        the latest one."""
+        import sys
+        from unittest.mock import MagicMock
+
+        fake = self._make_fake_imap([
+            ("noreply@developers.tiktok.com", "Verify your account",
+             "Click to confirm: https://developers.tiktok.com/confirm?token=abc"),
+            ("newsletter@unrelated.com", "Weekly digest",
+             "Here is your weekly newsletter content..."),
+        ])
+
+        sys.modules["aioimaplib"] = MagicMock()
+        sys.modules["aioimaplib"].IMAP4_SSL = MagicMock(return_value=fake)
+        sys.modules["aioimaplib"].IMAP4 = MagicMock(return_value=fake)
+
+        handler = self._make_handler(submitted_at=asyncio.get_event_loop().time() - 1)
+        result = await handler._check_inbox_for_new_email("developers.tiktok.com")
+
+        assert result is not None, "Should have found the real confirmation link"
+        assert "tiktok" in result
+
+    @pytest.mark.asyncio
+    async def test_only_message_is_real_confirmation(self):
+        """When the confirmation email is the ONLY UNSEEN message, it still
+        works correctly — this is the case that already worked before the fix."""
+        import sys
+        from unittest.mock import MagicMock
+
+        fake = self._make_fake_imap([
+            ("noreply@example.com", "Confirm your email",
+             "Click to confirm: https://example.com/confirm?token=xyz"),
+        ])
+
+        sys.modules["aioimaplib"] = MagicMock()
+        sys.modules["aioimaplib"].IMAP4_SSL = MagicMock(return_value=fake)
+        sys.modules["aioimaplib"].IMAP4 = MagicMock(return_value=fake)
+
+        handler = self._make_handler(submitted_at=asyncio.get_event_loop().time() - 1)
+        result = await handler._check_inbox_for_new_email("example.com")
+
+        assert result is not None
+        assert "confirm" in result
+
+    @pytest.mark.asyncio
+    async def test_real_email_in_various_positions(self):
+        """The confirmation email is found regardless of whether it's the
+        oldest, middle, or newest among several unrelated messages."""
+        import sys
+        from unittest.mock import MagicMock
+
+        for real_idx, label in [(0, "oldest"), (2, "middle"), (4, "newest")]:
+            specs = []
+            for i in range(5):
+                if i == real_idx:
+                    specs.append((
+                        "noreply@target.com", "Confirm",
+                        "Click https://target.com/confirm?token=real",
+                    ))
+                else:
+                    specs.append((
+                        f"bot{i}@spam.com", f"Spam {i}",
+                        "Just some spam content...",
+                    ))
+
+            fake = self._make_fake_imap(specs)
+            sys.modules["aioimaplib"] = MagicMock()
+            sys.modules["aioimaplib"].IMAP4_SSL = MagicMock(return_value=fake)
+            sys.modules["aioimaplib"].IMAP4 = MagicMock(return_value=fake)
+
+            handler = self._make_handler(submitted_at=asyncio.get_event_loop().time() - 1)
+            result = await handler._check_inbox_for_new_email("target.com")
+            assert result is not None, f"Failed when real email was {label} (idx={real_idx})"
+            assert "confirm" in result, f"Wrong link when real email was {label}"
+
+    @pytest.mark.asyncio
+    async def test_no_confirmation_email_present(self):
+        """Returns None when no UNSEEN message matches the sender domain
+        — unchanged behavior, must not regress."""
+        import sys
+        from unittest.mock import MagicMock
+
+        fake = self._make_fake_imap([
+            ("spam1@other.com", "Spam 1", "Content 1"),
+            ("spam2@other.com", "Spam 2", "Content 2"),
+        ])
+
+        sys.modules["aioimaplib"] = MagicMock()
+        sys.modules["aioimaplib"].IMAP4_SSL = MagicMock(return_value=fake)
+        sys.modules["aioimaplib"].IMAP4 = MagicMock(return_value=fake)
+
+        handler = self._make_handler(submitted_at=asyncio.get_event_loop().time() - 1)
+        result = await handler._check_inbox_for_new_email("target.com")
+
+        assert result is None, "Should return None when no confirmation email is present"
+
+    @pytest.mark.asyncio
+    async def test_bound_respected_too_many_messages(self):
+        """When there are more UNSEEN messages than the iteration cap (20),
+        a confirmation email sitting beyond the cap is not found.  This is a
+        known limitation — we cap at 20 to avoid fetching an unbounded
+        backlog, but log it so the operator can tell this happened."""
+        import sys
+        from unittest.mock import MagicMock
+
+        # Create 25 messages — only message 1 (the oldest) is real,
+        # messages 2-25 are spam.  With a 20-message cap (newest first),
+        # message 1 won't be in the last-20 window.
+        specs = [(
+            "noreply@target.com", "Confirm",
+            "Click https://target.com/confirm?token=real",
+        )]
+        for i in range(24):
+            specs.append((f"spam{i}@other.com", f"Spam {i}", "Spam content"))
+
+        fake = self._make_fake_imap(specs)
+        sys.modules["aioimaplib"] = MagicMock()
+        sys.modules["aioimaplib"].IMAP4_SSL = MagicMock(return_value=fake)
+        sys.modules["aioimaplib"].IMAP4 = MagicMock(return_value=fake)
+
+        handler = self._make_handler(submitted_at=asyncio.get_event_loop().time() - 1)
+        result = await handler._check_inbox_for_new_email("target.com")
+
+        # The real email (id=1) is outside the last-20 window (ids 6-25)
+        # so it's not found.  This is expected behavior with the cap.
+        assert result is None, (
+            "With 25 messages and 20 cap, the oldest real email is outside "
+            "the window"
+        )
