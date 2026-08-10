@@ -1614,3 +1614,268 @@ class TestBytesMessageIDFix:
             "Candidate log line must fire when a real message is found — "
             "this was the regression where bytes IDs silently broke everything"
         )
+
+
+# ---------------------------------------------------------------------------
+# Tests for page-driven extraction priority + login verification
+# ---------------------------------------------------------------------------
+
+
+class TestPageExpectsCodeCheck:
+    """Verify _page_expects_code_check detects visible code fields."""
+
+    @pytest.mark.asyncio
+    async def test_visible_code_field_returns_true(self):
+        """Page with a visible input[name=code] → True."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        handler = RegistrationHandler(
+            RegistrationConfig(
+                signup_url="https://target.com/signup",
+                email="test@target.com",
+            )
+        )
+        page = AsyncMock()
+        mock_field = MagicMock()
+        mock_field.is_visible = AsyncMock(return_value=True)
+        page.query_selector = AsyncMock(return_value=mock_field)
+
+        result = await handler._page_expects_code_check(page)
+        assert result is True
+
+    @pytest.mark.asyncio
+    async def test_no_matching_field_returns_false(self):
+        from unittest.mock import AsyncMock
+
+        handler = RegistrationHandler(
+            RegistrationConfig(
+                signup_url="https://target.com/signup",
+                email="test@target.com",
+            )
+        )
+        page = AsyncMock()
+        page.query_selector = AsyncMock(return_value=None)
+
+        result = await handler._page_expects_code_check(page)
+        assert result is False
+
+    @pytest.mark.asyncio
+    async def test_invisible_field_returns_false(self):
+        from unittest.mock import AsyncMock, MagicMock
+
+        handler = RegistrationHandler(
+            RegistrationConfig(
+                signup_url="https://target.com/signup",
+                email="test@target.com",
+            )
+        )
+        page = AsyncMock()
+        mock_field = MagicMock()
+        mock_field.is_visible = AsyncMock(return_value=False)
+        page.query_selector = AsyncMock(return_value=mock_field)
+
+        result = await handler._page_expects_code_check(page)
+        assert result is False
+
+
+class TestExtractionPriorityFlip:
+    """Verify that _page_expects_code flips extraction order."""
+
+    def test_prefer_code_returns_code_first_when_both_present(self):
+        """When _page_expects_code is set and email has both link and code,
+        code is returned first."""
+        handler = TestGetEmailBodyText._handler()
+        handler._page_expects_code = True
+        msg = _make_email(
+            html_body="""<a href="https://target.com/confirm?token=abc">Confirm</a>
+            Your verification code is XYZ789""",
+        )
+        result = handler._extract_link_from_email(msg, "target.com")
+        assert result == ("code", "XYZ789")
+
+    def test_prefer_code_falls_back_to_link(self):
+        """When _page_expects_code is set but email has only a link, the
+        link is still returned."""
+        handler = TestGetEmailBodyText._handler()
+        handler._page_expects_code = True
+        msg = _make_email(html_body="""<a href="https://target.com/confirm?token=abc">Confirm</a>""")
+        result = handler._extract_link_from_email(msg, "target.com")
+        assert result == ("link", "https://target.com/confirm?token=abc")
+
+    def test_default_link_first_no_code_field(self):
+        """Without _page_expects_code, link is tried first (default behavior)."""
+        handler = TestGetEmailBodyText._handler()
+        # _page_expects_code not set (defaults to False via getattr)
+        msg = _make_email(
+            html_body="""<a href="https://target.com/confirm?token=abc">Confirm</a>
+            Your code: XYZ789""",
+        )
+        result = handler._extract_link_from_email(msg, "target.com")
+        assert result[0] == "link"
+        assert "confirm" in result[1]
+
+
+class TestLoginVerification:
+    """Verify that _verify_via_login sets login_verified correctly."""
+
+    @pytest.mark.asyncio
+    async def test_verify_via_login_sets_true(self, monkeypatch):
+        from unittest.mock import AsyncMock, MagicMock
+
+        config = RegistrationConfig(
+            signup_url="https://target.com/signup",
+            email="test@target.com",
+            password="test-pw",
+            imap_config=IMAPConfig(
+                host="imap.target.com", username="test@target.com",
+                password="fake-pw",
+            ),
+        )
+        handler = RegistrationHandler(config)
+
+        mock_login_handler = MagicMock()
+        mock_login_handler.authenticated = True
+        mock_login_handler.login = AsyncMock()
+        mock_login_cls = MagicMock(return_value=mock_login_handler)
+
+        monkeypatch.setattr(
+            "ai_browser.login_handler.LoginHandler",
+            mock_login_cls,
+        )
+        result = await handler._verify_via_login(MagicMock())
+        assert result is True
+
+    @pytest.mark.asyncio
+    async def test_verify_via_login_sets_false(self, monkeypatch):
+        from unittest.mock import AsyncMock, MagicMock
+
+        config = RegistrationConfig(
+            signup_url="https://target.com/signup",
+            email="test@target.com",
+            password="test-pw",
+            imap_config=IMAPConfig(
+                host="imap.target.com", username="test@target.com",
+                password="fake-pw",
+            ),
+        )
+        handler = RegistrationHandler(config)
+
+        mock_login_handler = MagicMock()
+        mock_login_handler.authenticated = False
+        mock_login_handler.login = AsyncMock()
+        monkeypatch.setattr(
+            "ai_browser.login_handler.LoginHandler",
+            MagicMock(return_value=mock_login_handler),
+        )
+        result = await handler._verify_via_login(MagicMock())
+        assert result is False
+
+    @pytest.mark.asyncio
+    async def test_verify_via_login_exception_returns_none(self, monkeypatch):
+        from unittest.mock import MagicMock
+
+        config = RegistrationConfig(
+            signup_url="https://target.com/signup",
+            email="test@target.com",
+            password="test-pw",
+            imap_config=IMAPConfig(
+                host="imap.target.com", username="test@target.com",
+                password="fake-pw",
+            ),
+        )
+        handler = RegistrationHandler(config)
+        monkeypatch.setattr(
+            "ai_browser.login_handler.LoginHandler",
+            MagicMock(side_effect=RuntimeError("crash")),
+        )
+        result = await handler._verify_via_login(MagicMock())
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_run_sets_login_verified_on_confirmation(self, monkeypatch):
+        """Full run() with confirmation → login_verified gets set."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        config = RegistrationConfig(
+            signup_url="https://target.com/signup",
+            email="test@target.com",
+            imap_config=IMAPConfig(
+                host="imap.target.com", username="test@target.com",
+                password="fake-pw",
+            ),
+        )
+        handler = RegistrationHandler(config)
+
+        async def _noop(*_a, **_kw):
+            return None
+        monkeypatch.setattr(handler, "_check_captcha", _noop)
+        monkeypatch.setattr(
+            handler, "_fill_signup_form",
+            AsyncMock(return_value=["email", "password"]),
+        )
+        monkeypatch.setattr(handler, "_submit_form", _noop)
+        monkeypatch.setattr(handler, "_page_expects_code_check",
+                             AsyncMock(return_value=False))
+
+        async def _fake_poll(*_a, **_kw):
+            return ("link", "https://target.com/confirm?token=abc")
+        monkeypatch.setattr(handler, "_poll_inbox_for_link", _fake_poll)
+
+        # Mock login verification
+        async def _fake_verify(*_a, **_kw):
+            return True
+        monkeypatch.setattr(handler, "_verify_via_login", _fake_verify)
+
+        page = AsyncMock()
+        page.url = "https://target.com/welcome"
+        session = MagicMock()
+        session.new_page = AsyncMock(return_value=page)
+
+        await handler.register(session)
+        assert handler.confirmed is True
+        assert handler.login_verified is True
+
+    @pytest.mark.asyncio
+    async def test_run_login_verification_failed_does_not_block(self, monkeypatch):
+        """Even when login verification returns False, registration still
+        reports confirmed=True and credentials are saved (the confirmation
+        action happened — we just know the account may not be active)."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        config = RegistrationConfig(
+            signup_url="https://target.com/signup",
+            email="test@target.com",
+            imap_config=IMAPConfig(
+                host="imap.target.com", username="test@target.com",
+                password="fake-pw",
+            ),
+        )
+        handler = RegistrationHandler(config)
+
+        async def _noop(*_a, **_kw):
+            return None
+        monkeypatch.setattr(handler, "_check_captcha", _noop)
+        monkeypatch.setattr(
+            handler, "_fill_signup_form",
+            AsyncMock(return_value=["email", "password"]),
+        )
+        monkeypatch.setattr(handler, "_submit_form", _noop)
+        monkeypatch.setattr(handler, "_page_expects_code_check",
+                             AsyncMock(return_value=False))
+
+        async def _fake_poll(*_a, **_kw):
+            return ("link", "https://target.com/confirm?token=abc")
+        monkeypatch.setattr(handler, "_poll_inbox_for_link", _fake_poll)
+
+        async def _fake_verify(*_a, **_kw):
+            return False  # login failed
+        monkeypatch.setattr(handler, "_verify_via_login", _fake_verify)
+
+        page = AsyncMock()
+        page.url = "https://target.com/welcome"
+        session = MagicMock()
+        session.new_page = AsyncMock(return_value=page)
+
+        await handler.register(session)
+        assert handler.confirmed is True
+        assert handler.login_verified is False  # distinct from None

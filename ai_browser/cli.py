@@ -1213,7 +1213,25 @@ async def _run_crawl(
                         err=True,
                     )
                 elif handler.confirmed:
-                    click.echo(f"  Registration complete and confirmed! Current URL: {page.url}")
+                    if handler.login_verified is True:
+                        click.echo(
+                            f"  Registration complete and verified via login! "
+                            f"Current URL: {page.url}"
+                        )
+                    elif handler.login_verified is False:
+                        click.echo(
+                            f"  Registration form submitted and a confirmation "
+                            f"step was attempted, but a follow-up login attempt "
+                            f"did NOT succeed — the account may not actually be "
+                            f"active. Investigate before relying on these "
+                            f"credentials. Current URL: {page.url}",
+                            err=True,
+                        )
+                    else:
+                        click.echo(
+                            f"  Confirmation action completed (unverified). "
+                            f"Current URL: {page.url}"
+                        )
                 else:
                     click.echo(
                         f"  Registration form submitted, but email confirmation was "

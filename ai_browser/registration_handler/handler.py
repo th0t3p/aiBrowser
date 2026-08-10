@@ -17,6 +17,7 @@ from playwright.async_api import Page
 
 from ai_browser.browser_session import BrowserSession
 from ai_browser._form_helpers import fill_form_fields, submit_form, check_captcha
+from ai_browser._form_helpers import _escape_css_string
 from ai_browser._llm_client import call_llm
 
 from .models import CaptchaDetected, DisposableInboxConfig, IMAPConfig, RegistrationConfig
@@ -134,6 +135,14 @@ _CODE_RE = re.compile(
     r"(?:pin|code|otp)\s*(?:is|:)?\s*\**\s*([A-Z0-9]{4,8})\**",
     re.IGNORECASE,
 )
+
+# Shared list of field names for code/OTP/PIN inputs — used by both
+# _page_expects_code_check (read-only check) and _submit_verification_code
+# (fill + submit).  Keep in sync if either is updated.
+_CODE_FIELD_NAMES = [
+    "code", "otp", "pin", "verification_code",
+    "confirmation_code", "verificationCode",
+]
 
 
 def _looks_like_docs_page(path: str) -> bool:
@@ -291,6 +300,7 @@ class RegistrationHandler:
         self._captcha_info: Optional[CaptchaDetected] = None
         self._signup_submitted_at: float = 0.0
         self.confirmed: bool = False
+        self.login_verified: Optional[bool] = None
         self._registration_looked_real: Optional[bool] = None
         self._provisioned_email: Optional[str] = None
 
@@ -365,6 +375,17 @@ class RegistrationHandler:
         if self.config.use_ai_judge and self.config.llm_api_key:
             self._registration_looked_real = await self._ai_judge_did_submit(page)
 
+        # ---- Check what the page is asking for -------------------------------
+        # Before touching the email, inspect the page's own DOM: if it shows
+        # a code/PIN/OTP input field, extraction should prioritize code over
+        # link — the page is the ground truth for what mechanism is in play.
+        self._page_expects_code = await self._page_expects_code_check(page)
+        if self._page_expects_code:
+            logger.info(
+                "Post-submit page has a code-entry field — will prioritize "
+                "extracting a code from the confirmation email over a link"
+            )
+
         # ---- Confirmation email: dispatch on backend ------------------------
         target_domain = urlparse(signup_url).hostname or ""
         if self.config.disposable_inbox_config:
@@ -392,6 +413,22 @@ class RegistrationHandler:
                 logger.warning("No confirmation link found within timeout window")
         else:
             logger.info("No IMAP or disposable inbox config; skipping email confirmation")
+
+        # ---- Post-confirmation: verify the account actually works ---------
+        if self.confirmed:
+            self.login_verified = await self._verify_via_login(session)
+            if self.login_verified is True:
+                logger.info("Post-confirmation login succeeded — account is active")
+            elif self.login_verified is False:
+                logger.warning(
+                    "Confirmation action completed but follow-up login DID NOT "
+                    "succeed — the account may not actually be active"
+                )
+            else:
+                logger.info(
+                    "Confirmation action completed; login verification was "
+                    "inconclusive — account status unknown"
+                )
 
         self._current_page = page
         return page
@@ -459,14 +496,31 @@ class RegistrationHandler:
         ]
         await submit_form(page, extra_selectors=signup_selectors)
 
+    async def _page_expects_code_check(self, page: Page) -> bool:
+        """True if the current page has a visible field matching known
+        code/OTP/PIN input names — a *before-the-fact* check (no filling),
+        used to decide extraction priority before ever looking at the email.
+        """
+        for name in _CODE_FIELD_NAMES:
+            try:
+                escaped = _escape_css_string(name)
+                field = await page.query_selector(
+                    f"input[name='{escaped}'], input[id='{escaped}'], "
+                    f"input[placeholder*='{_escape_css_string(name.replace('_', ' '))}' i]"
+                )
+                if field and await field.is_visible():
+                    return True
+            except Exception:
+                continue
+        return False
+
     async def _submit_verification_code(self, page: Page, code: str) -> bool:
         """Fill a verification code into the page and submit the form.
 
         Returns True if a code field was found and filled, False otherwise.
         """
         filled = await fill_form_fields(page, [
-            (["code", "otp", "pin", "verification_code",
-              "confirmation_code", "verificationCode"], code),
+            (_CODE_FIELD_NAMES, code),
         ])
         if not filled:
             logger.info(
@@ -609,6 +663,26 @@ class RegistrationHandler:
     # ------------------------------------------------------------------
     # IMAP polling for confirmation email
     # ------------------------------------------------------------------
+
+    async def _verify_via_login(self, session) -> Optional[bool]:
+        """Attempt a real login with the registration credentials to verify
+        the account is actually active. Returns True/False/None matching
+        LoginHandler.authenticated semantics."""
+        try:
+            from ai_browser.login_handler import LoginHandler
+            from ai_browser.login_handler.models import LoginConfig
+
+            login_config = LoginConfig(
+                login_url=self.config.signup_url,
+                email=self.config.email or "",
+                password=self.config.password,
+            )
+            handler = LoginHandler(login_config)
+            await handler.login(session)
+            return handler.authenticated
+        except Exception as exc:
+            logger.warning("Post-confirmation login verification failed to run: %s", exc)
+            return None
 
     async def _handle_confirmation_result(
         self, page: Page, result: tuple[str, str],
@@ -950,6 +1024,16 @@ class RegistrationHandler:
                 "AI classified latest unread mail (from %s) as likely the "
                 "registration email", msg.get("From", ""),
             )
+            # Respect the page's own indication of what it wants: code
+            # before link, or link before code (the default).
+            if getattr(self, "_page_expects_code", False):
+                code = _extract_verification_code_from_body(body_text)
+                if code:
+                    return ("code", code)
+                link = _extract_link_from_body(body_text, target_domain)
+                if link:
+                    return ("link", link)
+                return None
             # Try link first, then code
             link = _extract_link_from_body(body_text, target_domain)
             if link:
@@ -1013,19 +1097,31 @@ class RegistrationHandler:
         """Try to extract a confirmation link or verification code from *msg*.
 
         Returns ``("link", url)``, ``("code", code)``, or ``None``.
+
+        When the post-submit page has a visible code-entry field
+        (``self._page_expects_code``), code extraction is tried first —
+        the page is the ground truth for what confirmation mechanism is
+        in play.  Otherwise link extraction is tried first (the default
+        for flows that are genuinely link-based).
         """
         body_text = self._get_email_body_text(msg)
 
-        # Try link extraction first (primary path)
+        if getattr(self, "_page_expects_code", False):
+            code = _extract_verification_code_from_body(body_text)
+            if code:
+                return ("code", code)
+            link = _extract_link_from_body(body_text, target_domain)
+            if link:
+                return ("link", link)
+            return None
+
+        # Default: link first (existing behavior for link-based flows)
         link = _extract_link_from_body(body_text, target_domain)
         if link:
             return ("link", link)
-
-        # Fall back to code extraction (PIN/OTP verification emails)
         code = _extract_verification_code_from_body(body_text)
         if code:
             return ("code", code)
-
         return None
 
     @property
