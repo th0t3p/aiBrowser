@@ -1,548 +1,354 @@
-# ai_browser
+# aiBrowser
 
-Automated web browsing for bug bounty reconnaissance. Drives a real browser
-(Playwright/Chromium) through **Burp Suite's proxy**, so every request the
-browser makes — links followed, forms submitted, accounts registered — lands
-in Burp's proxy history automatically.
+Automated web browsing for bug bounty reconnaissance: crawls a target,
+optionally drives an LLM-backed agent through JS-heavy pages, optionally
+logs in or registers an account, and captures traffic — all through
+Burp Suite by default, or standalone.
 
-> **This tool captures traffic directly via Playwright.** Every in-scope
-> request/response pair is saved to `output/traffic/<hostname>/index.jsonl`
-> with content-addressed body files under `bodies/`. Burp Suite remains the
-> proxy (all browser traffic still routes through it), but aiBrowser now
-> records its own traffic for direct consumption by other tools (e.g. aiSSRF)
-> without requiring aiScraper's Burp-ingestion endpoint.
+```bash
+ai-browser crawl developers.tiktok.com --authorized
+```
+
+That's the minimum viable invocation. Everything else in this document
+is about what you can layer on top of it.
 
 ---
 
-## What it does
+## Options, up front
 
-Three layers, each usable independently:
+Every flag `ai-browser crawl` accepts, grouped by what they control. Full
+authoritative list is always `ai-browser crawl --help` — this groups it
+for readability and adds the context the raw help text doesn't have
+room for.
 
-1. **Crawler** — deterministic, no LLM. Follows links, reads `robots.txt`
-   and `sitemap.xml`, regex-extracts likely API endpoints from inline JS.
-2. **Agent Explorer** — LLM-driven. For JS-heavy pages where the crawler
-   finds no new links, an LLM reads the page's accessibility tree and
-   decides what to click or fill next. Supports **Anthropic, OpenAI, and
-   DeepSeek**.
-3. **Registration + Login handlers** — fills signup/login forms, polls an
-   IMAP inbox for confirmation emails, detects (but never solves) CAPTCHAs,
-   and persists the resulting session so later runs skip straight to an
-   authenticated crawl.
+### Authorization & scope (required + how far to follow links)
 
-4. **Traffic Capture** — hooks Playwright's `page.on("response")` to record
-   every in-scope request/response pair as JSON Lines with content-addressed
-   body files. Always on by default (opt-out with `--no-traffic-capture`),
-   writes to `output/traffic/<hostname>/` for direct consumption by other
-   tools (e.g. aiSSRF) with no Burp-ingestion dependency.
-
-```
-                    ┌──────────────┐
-                    │  ai_browser  │
-                    │ (Playwright) │
-                    └──────┬───────┘
-                           │ all traffic proxied
-                           ▼
-                   ┌───────────────┐
-                   │  Burp Suite   │
-                   │ 127.0.0.1:8080│
-                   └───────────────┘
-                           │
-                           ▼
-                     Target Host(s)
-
-        Traffic also captured directly to
-        output/traffic/<hostname>/index.jsonl
-        (self-contained, no Burp dependency)
-```
-
----
-
-## Prerequisites
-
-| Component | Needed for | Notes |
+| Flag | Default | Notes |
 |---|---|---|
-| **Python 3.11+** | Everything | Check with `python3 --version` |
-| **Burp Suite** (Community or Pro) | Everything | Proxy listener running, target in scope |
-| **Playwright** (Chromium) | Everything | Installed separately from the pip package — see below |
-| **An LLM API key** (Anthropic, OpenAI, or DeepSeek) | `--agent` only | Skip this and pass `--no-agent` to run crawler-only |
-| **`browser-use` + `langchain-deepseek`** | `--agent-backend browser-use` only | `pip install -e ".[browser-use]"` — optional extra, not installed by default |
-| **An IMAP-accessible inbox** | `--register` / `--login` with email confirmation | Needs an app-specific password on most providers — see below |
+| `--authorized` | — | **Required.** Confirms you have permission to test this hostname. The tool refuses to run without it. |
+| `--scope TEXT` | seed hostname (exact match) | A glob pattern, e.g. `*.tiktok.com`. Controls which discovered links get followed. |
+| `--scope-file FILE` | — | One glob pattern per line, `#` comments allowed. Combines with `--scope` (union, not override) if both given. |
 
-### Installing
+### Network / traffic
 
-```bash
-git clone https://github.com/th0t3p/aiBrowser.git
-cd aiBrowser
-python3 -m venv venv
-source venv/bin/activate
-python -m pip install --upgrade pip     # older pip can't do editable installs from pyproject.toml alone
-pip install -e .
-playwright install chromium              # separate step — pip install alone does NOT fetch the browser binary
-```
+| Flag | Default | Notes |
+|---|---|---|
+| `--proxy-server TEXT` | `http://127.0.0.1:8080` | Where to route traffic if not using `--no-proxy`. |
+| `--no-proxy` | off | Route directly to the target instead of through Burp. |
+| `--ca-cert PATH` | — | Burp's CA cert (DER/PEM), for trusting Burp's MITM'd HTTPS. Meaningless with `--no-proxy` — see below. |
+| `--traffic-dir PATH` | `output/traffic/<hostname>/` | Where captured traffic (independent of Burp) gets written. |
+| `--no-traffic-capture` | off | Disables aiBrowser's own traffic logging entirely. |
 
-### Confirming Burp is actually listening
+### Crawl behavior (Phase 1)
 
-```bash
-curl -x http://127.0.0.1:8080 http://burpsuite -v
-```
+| Flag | Default | Notes |
+|---|---|---|
+| `--max-depth INT` | 3 | BFS depth limit. |
+| `--max-pages INT` | 50 | Page count limit. |
+| `--skip-existing FILE` | — | A previous run's output JSON. Already-seen URLs aren't re-crawled; their entries are merged into this run's output. |
+| `--output TEXT` | stdout | Where to write the final JSON. |
+| `--storage-dir PATH` | `storage/browser_states` | Where session state, credentials, and PID files persist. |
+| `--headless` / `--visible` | headless | Whether you can see the browser window. |
 
-If Burp's proxy is up, this returns Burp's own CA-certificate download page.
-If you get "connection refused," check Burp's **Proxy → Proxy Listeners**
-tab for the actual bound port before continuing.
+### Agent exploration (Phase 2)
 
-### HTTPS / Burp's CA certificate
+| Flag | Default | Notes |
+|---|---|---|
+| `--agent` / `--no-agent` | agent (on) | Whether Phase 2 runs at all. |
+| `--agent-backend [custom\|browser-use]` | `custom` | Which engine drives it. See [Two backends](#two-backends-for-phase-2) below — this choice has real, non-obvious consequences for other flags. |
+| `--max-actions INT` | 20 | **Only affects `--agent-backend browser-use`.** See the callout below — this is the single most common way to be confused by this tool's current behavior. |
+| `--agent-task TEXT` | generic "explore thoroughly" | **Only affects `--agent-backend browser-use`.** Override the agent's instructions. |
 
-By default, `ignore_https_errors` is enabled, so Playwright accepts Burp's
-self-signed MITM cert with no extra setup — nothing to configure for a
-first run. If you need stricter TLS validation for realism (catching
-cert-related bugs on the target), export Burp's CA cert (**Proxy → Options
-→ Import/Export CA certificate**) and pass it via `--ca-cert path/to/cert`.
+> **`--max-actions` silently does nothing on the default backend.**
+> `_run_phase2_custom` never reads it — the custom explorer's action
+> budget is a separate, hardcoded value (also 20, which is why this is
+> easy to miss) inside `ExplorerConfig` that no CLI flag currently
+> exposes. If you pass `--max-actions 100` without also passing
+> `--agent-backend browser-use`, you will get exactly the same
+> exploration depth as the default. See [Suggestions](#suggestions-for-simplifying-the-cli) below.
 
-### IMAP app passwords
+### LLM configuration (shared across Phase 2, Phase 3, and login's AI checks)
 
-Gmail, Outlook, and most major providers **block IMAP login with your
-regular account password**. You'll need a provider-generated app-specific
-password instead (e.g. Gmail: [myaccount.google.com/apppasswords](https://myaccount.google.com/apppasswords),
-requires 2-Step Verification enabled first). Custom-domain mail servers
-often don't have this restriction. Pass it via `--imap-password` or,
-safer, the `AIBROWSER_IMAP_PASSWORD` environment variable (avoids it
-sitting in shell history).
+| Flag | Default | Notes |
+|---|---|---|
+| `--llm-provider [anthropic\|openai\|deepseek]` | `anthropic` | |
+| `--llm-model TEXT` | provider-specific | Required if you set a provider explicitly and want anything other than the built-in default. |
+| `--llm-api-key TEXT` | — | Or set `AIBROWSER_LLM_API_KEY`. |
+| `--llm-base-url TEXT` | provider default | |
+| `--llm-max-tokens INT` | provider default | |
+| `--anthropic-api-key TEXT` | — | **Deprecated.** Falls back into `--llm-api-key` with a warning. Use the real flag. |
 
-### Using a .env file (recommended)
+**These same credentials drive every AI-assisted decision in the tool**,
+not just Phase 2: the registration post-submit judge, the login success
+judge, and the confirmation-email classification fallback (see
+[Email registration](#email-registration-in-detail)) all reuse
+`--llm-provider`/`--llm-api-key`/etc. There's no separate credential set
+for registration or login. If you're running `--register` or `--login`
+without Phase 2 (`--no-agent`), you still want these flags set if you
+want the AI-assisted parts of registration/login to function — without
+them, those specific checks are skipped (some fail open, treated as
+inconclusive; one fails closed, treated as "no" — see below) but nothing
+crashes.
 
-Instead of passing credentials on every command, copy the example file
-and fill in your settings once:
+### Registration (Phase 3)
 
-```bash
-cp .env.example .env
-# Edit .env — add your API keys, IMAP credentials, etc.
-```
+| Flag | Default | Notes |
+|---|---|---|
+| `--register` | off | Attempt registration after crawling. |
+| `--register-email TEXT` | — | Required *unless* `--email-backend disposable` (address is provisioned dynamically in that mode). |
+| `--register-password TEXT` | random, auto-generated | Saved to the credentials file either way. |
+| `--register-name TEXT` | — | |
 
-Then invoke the CLI without repeated flags:
+### Login (Phase 0)
 
-```bash
-# Before (every flag on every command)
-ai-browser crawl example.com --authorized --agent \
-    --llm-provider deepseek --llm-model deepseek-chat \
-    --llm-api-key "sk-..." --imap-password "$AIBROWSER_IMAP_PASSWORD"
+| Flag | Default | Notes |
+|---|---|---|
+| `--login` | off | Attempt login *before* crawling. |
+| `--login-email TEXT` | falls back to `--register-email` | |
+| `--login-password TEXT` | falls back to `--register-password` | |
 
-# After (credentials from .env, only target-specific flags remain)
-ai-browser crawl example.com --authorized --agent \
-    --llm-provider deepseek --llm-model deepseek-chat
-```
+### Email confirmation backend
 
-Explicit CLI flags always override `.env` values, so you can set
-defaults in `.env` and override per-invocation when needed (e.g. a
-different model for one target).
+| Flag | Default | Notes |
+|---|---|---|
+| `--email-backend [imap\|disposable]` | `imap` | See [Email registration](#email-registration-in-detail). |
+| `--imap-host` / `--imap-port` / `--imap-username` / `--imap-password` | port 993 | A pre-existing mailbox you control. Password can also be `AIBROWSER_IMAP_PASSWORD`. |
+| `--email-timeout INT` | 120 | Seconds to wait for the confirmation email. |
+| `--disposable-inbox-api-key TEXT` | — | AgentMail API key. Required if `--email-backend disposable`. |
+| `--disposable-inbox-domain TEXT` | provider default | Custom sending domain, if your AgentMail plan supports it. |
+
+### Session / cookies
+
+| Flag | Default | Notes |
+|---|---|---|
+| `--cookies-file FILE` | — | Import an existing session (Playwright `storage_state()` JSON, or a bare cookie array). Skips the automatic per-hostname session restore. |
 
 ---
 
-## Quick start
+## What can be used together, what can't
 
-```bash
-# Smoke test: crawler only, no LLM, no registration — fastest way to
-# confirm Playwright + Burp are wired up correctly
-ai-browser crawl example.com --authorized --no-agent --headless
-```
+**Hard errors** (the tool refuses to start):
 
-Every run requires `--authorized` — there's no default; the CLI refuses to
-start without it, as an explicit acknowledgment that you have testing
-permission for the target.
+- `--register` with neither `--register-email` nor `--email-backend disposable` set.
+- `--login` without `--login-email`/`--login-password` **and** without `--register-email`/`--register-password` to fall back to (both need to resolve to *something*).
+- `--email-backend disposable` together with any of `--imap-host` / `--imap-username` / `--imap-password` — pick one backend, not both.
+- `--email-backend disposable` without `--disposable-inbox-api-key`.
+- `--agent` (default) without `--llm-model` when a provider was explicitly set but no model resolved — this is really "you configured half an LLM setup," not a real conflict.
 
----
+**Not an error, but one silently wins:**
 
-## Usage
+- `--cookies-file` + `--register` and/or `--login`: cookies win. Phase 0 and Phase 3 are both skipped outright, regardless of whether you also passed `--register`/`--login` — you'll see `"Skipped - using provided cookies..."` in the output rather than either phase running.
+- `--login` succeeding also skips `--register` (checked via the login handler's own success verification, not just "the flag was passed") — but a **failed or inconclusive** login does *not* block registration; Phase 3 still runs normally in that case.
+- `--max-actions` / `--agent-task` with `--agent-backend custom` (the default): both flags are accepted, neither does anything. No warning is printed. See the callout above.
+- `--ca-cert` with `--no-proxy`: accepted, has no effect (there's no MITM cert to trust when there's no proxy in the loop).
 
-### Wildcard scope
-
-`--scope` accepts a glob pattern for which discovered hostnames are
-in-scope to follow, separate from the hostname you actually start at:
-
-```bash
-ai-browser crawl developers.example.com --authorized --scope "*.example.com"
-```
-
-The positional `hostname` argument stays a concrete, resolvable host (used
-to build the seed URL, `robots.txt`, and `sitemap.xml` requests) — it can't
-itself be a wildcard. `--scope` governs which *discovered links* the
-crawler and agent are allowed to follow once exploring. If `--scope` is
-omitted, scope defaults to an exact match on `hostname`.
-
-**Multi-pattern scope via `--scope-file`**: when a single glob pattern
-isn't enough (e.g. you need to cover both `*.tiktok.com` and
-`careers.tiktok.com` as distinct patterns), put one pattern per line in
-a file:
-
-```bash
-# scope.txt — one pattern per line, '#' comments and blank lines ignored
-*.tiktok.com
-careers.tiktok.com
-```
-
-Then pass it with `--scope-file`:
-
-```bash
-ai-browser crawl developers.tiktok.com --authorized --scope-file scope.txt
-```
-
-`--scope` and `--scope-file` combine when both are given (union of
-patterns, not override). A hostname is in-scope if it matches **any**
-pattern from the combined set.
-
-### Agent Explorer — choosing an LLM provider and backend
-
-```bash
-# With a .env file, no API key flag needed — it's read from AIBROWSER_LLM_API_KEY
-ai-browser crawl example.com --authorized --agent \
-    --llm-provider anthropic --llm-model claude-sonnet-4-20250514
-
-# Without .env, set it per-command:
-ai-browser crawl example.com --authorized --agent \
-    --llm-provider anthropic --llm-model claude-sonnet-4-20250514 \
-    --llm-api-key "sk-ant-..."
-
-# OpenAI
-ai-browser crawl example.com --authorized --agent \
-    --llm-provider openai --llm-model gpt-4o --llm-api-key "sk-..."
-
-# DeepSeek
-ai-browser crawl example.com --authorized --agent \
-    --llm-provider deepseek --llm-model deepseek-chat --llm-api-key "..."
-
-# Self-hosted / custom endpoint (OpenAI-compatible)
-ai-browser crawl example.com --authorized --agent \
-    --llm-provider openai --llm-base-url "http://localhost:8000/v1" --llm-api-key "unused"
-```
-
-By default, `--agent-backend custom` uses aiBrowser's own AgentExplorer.
-You can switch to **browser-use** (an external agent library with richer
-action capabilities) by passing `--agent-backend browser-use`. This
-requires the optional `[browser-use]` extra:
-
-```bash
-pip install -e ".[browser-use]"
-
-# browser-use as the Phase 2 engine — connects to the SAME Chromium
-# process via CDP (no second browser launch)
-ai-browser crawl example.com --authorized --agent \
-    --agent-backend browser-use \
-    --max-actions 15 \
-    --llm-provider deepseek --llm-model deepseek-v4-flash
-```
-
-`--agent-backend custom` (the default) is stable and tested. `browser-use`
-is new and requires `browser-use==0.1.48` pinned. Control agent verbosity
-with `--max-actions` (default 20) — lower is cheaper, higher explores
-more of the site.
-
-Override the agent's task with `--agent-task` to focus exploration on
-specific pages or patterns, reducing wasted budget on re-discovering
-what the crawler already found:
-
-```bash
-# Directive task — wastes less budget than the generic default
-ai-browser crawl example.com --authorized --agent \
-    --agent-backend browser-use \
-    --agent-task "Click through the left sidebar navigation on every
-    documentation page and report all linked pages. Do not scroll
-    aimlessly — use the sidebar to discover every linked doc page."
-```
-
-The no-forms/no-registration constraint is appended automatically, so
-custom tasks don't need to include it. Only meaningful for
-`--agent-backend browser-use` (the `custom` backend uses a per-step
-decision loop, not a single task string).
-
-#### Verify browser-use safety before pointing it at a real target
-
-`--agent-backend browser-use` connects browser-use to the **same**
-Chromium process aiBrowser already launched, via CDP, rather than letting
-it spawn its own browser. Before trusting that against a real,
-adversarial-by-design target, run the standalone safety verification:
-
-```bash
-pip install -e ".[browser-use]"
-export DEEPSEEK_API_KEY="sk-..."
-export NO_PROXY=127.0.0.1,localhost   # avoid Burp intercepting the CDP handshake
-export no_proxy=127.0.0.1,localhost   # some libs only check the lowercase form
-
-python scripts/verify_browser_use_safety.py
-```
-
-This runs two independent checks and prints a PASS/FAIL verdict for each
-(overall pass requires both):
-
-1. **`allowed_domains` enforcement** — 5 repeated runs confirming a
-   disallowed domain never gets contacted, verified via Playwright's own
-   network observation (not browser-use's self-reported logs).
-2. **HTTPS through an untrusted cert + context reuse** — confirms the
-   browser accepts an untrusted/self-signed certificate (standing in for
-   Burp's MITM cert) without blocking navigation, and that browser-use is
-   genuinely reusing aiBrowser's pre-created browser context rather than
-   spinning up its own (the assumption the CDP-sharing design depends on).
-
-If either check fails, don't run `--agent-backend browser-use` against a
-real target until you understand why — see "Key design decisions" below
-for what each check is actually protecting against.
-
-`--anthropic-api-key` still works as a deprecated alias for backward
-compatibility, but new setups should use `--llm-provider` / `--llm-api-key`.
-
-### Registration — letting the agent create an account autonomously
-
-By default, if the agent encounters a signup form mid-crawl, it treats it
-as a borderline action requiring confirmation — it will **not** register an
-account on its own unless you explicitly opt in with `--register`:
-
-```bash
-# With a .env file (see "Using a .env file" above), this shrinks to:
-ai-browser crawl example.com --authorized --agent --register \
-    --register-password "Str0ngP@ss!"
-
-# Without .env, pass every flag explicitly:
-ai-browser crawl example.com --authorized --agent --register \
-    --register-email "test+example@yourdomain.com" \
-    --register-password "Str0ngP@ss!" \
-    --imap-host imap.yourdomain.com \
-    --imap-username "test@yourdomain.com" \
-    --imap-password "$AIBROWSER_IMAP_PASSWORD"
-```
-
-With `--register` set, the agent recognizes signup-intent elements (sign
-up, create account, register, get started, join now) during exploration
-and hands off to the registration handler for the actual fill + submit +
-email-confirmation flow — rather than the agent improvising form values
-itself.
-
-If a CAPTCHA is hit during registration, the flow **pauses** and raises
-`CaptchaDetected` with a saved screenshot — nothing is solved
-automatically. Solve it manually in a visible browser window
-(`--visible`), then call `.resume()` to continue.
-
-### Login — reusing a session on later runs
-
-```bash
-ai-browser crawl example.com --authorized --login \
-    --login-email "test+example@yourdomain.com" \
-    --login-password "Str0ngP@ss!"
-```
-
-If you've already registered on a target in a previous run, you often
-don't need `--login-email`/`--login-password` at all — cookies and
-localStorage are persisted per hostname in `storage/browser_states/`, so a
-later run picks up the still-authenticated session automatically. The
-explicit login flags are there for logging in with credentials that
-weren't created by this tool.
-
-### Full pipeline example
-
-```bash
-# With a .env file (credentials come from .env):
-ai-browser crawl example.com \
-    --authorized \
-    --scope "*.example.com" \
-    --agent --register \
-    --register-password "Str0ngP@ss!" \
-    --max-depth 5 --max-pages 100 \
-    --output results.json
-
-# Without .env, pass credentials explicitly:
-ai-browser crawl example.com \
-    --authorized \
-    --scope "*.example.com" \
-    --agent --llm-provider anthropic --llm-api-key "$AIBROWSER_LLM_API_KEY" \
-    --register \
-    --register-email "test+example@yourdomain.com" \
-    --register-password "Str0ngP@ss!" \
-    --imap-host imap.yourdomain.com \
-    --imap-username "test@yourdomain.com" \
-    --imap-password "$AIBROWSER_IMAP_PASSWORD" \
-    --max-depth 5 --max-pages 100 \
-    --output results.json
-```
-
-### Resume a crawl — skipping already-discovered URLs
-
-When you've already run a crawl against a target and want a second pass to
-find **new** endpoints without re-crawling what you already found, pass the
-previous run's output JSON with `--skip-existing`:
-
-```bash
-ai-browser crawl example.com --authorized \
-    --skip-existing results.json \
-    --output run2.json
-```
-
-The crawler seeds its visited set with every URL present in the prior
-output, so those pages are never re-queued. The final output JSON merges
-the prior entries (kept as-is) with any genuinely new endpoints discovered
-in the resumed run, and includes `skipped_existing_count` /
-`newly_discovered_count` fields to make the result self-documenting.
-
-Prior entries win on URL collision — the already-verified data from the
-earlier run is preserved unchanged.
+**Precedence, summarized:** `--cookies-file` > successful `--login` > default (crawl normally, then optionally register).
 
 ---
 
-## Module layout
+## Two modes: routed through Burp, or standalone
 
-```
-ai_browser/
-├── _scope.py                 # Shared glob-pattern hostname matching (used by
-│                              #   browser_session, agent_explorer, crawler)
-├── _form_helpers.py           # Shared form-filling + CAPTCHA detection,
-│                              #   used by both registration_handler and login_handler
-├── browser_session/
-│   ├── session.py             # BrowserSession — Playwright wrapper, Burp proxy,
-│   │                          #   scope guard, storage_state persistence
-│   └── models.py               # BrowserSessionConfig, ProxyConfig, ScopeGuardError
-├── crawler/
-│   ├── crawler.py             # Deterministic BFS crawler (no LLM)
-│   └── models.py               # CrawlConfig (seed_hostname vs scope_pattern), CrawlResult
-├── agent_explorer/
-│   ├── explorer.py             # Accessibility tree → LLM → action, with denylist,
-│   │                          #   registration hand-off, multi-provider LLM calls
-│   └── models.py               # ExplorerConfig, AgentAction, AuditLogEntry
-├── registration_handler/
-│   ├── handler.py             # Signup form fill, IMAP polling, CAPTCHA pause
-│   └── models.py               # RegistrationConfig, IMAPConfig, CaptchaDetected
-├── login_handler/
-│   ├── handler.py             # Login form fill, session persistence
-│   └── models.py               # LoginConfig
-├── traffic_capture/
-│   ├── __init__.py              # TrafficCapture — page.on("response") hooks,
-│   │                             #   content-addressed body storage, index.jsonl
-│   └── schema.json               # JSON Schema v1.0 — source of truth for record format
-└── cli.py                       # Click CLI entrypoint (crawl command)
-```
+By default, all traffic goes through Burp Suite (`http://127.0.0.1:8080`)
+*and* is independently logged by aiBrowser itself — these are two
+separate, parallel things that both happen unless you turn one off.
+
+**Why both exist:** Burp gives you the interactive side — Repeater,
+Intruder, the passive/active Scanner, extensions, just watching traffic
+live while a crawl runs. aiBrowser's own capture (`output/traffic/<hostname>/`)
+exists independently of Burp: it's Playwright's own `page.on("response")`
+hook, writing an append-only `index.jsonl` (one record per request, with
+headers, status, and content-addressed SHA-256 references into a
+`bodies/` directory) that other tools in this pipeline (e.g. `aiSSRF`)
+consume directly — it doesn't depend on Burp being up, and it dedupes
+identical bodies automatically.
+
+**`--no-proxy`** turns off *only* the Burp-routing half. Traffic still
+goes to the target directly instead of through 127.0.0.1:8080, but
+`output/traffic/` capture keeps working exactly the same either way. Use
+this when Burp isn't running, or you specifically don't need live Burp
+inspection for a given run — a downed Burp instance used to take out
+every phase of a run identically before this flag existed.
+
+**`--no-traffic-capture`** turns off the other half — no `index.jsonl`,
+no `bodies/`. You'd want this if you're only routing through Burp for
+its own capture/history and don't need aiBrowser's redundant copy.
+
+Both can be off at once (`--no-proxy --no-traffic-capture`) for a
+fast, log-free smoke test with no persistent traffic record at all.
 
 ---
 
-## Key design decisions
+## Running from different phases
 
-### Scope guard is enforced twice, independently
+The tool always runs Phase 1 (crawl); everything else is opt-in or
+conditionally skipped:
 
-`BrowserSession` intercepts every request at the Playwright route level —
-anything outside the configured scope pattern gets aborted before it
-leaves the browser. `AgentExplorer` performs its **own** independent
-hostname check before executing any action, rather than trusting
-`BrowserSession` alone — the same defense-in-depth principle used across
-the rest of this toolchain (`aiSSRF`'s candidate fetcher does the same
-against `aiScraper`'s output). Scope violations are recorded on
-`session.violations`; call `session.check_violations()` to raise if any
-occurred.
+- **Skip crawling already-known URLs**: `--skip-existing <prior-run.json>`. Their entries get merged into this run's output rather than re-fetched.
+- **Skip Phase 0 and Phase 3 entirely, start already-authenticated**: `--cookies-file <path>`. Two accepted shapes — Playwright's `storage_state()` JSON, or a bare browser-extension-style cookie array (auto-detected).
+- **Skip Phase 3 only, log in fresh instead of registering**: `--login` with credentials. If login succeeds (verified, not just attempted — see below), registration is skipped automatically even if `--register` was also passed.
+- **Skip Phase 2**: `--no-agent`. Crawl + optional login/register, no autonomous exploration.
+- **Skip Phase 3 explicitly**: just don't pass `--register`. (Phase 0/`--login` is independent of this.)
 
-### Traffic capture is self-contained, not Burp-dependent
+There's no flag to skip Phase 1 itself — every run crawls first, since
+Phase 2/3 both depend on what Phase 1 discovers (candidate signup URLs,
+in-scope endpoints to explore further).
 
-aiBrowser records every in-scope request/response pair to a file-based
-format under `output/traffic/<hostname>/`: one `index.jsonl` per run
-with content-addressed body files under `bodies/<sha256>.bin`. This is
-always on by default — opt out with `--no-traffic-capture` — and meant
-for direct consumption by other tools (e.g. aiSSRF) without requiring
-Burp Suite or aiScraper's ingestion endpoint. Burp remains the proxy;
-the capture is an independent second record.
+### Two backends for Phase 2
 
-The JSON Schema at `ai_browser/traffic_capture/schema.json` is the
-source of truth for the record format (schema version `"1.0"`). Other
-tools should validate against it directly.
+`--agent-backend custom` (default) is aiBrowser's own explorer — stable,
+but its action budget isn't currently exposed via any CLI flag (see the
+callout above). `--agent-backend browser-use` connects the `browser-use`
+library to the *same* Chromium process via CDP rather than launching a
+second browser — requires the `[browser-use] extra` installed
+(`pip install -e ".[browser-use]"`). This is the only backend
+`--max-actions`/`--agent-task` actually affect.
 
-### The action denylist checks the real element, not just the LLM's claim
-
-The LLM's self-reported action (target/value/reasoning) is checked against
-the denylist first, but before actually clicking or submitting anything,
-the resolved DOM element's real visible text is checked again. This
-matters because page content — the very thing being security-tested —
-can't be trusted to accurately describe itself back to the model.
-
-### browser-use connects via CDP to the same browser, not a second one
-
-`launch_persistent_context()` — used for the default `custom` backend —
-internally adds Chromium's `--remote-debugging-pipe` flag, which
-conflicts with the explicit `--remote-debugging-port` needed to expose a
-CDP endpoint (a reproducible SIGBUS). The `browser-use` backend path
-instead uses `launch()` + `new_context()`, and pre-creates that context
-**before** handing off the CDP URL — so when browser-use connects, it
-finds an existing context and reuses it rather than creating its own
-(verified directly, not assumed — see `scripts/verify_browser_use_safety.py`).
-
-HTTPS through Burp's MITM cert is handled by a Chromium-wide
-`--ignore-certificate-errors` launch argument, not by browser-use's own
-`disable_security` option. `disable_security=True` bypasses CSP and cert
-validation entirely — browser-use's own source flags this as a
-cookie-theft/malicious-iframe risk — and it's a no-op in this
-architecture anyway, since it only takes effect in the branch of
-browser-use's context setup that runs when a context is *not* already
-being reused. Given the reuse branch is what's actually exercised here,
-it's deliberately left unset rather than added "just in case."
-
-### Orphaned Chromium processes are reaped, not left to accumulate
-
-A crashed or killed run using the `browser-use` backend (the SIGBUS above
-being the original example) can leave a Chromium process running with no
-owner. Each such session records its browser's OS PID to
-`storage/pids/<hostname>.pid` (fetched via CDP's
-`SystemInfo.getProcessInfo`, since Playwright doesn't expose it
-directly). The next run for that hostname checks for a stale PID file: if
-the recorded process is still alive **and** independently confirmed to
-still look like Chromium (never trusted blindly — a PID getting recycled
-by the OS for something unrelated is a real if rare scenario), it's
-terminated before a fresh browser launches. The file is cleared on every
-clean shutdown.
-
-### Registration is opt-in, not incidental
-
-Signup-related actions are recognized as their own category, separate from
-the destructive-action denylist. Without `--register`, they require human
-confirmation and are never auto-approved. With `--register`, the agent
-recognizes them and delegates the actual form-filling to
-`RegistrationHandler` rather than improvising values itself.
-
-### CAPTCHA handling
-
-Detected, screenshotted, and paused — never solved automatically. The
-caller receives a `CaptchaDetected` exception with the screenshot path and
-resumes manually after solving it.
+**Before trusting `browser-use` against a real target**, run
+`scripts/verify_browser_use_safety.py` — it independently verifies (not
+via browser-use's own self-reported logs) that `allowed_domains`
+enforcement holds and that HTTPS through an untrusted/MITM'd cert works
+correctly for this CDP-sharing setup. Needs `DEEPSEEK_API_KEY` and
+`NO_PROXY=127.0.0.1,localhost` set (Burp will otherwise intercept the
+CDP handshake itself and break the check).
 
 ---
 
-## Storage layout
+## Email registration, in detail
 
-```
-storage/
-├── browser_states/         # Per-hostname cookies/localStorage (session reuse)
-│   └── example.com.json
-├── pids/                   # Per-hostname CDP browser PID files (orphan reaping)
-│   └── example.com.pid
-├── audit_logs/              # Newline-delimited JSON audit log per crawl session
-│   └── example.com_20260718_120000.jsonl
-└── captcha_screenshots/     # Saved on every CAPTCHA pause
-    └── captcha_https_example.com_signup_submit_20260718_120000.png
+This is the most involved subsystem in the tool, and the one most worth
+understanding before relying on it.
 
-output/
-└── traffic/
-    └── <hostname>/          # Traffic capture (on by default)
-        ├── index.jsonl       # One JSON line per captured request/response
-        └── bodies/           # Content-addressed body files (<sha256>.bin)
-```
+### Two backends, chosen with `--email-backend`
+
+**`imap` (default)** — polls a real, pre-existing mailbox you control.
+Needs `--imap-host`/`--imap-username`/`--imap-password` (or the env var
+for the password). This is a **shared** inbox — if it's your everyday
+mailbox, unrelated mail landing during the poll window is a real
+consideration, which is exactly what the tiered matching below exists to
+handle.
+
+**`disposable`** — provisions a fresh, single-purpose AgentMail inbox
+per registration attempt via API. No shared-inbox contention by
+construction, since nothing else ever uses that address. Needs
+`--disposable-inbox-api-key`. Mutually exclusive with any `--imap-*` flag.
+
+### Finding the actual signup page
+
+`signup_url` isn't guessed — `discover_signup_url()` scans every URL
+Phase 1 discovered for path patterns that plausibly indicate a signup
+page (`/signup`, `/register`, `/join`, etc.), ranking exact path-segment
+matches above weaker substring matches, and explicitly excluding
+documentation-flavored false positives (a `/doc/getting-started-create-an-app`
+page is *about* registering an app, it isn't a signup form). If nothing
+plausible turns up, it falls back to the bare hostname root. This is
+purely deterministic — there's no AI involved in picking the URL itself.
+
+### Filling the form, and *not* filling the wrong one
+
+Fields are matched by common name/id/placeholder patterns
+(`_form_helpers.fill_form_fields`). Critically: **if no email field is
+found, the form is never submitted at all** — this guards against the
+generic submit-button fallback clicking whatever button it can find on
+the page (which, on a page with no real signup form but *some* form
+present — a newsletter box being the textbook case — used to produce a
+false "registration submitted" report).
+
+### After submitting: an AI check that fails open
+
+If `use_ai_judge` is on (default) and LLM credentials are configured, an
+LLM looks at the post-submit page and judges whether it looks like a
+real registration happened (`_ai_judge_did_submit`) — indicators include
+"check your email," "account created," or **a request to enter a
+verification code/PIN**, which was specifically added after this exact
+judge misclassified a legitimate PIN-flow registration as "not a
+registration" the first time it was tested for real. This judge **fails
+open**: if the LLM call fails or returns nothing usable, the result is
+`None` (inconclusive), not a confident negative — the run doesn't get
+blocked on an LLM hiccup.
+
+### Finding the confirmation email: three tiers
+
+This is where most of the real-world debugging effort has gone, because
+"which email in the inbox is actually the confirmation" turned out to
+be less obvious than it sounds — TikTok's own confirmation mail comes
+from `dev.tiktok.com`, not `developers.tiktok.com`, which is completely
+standard practice for transactional mail and broke a naive exact-domain
+check outright.
+
+1. **Domain-preferred, deterministic.** Among unread messages that
+   arrived after signup was submitted, ones whose sender shares the
+   target's *registrable* domain (`tldextract`-based comparison —
+   `dev.tiktok.com` and `developers.tiktok.com` both resolve to
+   `tiktok.com`, so this matches; a completely unrelated domain doesn't)
+   are checked first, newest first, for an extractable confirmation
+   link.
+2. **Everything else, still deterministic.** If nothing domain-matching
+   panned out, the same content-extraction pass runs over the remaining
+   unread messages — this covers legitimate mail sent via a third-party
+   ESP (SendGrid, Mailgun, etc.) whose sending domain wouldn't
+   domain-match at all, registrable or otherwise.
+3. **AI classification of the single latest unread message, once, as a
+   last resort.** Only triggers after the *entire* poll timeout has
+   elapsed with nothing found — not once per poll interval, which would
+   waste an LLM call every few seconds for no reason. The LLM is shown
+   the latest unread message's sender/subject/body and asked whether it
+   plausibly relates to this signup. **This one fails closed** — an LLM
+   failure or empty response results in "no," not "inconclusive, proceed
+   anyway." This is a deliberate, intentional exception to how every
+   other AI check in this tool behaves: being wrong here means acting on
+   a stranger's unrelated email, so the safe default under uncertainty
+   is to not act, not to guess yes.
+
+### CAPTCHA
+
+Detected, never solved. The tool pauses and takes a screenshot rather
+than attempting any bypass — this is a deliberate posture choice for a
+security-testing tool, not a missing feature.
 
 ---
 
-## Programmatic usage
+## Suggestions for simplifying the CLI
 
-```python
-from ai_browser.browser_session import BrowserSession, BrowserSessionConfig
-from ai_browser.crawler import Crawler, CrawlConfig
+A few things that came up directly while writing this document, worth
+considering as cleanup:
 
-config = BrowserSessionConfig(authorized_hostname="*.example.com")
-async with BrowserSession(config) as session:
-    crawl_config = CrawlConfig(
-        start_url="https://example.com",
-        seed_hostname="example.com",
-        scope_pattern="*.example.com",
-        max_depth=3,
-        max_pages=50,
-    )
-    result = await Crawler(crawl_config).run(session)
-    print(f"Found {len(result.endpoints)} endpoints")
-    session.check_violations()  # raises if any scope guard blocked a navigation
-```
+1. **Expose `--max-actions` for the custom backend too, or make its
+   current inertness loud instead of silent.** Right now it's a trap:
+   the flag is accepted regardless of `--agent-backend`, does nothing on
+   the default, and nothing tells you that. Either wire it into
+   `ExplorerConfig` for both backends, or have the CLI print a warning
+   when `--max-actions`/`--agent-task` are set without
+   `--agent-backend browser-use`.
+
+2. **Env var coverage is inconsistent.** Most credential-shaped flags
+   have an `AIBROWSER_*` env var fallback (`--llm-api-key`,
+   `--imap-password`, `--disposable-inbox-api-key`), but
+   `--register-password`, `--login-email`, and `--login-password` don't.
+   Worth either adding the missing ones or documenting why those three
+   are treated differently (there may be a reason — e.g. not wanting
+   registration passwords in shell env by convention — but if so it's
+   not stated anywhere currently).
+
+3. **The registration/login validation errors are scattered `click.echo`
+   + `return` pairs rather than a single upfront validation pass.**
+   Functionally fine, but it means a run can get partway through Phase 0
+   (spend time actually attempting a crawl) before discovering in Phase
+   3 that the flag combination was invalid from the start. Validating
+   all cross-flag constraints once, before Phase 1 starts, would fail
+   faster and be easier to extend as more phases/flags are added.
+
+4. **`--agent` / `--no-agent` and `--register` / no-`--register` use
+   different conventions** — one's a boolean pair (`--agent`/`--no-agent`),
+   the other's a bare flag with no explicit off-switch (`--register`
+   present or absent). Not wrong, just inconsistent; picking one
+   convention for all phase-toggle flags would make the mental model
+   more predictable.
+
+5. **Consider a single `--phases` selector** (e.g.
+   `--phases crawl,login,agent` or similar) as an alternative/complement
+   to the current per-phase boolean flags, especially now that there are
+   real precedence rules between them (`--cookies-file` overriding both
+   login and registration, successful login overriding registration).
+   Right now understanding "what will actually run" requires reading
+   this document's precedence table; an explicit phase list would make
+   it visible directly in the command.
