@@ -1455,3 +1455,162 @@ class TestDiagnosticMailboxScan:
         assert diag_mock.call_count == 1, (
             f"Diagnostic should fire exactly once, got {diag_mock.call_count}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Tests for bytes message-ID fix (search returns bytes, fetch must receive str)
+# ---------------------------------------------------------------------------
+
+
+class TestBytesMessageIDFix:
+    """Verify that bytes message IDs from search() are decoded before being
+    passed to fetch() — the exact bug that silently broke all IMAP polling."""
+
+    @pytest.mark.asyncio
+    async def test_fetch_receives_str_not_bytes_tier1(self):
+        """_check_inbox_for_new_email decodes bytes IDs to str before fetch."""
+        import sys
+        from unittest.mock import MagicMock
+
+        fake = TestIMAPChecksAllUnseenMessages._make_fake_imap([
+            ("noreply@target.com", "Confirm",
+             "Click https://target.com/confirm?token=abc"),
+        ])
+        # search already returns bytes (the fixture encodes IDs to bytes),
+        # so this is a faithful reproduction of real aioimaplib behavior.
+
+        # Replace fetch to capture the message ID argument, delegating to
+        # the original mock fetch for the actual response.
+        _fetch_calls = []
+        _real_fetch = fake.fetch
+        async def _capture_fetch(msg_id, fmt):
+            _fetch_calls.append(msg_id)
+            return await _real_fetch(msg_id, fmt)
+        fake.fetch = AsyncMock(side_effect=_capture_fetch)
+
+        sys.modules["aioimaplib"] = MagicMock()
+        sys.modules["aioimaplib"].IMAP4_SSL = MagicMock(return_value=fake)
+        sys.modules["aioimaplib"].IMAP4 = MagicMock(return_value=fake)
+
+        handler = TestIMAPChecksAllUnseenMessages._make_handler(
+            submitted_at=asyncio.get_event_loop().time() - 1,
+        )
+        await handler._check_inbox_for_new_email("target.com")
+
+        assert len(_fetch_calls) >= 1
+        for msg_id in _fetch_calls:
+            assert isinstance(msg_id, str), (
+                f"fetch() must receive str, got {type(msg_id)}: {msg_id!r}"
+            )
+
+    @pytest.mark.asyncio
+    async def test_fetch_receives_str_not_bytes_in_loop(self):
+        """When multiple message IDs come from search, all are decoded before
+        being passed to fetch in the iteration loop."""
+        import sys
+        from unittest.mock import MagicMock
+
+        fake = TestIMAPChecksAllUnseenMessages._make_fake_imap([
+            ("noreply@target.com", "Confirm",
+             "Click https://target.com/confirm?token=abc"),
+            ("noreply@mailgun.org", "Verify",
+             "Click https://target.com/verify"),
+        ])
+
+        _fetch_calls = []
+        async def _capture_fetch(msg_id, fmt):
+            _fetch_calls.append(msg_id)
+            return ("OK", [f"{msg_id} (BODY ...)".encode(), b"raw body"])
+
+        fake.fetch = AsyncMock(side_effect=_capture_fetch)
+
+        sys.modules["aioimaplib"] = MagicMock()
+        sys.modules["aioimaplib"].IMAP4_SSL = MagicMock(return_value=fake)
+        sys.modules["aioimaplib"].IMAP4 = MagicMock(return_value=fake)
+
+        handler = TestIMAPChecksAllUnseenMessages._make_handler(
+            submitted_at=asyncio.get_event_loop().time() - 1,
+        )
+        await handler._check_inbox_for_new_email("target.com")
+
+        # Should have called fetch for both messages
+        assert len(_fetch_calls) >= 2
+        for msg_id in _fetch_calls:
+            assert isinstance(msg_id, str), (
+                f"Each fetch call must receive str, got {type(msg_id)}: {msg_id!r}"
+            )
+
+    @pytest.mark.asyncio
+    async def test_failed_fetch_logs_warning(self, caplog):
+        """When fetch returns non-OK, a warning is logged (not silent)."""
+        import sys
+        from unittest.mock import MagicMock, AsyncMock
+
+        fake = AsyncMock()
+        fake.wait_hello_from_server = AsyncMock()
+        fake.login = AsyncMock()
+        fake.select = AsyncMock()
+        fake.logout = AsyncMock()
+        fake.search = AsyncMock()
+        # Return bytes IDs (real aioimaplib behavior)
+        fake.search.return_value = ("OK", [b"1"])
+
+        # fetch always fails
+        fake.fetch = AsyncMock(return_value=("NO", []))
+
+        sys.modules["aioimaplib"] = MagicMock()
+        sys.modules["aioimaplib"].IMAP4_SSL = MagicMock(return_value=fake)
+        sys.modules["aioimaplib"].IMAP4 = MagicMock(return_value=fake)
+
+        handler = TestIMAPChecksAllUnseenMessages._make_handler(
+            submitted_at=asyncio.get_event_loop().time() - 1,
+        )
+        with caplog.at_level(logging.WARNING):
+            result = await handler._check_inbox_for_new_email("target.com")
+
+        assert result is None
+        fetch_fail_logs = [
+            r for r in caplog.records
+            if "IMAP fetch failed" in r.message
+        ]
+        assert len(fetch_fail_logs) >= 1, (
+            "Should log warning when fetch fails, got no matching records"
+        )
+        assert "result=NO" in fetch_fail_logs[0].message
+
+    @pytest.mark.asyncio
+    async def test_end_to_end_bytes_round_trip(self, caplog):
+        """Full round trip with bytes search → decoded fetch → candidate log line.
+        This is the actual regression that was silently broken."""
+        import sys
+        from unittest.mock import MagicMock
+
+        fake = TestIMAPChecksAllUnseenMessages._make_fake_imap([
+            ("noreply@target.com", "Confirm your email",
+             "Click to confirm: https://target.com/confirm?token=abc"),
+        ])
+
+        sys.modules["aioimaplib"] = MagicMock()
+        sys.modules["aioimaplib"].IMAP4_SSL = MagicMock(return_value=fake)
+        sys.modules["aioimaplib"].IMAP4 = MagicMock(return_value=fake)
+
+        handler = TestIMAPChecksAllUnseenMessages._make_handler(
+            submitted_at=asyncio.get_event_loop().time() - 1,
+        )
+        with caplog.at_level(logging.INFO):
+            result = await handler._check_inbox_for_new_email("target.com")
+
+        # Should have found the link (via Tier 1 domain match)
+        assert result is not None
+        assert result[0] == "link"
+        assert "confirm" in result[1]
+
+        # The candidate log line should have fired
+        candidate_logs = [
+            r for r in caplog.records
+            if "Candidate confirmation email" in r.message
+        ]
+        assert len(candidate_logs) >= 1, (
+            "Candidate log line must fire when a real message is found — "
+            "this was the regression where bytes IDs silently broke everything"
+        )

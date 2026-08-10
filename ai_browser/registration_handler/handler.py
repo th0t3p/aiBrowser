@@ -661,7 +661,10 @@ class RegistrationHandler:
                 )
                 await imap.logout()
                 return
-            ids = messages[0].split()[-5:]
+            ids = [
+                mid.decode() if isinstance(mid, bytes) else mid
+                for mid in messages[0].split()[-5:]
+            ]
             logger.info(
                 "Diagnostic: %d most recent message(s) in %s (any read status):",
                 len(ids), imap_config.mailbox,
@@ -669,6 +672,11 @@ class RegistrationHandler:
             for msg_id in reversed(ids):
                 result, msg_data = await imap.fetch(msg_id, "(BODY.PEEK[HEADER])")
                 if result != "OK" or not msg_data or not msg_data[0]:
+                    logger.warning(
+                        "IMAP fetch failed for diagnostic message %s "
+                        "(result=%s) — skipping",
+                        msg_id, result,
+                    )
                     continue
                 raw = msg_data[1]
                 if isinstance(raw, tuple):
@@ -765,7 +773,10 @@ class RegistrationHandler:
                 await imap.logout()
                 return None
 
-            message_ids = messages[0].split()
+            message_ids = [
+                mid.decode() if isinstance(mid, bytes) else mid
+                for mid in messages[0].split()
+            ]
 
             # Check up to the last 20 UNSEEN messages (newest first) instead
             # of only the single latest one.  On a shared personal inbox, an
@@ -783,6 +794,10 @@ class RegistrationHandler:
                 result, msg_data = await imap.fetch(msg_id, "(BODY.PEEK[])")
 
                 if result != "OK" or not msg_data or not msg_data[0]:
+                    logger.warning(
+                        "IMAP fetch failed for message %s (result=%s) — skipping",
+                        msg_id, result,
+                    )
                     continue
 
                 raw_email = msg_data[1]
@@ -872,7 +887,10 @@ class RegistrationHandler:
                 await imap.logout()
                 return None
 
-            message_ids = messages[0].split()
+            message_ids = [
+                mid.decode() if isinstance(mid, bytes) else mid
+                for mid in messages[0].split()
+            ]
             if not message_ids:
                 await imap.logout()
                 return None
@@ -881,6 +899,11 @@ class RegistrationHandler:
             result, msg_data = await imap.fetch(latest_id, "(BODY.PEEK[])")
             await imap.logout()
             if result != "OK" or not msg_data or not msg_data[0]:
+                logger.warning(
+                    "IMAP fetch failed for latest message %s (result=%s) "
+                    "during Tier 3 classification — skipping",
+                    latest_id, result,
+                )
                 return None
 
             raw_email = msg_data[1]
