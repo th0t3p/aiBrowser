@@ -218,7 +218,7 @@ class LoginHandler:
                 messages=messages,
                 max_tokens=10,
             )
-            if response is None:
+            if not response:
                 return None  # fail open
 
             result = "yes" in response.strip().lower()

@@ -624,3 +624,58 @@ class TestMaxTokensConfig:
             )
             call_body = mock_post.call_args[1]["json"]
             assert call_body["max_tokens"] == 100
+
+
+class TestEmptyLLMResponseReturnsNone:
+    @pytest.mark.asyncio
+    async def test_anthropic_empty_text_returns_none(self):
+        from ai_browser._llm_client import call_llm
+        from unittest.mock import AsyncMock, MagicMock, patch
+        import httpx
+
+        mock_resp = MagicMock(spec=httpx.Response)
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {
+            "content": [{"type": "text", "text": ""}],
+        }
+        mock_resp.raise_for_status = MagicMock()
+
+        with patch("ai_browser._llm_client._call_anthropic", AsyncMock(return_value=mock_resp)):
+            result = await call_llm(
+                "anthropic", "key", "model", [{"role": "user", "content": "test"}]
+            )
+            assert result is None, f"Expected None, got {result!r}"
+
+    @pytest.mark.asyncio
+    async def test_openai_empty_content_returns_none(self):
+        from ai_browser._llm_client import call_llm
+        from unittest.mock import AsyncMock, MagicMock, patch
+        import httpx
+
+        mock_resp = MagicMock(spec=httpx.Response)
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {
+            "choices": [{"message": {"content": ""}}],
+        }
+        mock_resp.raise_for_status = MagicMock()
+
+        with patch("ai_browser._llm_client._call_openai_compatible", AsyncMock(return_value=mock_resp)):
+            result = await call_llm("openai", "key", "model", [{"role": "user", "content": "test"}])
+            assert result is None, f"Expected None, got {result!r}"
+
+    @pytest.mark.asyncio
+    async def test_openai_missing_content_returns_none(self):
+        from ai_browser._llm_client import call_llm
+        from unittest.mock import AsyncMock, MagicMock, patch
+        import httpx
+
+        mock_resp = MagicMock(spec=httpx.Response)
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {
+            "choices": [{"message": {}}],  # no content key at all
+        }
+        mock_resp.raise_for_status = MagicMock()
+
+        with patch("ai_browser._llm_client._call_openai_compatible", AsyncMock(return_value=mock_resp)):
+            result = await call_llm("openai", "key", "model", [{"role": "user", "content": "test"}])
+            assert result is None, f"Expected None, got {result!r}"

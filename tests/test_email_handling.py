@@ -453,3 +453,68 @@ class TestIMAPChecksAllUnseenMessages:
             "With 25 messages and 20 cap, the oldest real email is outside "
             "the window"
         )
+
+
+class TestSameRegistrableDomain:
+    def test_different_subdomains_same_registrable(self):
+        from ai_browser.registration_handler.handler import _same_registrable_domain
+        assert _same_registrable_domain("developers.tiktok.com", "dev.tiktok.com") is True
+
+    def test_unrelated_domains(self):
+        from ai_browser.registration_handler.handler import _same_registrable_domain
+        assert _same_registrable_domain("dev.tiktok.com", "spam.evil.com") is False
+
+    def test_same_hostname(self):
+        from ai_browser.registration_handler.handler import _same_registrable_domain
+        assert _same_registrable_domain("example.com", "example.com") is True
+
+    def test_multi_part_tld(self):
+        from ai_browser.registration_handler.handler import _same_registrable_domain
+        assert _same_registrable_domain("foo.example.co.uk", "bar.example.co.uk") is True
+
+    def test_multi_part_tld_different(self):
+        from ai_browser.registration_handler.handler import _same_registrable_domain
+        assert _same_registrable_domain("foo.example.co.uk", "foo.evil.co.uk") is False
+
+    def test_empty_inputs(self):
+        from ai_browser.registration_handler.handler import _same_registrable_domain
+        assert _same_registrable_domain("", "example.com") is False
+        assert _same_registrable_domain("example.com", "") is False
+        assert _same_registrable_domain("", "") is False
+
+
+class TestSenderSubdomainNotSkipped:
+    @pytest.mark.asyncio
+    async def test_email_from_different_subdomain_not_skipped(self):
+        import sys
+        from unittest.mock import MagicMock
+        from ai_browser.registration_handler.handler import RegistrationHandler
+        from ai_browser.registration_handler.models import RegistrationConfig, IMAPConfig
+        import asyncio
+
+        fake = TestIMAPChecksAllUnseenMessages._make_fake_imap([
+            ("TikTok <noreply@dev.tiktok.com>", "Verify your account",
+             "Click to confirm: https://developers.tiktok.com/confirm?token=abc"),
+        ])
+        sys.modules["aioimaplib"] = MagicMock()
+        sys.modules["aioimaplib"].IMAP4_SSL = MagicMock(return_value=fake)
+        sys.modules["aioimaplib"].IMAP4 = MagicMock(return_value=fake)
+
+        config = RegistrationConfig(
+            signup_url="https://developers.tiktok.com/signup",
+            email="test@example.com",
+            imap_config=IMAPConfig(
+                host="imap.example.com",
+                username="test@example.com",
+                password="fake-pw",
+            ),
+        )
+        handler = RegistrationHandler(config)
+        handler._signup_submitted_at = asyncio.get_event_loop().time() - 1
+
+        result = await handler._check_inbox_for_new_email("developers.tiktok.com")
+        assert result is not None, (
+            "Email from noreply@dev.tiktok.com should match "
+            "developers.tiktok.com (same registrable domain tiktok.com)"
+        )
+        assert "tiktok" in result

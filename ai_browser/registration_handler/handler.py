@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import email
+import email.utils
 import logging
 import re
 from datetime import datetime
 from typing import Optional
+
+import tldextract
 from urllib.parse import urlparse
 
 from playwright.async_api import Page
@@ -96,6 +99,25 @@ _DOCS_FALSE_POSITIVE_RE = re.compile(
 )
 
 
+def _same_registrable_domain(a: str, b: str) -> bool:
+    """True if *a* and *b* share the same registrable domain.
+
+    Examples::
+
+        _same_registrable_domain("developers.tiktok.com", "dev.tiktok.com")  # → True
+        _same_registrable_domain("dev.tiktok.com", "spam.evil.com")          # → False
+        _same_registrable_domain("foo.example.co.uk", "bar.example.co.uk")   # → True
+    """
+    if not a or not b:
+        return False
+    try:
+        ext_a = tldextract.extract(a)
+        ext_b = tldextract.extract(b)
+        return (ext_a.domain, ext_a.suffix) == (ext_b.domain, ext_b.suffix)
+    except Exception:
+        return False
+
+
 def _looks_like_docs_page(path: str) -> bool:
     """Return True if *path* looks like a documentation/tutorial page rather
     than an actual signup form."""
@@ -140,7 +162,7 @@ def _extract_link_from_body(body_text: str, target_domain: str = "") -> Optional
     if target_domain:
         for link in non_asset_links:
             parsed = urlparse(link)
-            if parsed.hostname and target_domain.lower() in parsed.hostname.lower():
+            if parsed.hostname and _same_registrable_domain(target_domain, parsed.hostname):
                 logger.debug("Found same-domain link: %s", link)
                 return link
 
@@ -413,7 +435,7 @@ class RegistrationHandler:
                 messages=messages,
                 max_tokens=10,
             )
-            if response is None:
+            if not response:
                 logger.debug("AI judge post-submit call failed — failing open")
                 return None  # fail open
 
@@ -528,7 +550,11 @@ class RegistrationHandler:
 
                 if target_domain:
                     from_header = msg.get("From", "")
-                    if target_domain.lower() not in from_header.lower():
+                    # Extract actual sender address (handles both
+                    # "addr@domain" and "Display Name <addr@domain>")
+                    _sender_addr = email.utils.parseaddr(from_header)[1]
+                    _sender_domain = _sender_addr.split("@")[-1] if "@" in _sender_addr else ""
+                    if _sender_domain and not _same_registrable_domain(target_domain, _sender_domain):
                         logger.debug("Skipping email from %s (id=%s)", from_header, msg_id.decode() if isinstance(msg_id, bytes) else msg_id)
                         continue
 

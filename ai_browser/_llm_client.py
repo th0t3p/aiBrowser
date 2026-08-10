@@ -141,7 +141,8 @@ async def call_llm(
             # Extract the first text content block
             for block in data.get("content", []):
                 if block.get("type") == "text":
-                    return block.get("text", "").strip()
+                    result = block.get("text", "").strip()
+                    return result if result else None
             return None
 
         elif provider in ("openai", "deepseek"):
@@ -159,7 +160,8 @@ async def call_llm(
             data = resp.json()
             choices = data.get("choices", [])
             if choices:
-                return (choices[0].get("message", {}).get("content", "") or "").strip()
+                result = (choices[0].get("message", {}).get("content", "") or "").strip()
+                return result if result else None
             return None
 
         else:
