@@ -128,77 +128,91 @@ class TrafficCapture:
         url = request.url
 
         if not self._is_in_scope(url):
+            logger.debug("TrafficCapture: out of scope, skipping %s", url)
             return
 
-        captured_at = datetime.now(timezone.utc).isoformat()
-        method = request.method
-
-        # -- request_id --------------------------------------------------
-        request_id_raw = f"{method}:{url}:{captured_at}"
-        request_id = hashlib.sha256(request_id_raw.encode()).hexdigest()
-
-        # -- query_params ------------------------------------------------
-        parsed = urlparse(url)
-        query_params: dict[str, list[str]] = {}
-        if parsed.query:
-            for k, v in parse_qs(parsed.query, keep_blank_values=True).items():
-                query_params[k] = v
-
-        # -- request_headers ---------------------------------------------
-        request_headers: dict[str, str] = dict(request.headers)
-
-        # -- request body ------------------------------------------------
-        request_body_ref, request_body_sha256 = await self._capture_body(
-            _read_request_body(request), url, "request"
-        )
-
-        # -- response headers & status -----------------------------------
-        response_headers: dict[str, str] = {}
-        response_status: Optional[int] = None
         try:
-            response_headers = dict(response.headers)
-        except Exception:
-            pass
-        try:
-            response_status = response.status
-        except Exception:
-            pass
+            captured_at = datetime.now(timezone.utc).isoformat()
+            method = request.method
 
-        # -- response body -----------------------------------------------
-        response_body_bytes: Optional[bytes] = None
-        try:
-            response_body_bytes = await response.body()
-        except Exception as exc:
-            logger.debug(
-                "Failed to read response body for %s: %s", url, exc
+            # -- request_id --------------------------------------------------
+            request_id_raw = f"{method}:{url}:{captured_at}"
+            request_id = hashlib.sha256(request_id_raw.encode()).hexdigest()
+
+            # -- query_params ------------------------------------------------
+            parsed = urlparse(url)
+            query_params: dict[str, list[str]] = {}
+            if parsed.query:
+                for k, v in parse_qs(parsed.query, keep_blank_values=True).items():
+                    query_params[k] = v
+
+            # -- request_headers ---------------------------------------------
+            try:
+                request_headers: dict[str, str] = dict(request.headers)
+            except Exception:
+                request_headers = {}
+
+            # -- request body ------------------------------------------------
+            request_body_ref, request_body_sha256 = await self._capture_body(
+                _read_request_body(request), url, "request"
             )
 
-        response_body_ref, response_body_sha256 = await self._capture_body(
-            response_body_bytes, url, "response"
-        )
+            # -- response headers & status -----------------------------------
+            response_headers: dict[str, str] = {}
+            response_status: Optional[int] = None
+            try:
+                response_headers = dict(response.headers)
+            except Exception:
+                pass
+            try:
+                response_status = response.status
+            except Exception:
+                pass
 
-        # -- write record ------------------------------------------------
-        record: dict = {
-            "schema_version": "1.0",
-            "request_id": request_id,
-            "captured_at": captured_at,
-            "method": method,
-            "url": url,
-            "query_params": query_params,
-            "request_headers": request_headers,
-            "request_body_ref": request_body_ref,
-            "request_body_sha256": request_body_sha256,
-            "response_status": response_status,
-            "response_headers": response_headers,
-            "response_body_ref": response_body_ref,
-            "response_body_sha256": response_body_sha256,
-        }
+            # -- response body -----------------------------------------------
+            response_body_bytes: Optional[bytes] = None
+            try:
+                response_body_bytes = await response.body()
+            except Exception as exc:
+                logger.debug(
+                    "Failed to read response body for %s: %s", url, exc
+                )
 
-        with open(self.index_path, "a") as fh:
-            fh.write(json.dumps(record, ensure_ascii=False) + "\n")
-            fh.flush()
+            response_body_ref, response_body_sha256 = await self._capture_body(
+                response_body_bytes, url, "response"
+            )
 
-        self._record_count += 1
+            # -- write record ------------------------------------------------
+            record: dict = {
+                "schema_version": "1.0",
+                "request_id": request_id,
+                "captured_at": captured_at,
+                "method": method,
+                "url": url,
+                "query_params": query_params,
+                "request_headers": request_headers,
+                "request_body_ref": request_body_ref,
+                "request_body_sha256": request_body_sha256,
+                "response_status": response_status,
+                "response_headers": response_headers,
+                "response_body_ref": response_body_ref,
+                "response_body_sha256": response_body_sha256,
+            }
+
+            with open(self.index_path, "a") as fh:
+                fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+                fh.flush()
+
+            self._record_count += 1
+            logger.debug(
+                "TrafficCapture: recorded %s %s (status=%s)",
+                method, url, response_status,
+            )
+        except Exception as exc:
+            logger.warning(
+                "TrafficCapture: failed to capture %s — record NOT written (%s)",
+                url, exc, exc_info=True,
+            )
 
     async def _capture_body(
         self,

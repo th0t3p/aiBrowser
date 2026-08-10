@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -542,3 +543,126 @@ class TestCLITrafficOptions:
             ["crawl", "example.com", "--authorized"],
         )
         assert "no such option" not in result.output.lower()
+
+
+# ---------------------------------------------------------------------------
+# Tests for guarded request.headers + capture observability
+# ---------------------------------------------------------------------------
+
+
+class TestRequestHeadersGuard:
+    """Verify that a crashing request.headers doesn't silently drop the record."""
+
+    @pytest.mark.asyncio
+    async def test_request_headers_raises_still_writes_record(self, tmp_path: Path):
+        """When request.headers raises, the record is still written with
+        empty request_headers — this is the direct regression test for the
+        unguarded call that was silently dropping entire traffic records."""
+        capture = TrafficCapture(tmp_path)
+        capture.ensure_dirs()
+        capture._scope_pattern = "example.com"
+
+        # Build a response whose request.headers raises on access
+        req = MagicMock()
+        req.method = "GET"
+        req.url = "https://example.com/page"
+        type(req).headers = property(
+            lambda self: (_ for _ in ()).throw(RuntimeError("stale request"))
+        )
+        req.post_data_buffer = None
+        req.post_data = None
+
+        mock_response = MagicMock()
+        mock_response.request = req
+        mock_response.status = 200
+        mock_response.headers = {"content-type": "text/html"}
+        async def _body() -> bytes:
+            return b"<html>ok</html>"
+        mock_response.body = _body
+
+        await capture._capture(mock_response)
+
+        assert capture._record_count == 1, (
+            "Record MUST be written even when request.headers raises"
+        )
+        lines = (tmp_path / "index.jsonl").read_text().strip().split("\n")
+        record = json.loads(lines[0])
+        assert record["request_headers"] == {}, (
+            "request_headers should fall back to {} on error, "
+            f"got {record['request_headers']}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_unexpected_failure_logs_warning(self, tmp_path: Path, caplog):
+        """When some other unexpected step raises inside _capture, a WARNING
+        log fires with the URL and exception — record is NOT written."""
+        capture = TrafficCapture(tmp_path)
+        capture.ensure_dirs()
+        capture._scope_pattern = "example.com"
+
+        r = _make_mock_response(url="https://example.com/page")
+
+        # Make open() raise OSError on write (simulates disk full / perm error)
+        with patch("builtins.open", side_effect=OSError("disk full")):
+            with caplog.at_level(logging.WARNING):
+                await capture._capture(r)
+
+        assert capture._record_count == 0, "Record should NOT be written on failure"
+
+        warnings = [
+            r for r in caplog.records
+            if "TrafficCapture: failed to capture" in r.message
+        ]
+        assert len(warnings) >= 1, (
+            "WARNING must fire when _capture fails, got no matching records"
+        )
+        assert "example.com/page" in warnings[0].message
+        assert "disk full" in warnings[0].message
+
+
+class TestCaptureObservability:
+    """Verify that every capture decision produces a log line."""
+
+    @pytest.mark.asyncio
+    async def test_out_of_scope_logs_debug(self, tmp_path: Path, caplog):
+        """Out-of-scope response → DEBUG 'out of scope, skipping' line."""
+        capture = TrafficCapture(tmp_path)
+        capture.ensure_dirs()
+        capture._scope_pattern = "example.com"
+
+        r = _make_mock_response(url="https://other.com/page")
+        with caplog.at_level(logging.DEBUG):
+            await capture._capture(r)
+
+        assert capture._record_count == 0
+        skip_logs = [
+            r for r in caplog.records
+            if "out of scope, skipping" in r.message
+        ]
+        assert len(skip_logs) >= 1, "Should log 'out of scope, skipping'"
+
+    @pytest.mark.asyncio
+    async def test_successful_capture_logs_debug(self, tmp_path: Path, caplog):
+        """Successful capture → DEBUG 'recorded ...' line with method/url/status."""
+        capture = TrafficCapture(tmp_path)
+        capture.ensure_dirs()
+        capture._scope_pattern = "example.com"
+
+        r = _make_mock_response(
+            url="https://example.com/api",
+            method="POST",
+            status=201,
+        )
+        with caplog.at_level(logging.DEBUG):
+            await capture._capture(r)
+
+        assert capture._record_count == 1
+        recorded_logs = [
+            r for r in caplog.records
+            if "TrafficCapture: recorded" in r.message
+        ]
+        assert len(recorded_logs) >= 1
+        msg = recorded_logs[0].message
+        assert "POST" in msg
+        assert "example.com/api" in msg
+        assert "status=201" in msg
