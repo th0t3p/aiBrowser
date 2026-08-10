@@ -99,6 +99,13 @@ _DOCS_FALSE_POSITIVE_RE = re.compile(
 )
 
 
+def _sender_domain(msg) -> str:
+    """Extract the domain part of the From header's actual email address
+    (handles both 'Name <addr@domain>' and bare 'addr@domain' forms)."""
+    _, addr = email.utils.parseaddr(msg.get("From", ""))
+    return addr.rsplit("@", 1)[-1] if "@" in addr else ""
+
+
 def _same_registrable_domain(a: str, b: str) -> bool:
     """True if *a* and *b* share the same registrable domain.
 
@@ -167,6 +174,64 @@ def _extract_link_from_body(body_text: str, target_domain: str = "") -> Optional
                 return link
 
     return non_asset_links[0]
+
+
+async def _ai_judge_is_registration_email_text(
+    *,
+    sender: str,
+    subject: str,
+    body_text: str,
+    hostname: str,
+    llm_provider: str,
+    llm_api_key: str,
+    llm_model: str,
+    llm_base_url: Optional[str] = None,
+) -> bool:
+    """Standalone, reusable AI classifier for registration/verification emails.
+
+    IMPORTANT — this fails CLOSED (returns False), not open, on any
+    error/empty response. Every other AI judge in this codebase fails
+    open (returns None, caller doesn't block progress on an inconclusive
+    read) because being wrong there just means proceeding without extra
+    confirmation. Here, being wrong in the "yes, use it" direction means
+    acting on a stranger's unrelated email — the safe default when
+    uncertain is to NOT extract/use it, not to assume yes.
+    """
+    try:
+        messages = [{
+            "role": "user",
+            "content": (
+                f"An automated signup was just submitted on "
+                f"{hostname or 'a website'}.\n"
+                f"Here is the single most recent unread email in the "
+                f"inbox used for that signup:\n\n"
+                f"From: {sender}\nSubject: {subject}\n\nBody:\n{body_text[:3000]}\n\n"
+                "Does this email look like an account registration or "
+                "email-verification message related to that signup "
+                "(e.g. contains a confirmation link, a verification "
+                "code/PIN, or similar account-activation language)? "
+                "It may be sent from a different domain than the site "
+                "itself — that's normal for transactional email "
+                "providers — so judge by content, not just the sender "
+                "address.\n\n"
+                "Answer with exactly one word: YES or NO."
+            ),
+        }]
+        response = await call_llm(
+            provider=llm_provider,
+            api_key=llm_api_key,
+            model=llm_model,
+            base_url=llm_base_url,
+            messages=messages,
+            max_tokens=10,
+        )
+        if not response:
+            logger.debug("AI classification call failed or empty — failing closed to NO")
+            return False
+        return "yes" in response.strip().lower()
+    except Exception as exc:
+        logger.debug("AI classification error: %s — failing closed to NO", exc)
+        return False
 
 
 class RegistrationHandler:
@@ -278,6 +343,10 @@ class RegistrationHandler:
                 inbox_address=self.config.email or "",
                 timeout_seconds=self.config.email_poll_timeout_seconds,
                 target_domain=target_domain,
+                llm_provider=self.config.llm_provider,
+                llm_api_key=self.config.llm_api_key,
+                llm_model=self.config.llm_model,
+                llm_base_url=self.config.llm_base_url or None,
             )
             if confirmation_link:
                 logger.info("Confirmation link found: %s", confirmation_link)
@@ -503,10 +572,25 @@ class RegistrationHandler:
                 return link
             await asyncio.sleep(self.config.email_poll_interval_seconds)
 
+        # Tier 3 — last resort, exactly once, only after Tiers 1-2 found
+        # nothing across the ENTIRE poll window. This is deliberately placed
+        # OUTSIDE the while loop so it can never fire more than once per
+        # _poll_inbox_for_link call, regardless of how many poll iterations
+        # happened — an LLM call every email_poll_interval_seconds would be
+        # wasteful and pointless while there's legitimately no mail yet.
+        logger.info(
+            "No domain-matched or content-extractable email found across the "
+            "poll window — trying AI classification of the latest unread "
+            "message as a last resort"
+        )
+        link = await self._ai_classify_and_extract_latest_unread(target_domain)
+        if link:
+            return link
+
         logger.warning("Timed out waiting for confirmation email")
         return None
 
-    async def _check_inbox_for_new_email(self, target_domain=""):
+    async def _check_inbox_for_new_email(self, target_domain="") -> Optional[str]:
         try:
             import aioimaplib
 
@@ -533,9 +617,13 @@ class RegistrationHandler:
             # unrelated unread email arriving during the poll window shouldn't
             # mask the real confirmation email sitting right behind it.
             _max_to_check = 20
-            _to_check = message_ids[-_max_to_check:]  # newest first
-            found_link = None
+            _to_check = message_ids[-_max_to_check:]
 
+            # Pass 1: fetch + date-filter every candidate, split into
+            # domain-matching vs. everything-else, preserving newest-first
+            # order within each group.
+            domain_matched: list = []
+            others: list = []
             for msg_id in reversed(_to_check):
                 result, msg_data = await imap.fetch(msg_id, "(RFC822)")
 
@@ -548,33 +636,43 @@ class RegistrationHandler:
 
                 msg = email.message_from_bytes(raw_email)
 
-                if target_domain:
-                    from_header = msg.get("From", "")
-                    # Extract actual sender address (handles both
-                    # "addr@domain" and "Display Name <addr@domain>")
-                    _sender_addr = email.utils.parseaddr(from_header)[1]
-                    _sender_domain = _sender_addr.split("@")[-1] if "@" in _sender_addr else ""
-                    if _sender_domain and not _same_registrable_domain(target_domain, _sender_domain):
-                        logger.debug("Skipping email from %s (id=%s)", from_header, msg_id.decode() if isinstance(msg_id, bytes) else msg_id)
-                        continue
-
                 date_str = msg.get("Date", "")
                 if date_str and self._signup_submitted_at > 0:
                     try:
                         from email.utils import parsedate_to_datetime
                         msg_date = parsedate_to_datetime(date_str)
                         if msg_date.timestamp() < self._signup_submitted_at:
-                            logger.debug("Skipping old email from %s", date_str)
                             continue
                     except Exception:
                         pass
 
-                found_link = self._extract_link_from_email(msg, target_domain)
-                if found_link:
-                    break
+                if target_domain and _same_registrable_domain(_sender_domain(msg), target_domain):
+                    domain_matched.append(msg)
+                else:
+                    others.append(msg)
+
+            # Tier 1: domain-matching candidates, deterministic extraction.
+            # NOTE: target_domain is still passed through to
+            # _extract_link_from_email — that's a SEPARATE use (preferring
+            # links WITHIN the email body whose own hostname matches the
+            # target), not the sender check. Don't conflate the two.
+            for msg in domain_matched:
+                found = self._extract_link_from_email(msg, target_domain)
+                if found:
+                    await imap.logout()
+                    return found
+
+            # Tier 2: everything else, same deterministic extraction —
+            # content-extractable even though the sender didn't domain-match
+            # (e.g. a third-party ESP sending domain).
+            for msg in others:
+                found = self._extract_link_from_email(msg, target_domain)
+                if found:
+                    await imap.logout()
+                    return found
 
             await imap.logout()
-            return found_link
+            return None
 
         except ImportError:
             logger.error("aioimaplib is required for IMAP polling")
@@ -583,9 +681,102 @@ class RegistrationHandler:
             logger.error("IMAP check failed: %s", exc)
             return None
 
-    def _extract_link_from_email(self, msg, target_domain=""):
-        body_text = ""
+    async def _ai_classify_and_extract_latest_unread(self, target_domain="") -> Optional[str]:
+        """Fetch the single latest UNSEEN message (any sender domain, still
+        respecting the date-after-submission filter), ask the LLM whether it
+        looks like the registration/verification email for this signup, and
+        if so, run the existing deterministic extractor on it."""
+        try:
+            import aioimaplib
 
+            imap_config = self.config.imap_config
+            imap = (aioimaplib.IMAP4_SSL(imap_config.host, imap_config.port)
+                    if imap_config.use_ssl else
+                    aioimaplib.IMAP4(imap_config.host, imap_config.port))
+            await imap.wait_hello_from_server()
+            await imap.login(imap_config.username, imap_config.password)
+            await imap.select(imap_config.mailbox)
+
+            result, messages = await imap.search("UNSEEN")
+            if result != "OK" or not messages or not messages[0]:
+                await imap.logout()
+                return None
+
+            message_ids = messages[0].split()
+            if not message_ids:
+                await imap.logout()
+                return None
+            latest_id = message_ids[-1]
+
+            result, msg_data = await imap.fetch(latest_id, "(RFC822)")
+            await imap.logout()
+            if result != "OK" or not msg_data or not msg_data[0]:
+                return None
+
+            raw_email = msg_data[1]
+            if isinstance(raw_email, tuple):
+                raw_email = raw_email[1]
+            msg = email.message_from_bytes(raw_email)
+
+            date_str = msg.get("Date", "")
+            if date_str and self._signup_submitted_at > 0:
+                try:
+                    from email.utils import parsedate_to_datetime
+                    msg_date = parsedate_to_datetime(date_str)
+                    if msg_date.timestamp() < self._signup_submitted_at:
+                        logger.debug(
+                            "Latest unread mail predates signup submission "
+                            "— skipping AI fallback"
+                        )
+                        return None
+                except Exception:
+                    pass
+
+            body_text = self._get_email_body_text(msg)
+            is_registration_email = await self._ai_judge_is_registration_email(
+                sender=msg.get("From", ""),
+                subject=msg.get("Subject", ""),
+                body_text=body_text,
+                hostname=target_domain,
+            )
+            if not is_registration_email:
+                return None
+
+            logger.info(
+                "AI classified latest unread mail (from %s) as likely the "
+                "registration email", msg.get("From", ""),
+            )
+            return _extract_link_from_body(body_text, target_domain)
+
+        except ImportError:
+            logger.error("aioimaplib is required for IMAP polling")
+            return None
+        except Exception as exc:
+            logger.error("AI-fallback IMAP check failed: %s", exc)
+            return None
+
+    async def _ai_judge_is_registration_email(
+        self, sender: str, subject: str, body_text: str, hostname: str
+    ) -> bool:
+        """Bounded, single classification call — delegates to the module-level
+        implementation so the disposable-inbox path can also reuse it."""
+        return await _ai_judge_is_registration_email_text(
+            sender=sender,
+            subject=subject,
+            body_text=body_text,
+            hostname=hostname,
+            llm_provider=self.config.llm_provider,
+            llm_api_key=self.config.llm_api_key,
+            llm_model=self.config.llm_model,
+            llm_base_url=self.config.llm_base_url or None,
+        )
+
+    def _get_email_body_text(self, msg) -> str:
+        """Extract plain-text body from a parsed email.message.Message,
+        handling multipart and non-multipart cases. Factored out of
+        _extract_link_from_email so other code (the Tier 3 AI classifier)
+        can get the raw body without also running link extraction."""
+        body_text = ""
         if msg.is_multipart():
             for part in msg.walk():
                 content_type = part.get_content_type()
@@ -605,7 +796,10 @@ class RegistrationHandler:
                     body_text = payload.decode(charset, errors="replace")
             except Exception:
                 pass
+        return body_text
 
+    def _extract_link_from_email(self, msg, target_domain=""):
+        body_text = self._get_email_body_text(msg)
         return _extract_link_from_body(body_text, target_domain)
 
     @property

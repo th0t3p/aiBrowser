@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from ai_browser.registration_handler.handler import RegistrationHandler
-from ai_browser.registration_handler.models import RegistrationConfig
+from ai_browser.registration_handler.models import IMAPConfig, RegistrationConfig
 
 
 def _make_email(html_body: str = "", text_body: str = "") -> email.message.Message:
@@ -518,3 +518,396 @@ class TestSenderSubdomainNotSkipped:
             "developers.tiktok.com (same registrable domain tiktok.com)"
         )
         assert "tiktok" in result
+
+
+# ---------------------------------------------------------------------------
+# New tests for Tier 1/2/3 email matching (refactor + AI fallback)
+# ---------------------------------------------------------------------------
+
+
+class TestGetEmailBodyText:
+    """Verify _get_email_body_text produces correct text from multipart
+    and non-multipart messages — a pure refactor, output must match what
+    _extract_link_from_email produced before the split."""
+
+    @staticmethod
+    def _handler():
+        return RegistrationHandler(
+            RegistrationConfig(
+                signup_url="https://target.com/signup",
+                email="test@target.com",
+            )
+        )
+
+    def test_multipart_plain_text_extraction(self):
+        handler = self._handler()
+        msg = _make_email(text_body="Hello, confirm here: https://example.com/confirm")
+        text = handler._get_email_body_text(msg)
+        assert "Hello, confirm here" in text
+        assert "https://example.com/confirm" in text
+
+    def test_multipart_html_text_extraction(self):
+        handler = self._handler()
+        msg = _make_email(html_body="<p>Click <a href='https://example.com/verify'>here</a></p>")
+        text = handler._get_email_body_text(msg)
+        assert "href='https://example.com/verify'" in text
+
+    def test_non_multipart_plain_text_extraction(self):
+        handler = self._handler()
+        from email.mime.text import MIMEText
+        msg = MIMEText("Plain text body with link https://example.com/activate")
+        text = handler._get_email_body_text(msg)
+        assert "Plain text body" in text
+        assert "https://example.com/activate" in text
+
+    def test_refactor_produces_same_link_as_before(self):
+        """Verify that _extract_link_from_email still works identically
+        after the refactor — the body text pipe produces the same result."""
+        handler = self._handler()
+        msg = _make_email(
+            html_body="""<a href="https://target.com/confirm?token=xyz">Confirm</a>""",
+            text_body="Confirm at https://target.com/confirm?token=xyz",
+        )
+        result = handler._extract_link_from_email(msg, "target.com")
+        assert "confirm" in result
+        assert "target.com" in result
+
+
+class TestSenderDomain:
+    """Test the _sender_domain helper for both From-header formats."""
+
+    def test_bare_address(self):
+        from email.mime.text import MIMEText
+        from ai_browser.registration_handler.handler import _sender_domain
+        msg = MIMEText("body")
+        msg["From"] = "noreply@example.com"
+        assert _sender_domain(msg) == "example.com"
+
+    def test_name_and_address(self):
+        from email.mime.text import MIMEText
+        from ai_browser.registration_handler.handler import _sender_domain
+        msg = MIMEText("body")
+        msg["From"] = "Example Team <noreply@dev.example.com>"
+        assert _sender_domain(msg) == "dev.example.com"
+
+    def test_no_from_header(self):
+        from email.mime.text import MIMEText
+        from ai_browser.registration_handler.handler import _sender_domain
+        msg = MIMEText("body")
+        assert _sender_domain(msg) == ""
+
+    def test_invalid_address(self):
+        from email.mime.text import MIMEText
+        from ai_browser.registration_handler.handler import _sender_domain
+        msg = MIMEText("body")
+        msg["From"] = "not-an-email"
+        assert _sender_domain(msg) == ""
+
+
+class TestCheckInboxTiering:
+    """Test that Tiers 1 and 2 are checked in order: domain-matching
+    messages (Tier 1) win over non-matching ones (Tier 2), even when
+    the non-matching message is more recent."""
+
+    @pytest.mark.asyncio
+    async def test_domain_matched_checked_first_and_wins(self):
+        """A mix of domain-matching (id=1, older) and non-matching (id=2,
+        newer, but also contains an extractable link).  Tier 1 should
+        find the domain-matched one first, even though it's not the
+        most recent."""
+        import sys
+        from unittest.mock import MagicMock
+
+        fake = TestIMAPChecksAllUnseenMessages._make_fake_imap([
+            # id=1: domain-matched, older
+            ("noreply@target.com", "Confirm your email",
+             "Click to confirm: https://target.com/confirm?token=abc"),
+            # id=2: domain-mismatched (ESP), newer, also has a link
+            ("noreply@mailgun.org", "Verify your account",
+             "Click: https://target.com/verify?from=esp"),
+        ])
+
+        sys.modules["aioimaplib"] = MagicMock()
+        sys.modules["aioimaplib"].IMAP4_SSL = MagicMock(return_value=fake)
+        sys.modules["aioimaplib"].IMAP4 = MagicMock(return_value=fake)
+
+        handler = TestIMAPChecksAllUnseenMessages._make_handler(
+            submitted_at=asyncio.get_event_loop().time() - 1,
+        )
+        result = await handler._check_inbox_for_new_email("target.com")
+        # Tier 1 should find the domain-matched link first
+        assert result == "https://target.com/confirm?token=abc"
+
+    @pytest.mark.asyncio
+    async def test_tier2_finds_esp_sender_with_no_domain_match(self):
+        """When NO messages match the sender domain, Tier 2 should still
+        find a link from a third-party ESP (e.g. Mailgun, SendGrid)."""
+        import sys
+        from unittest.mock import MagicMock
+
+        fake = TestIMAPChecksAllUnseenMessages._make_fake_imap([
+            ("noreply@mailgun.org", "Verify your email",
+             "Click to confirm: https://target.com/confirm?token=xyz"),
+        ])
+
+        sys.modules["aioimaplib"] = MagicMock()
+        sys.modules["aioimaplib"].IMAP4_SSL = MagicMock(return_value=fake)
+        sys.modules["aioimaplib"].IMAP4 = MagicMock(return_value=fake)
+
+        handler = TestIMAPChecksAllUnseenMessages._make_handler(
+            submitted_at=asyncio.get_event_loop().time() - 1,
+        )
+        result = await handler._check_inbox_for_new_email("target.com")
+        # Tier 2 should find it even though sender is from mailgun.org
+        assert result == "https://target.com/confirm?token=xyz"
+
+
+class TestPollInboxTier3ExactlyOnce:
+    """Test that _ai_classify_and_extract_latest_unread is called exactly
+    once when the poll loop times out — never per-iteration."""
+
+    @pytest.mark.asyncio
+    async def test_tier3_called_exactly_once_after_timeout(self):
+        from unittest.mock import AsyncMock
+
+        handler = RegistrationHandler(
+            RegistrationConfig(
+                signup_url="https://target.com/signup",
+                email="test@target.com",
+                imap_config=IMAPConfig(
+                    host="imap.target.com",
+                    username="test@target.com",
+                    password="fake-pw",
+                ),
+                email_poll_timeout_seconds=10,
+                email_poll_interval_seconds=1,
+            )
+        )
+        handler._check_inbox_for_new_email = AsyncMock(return_value=None)
+        tier3_mock = AsyncMock(return_value=None)
+        handler._ai_classify_and_extract_latest_unread = tier3_mock
+
+        result = await handler._poll_inbox_for_link("target.com")
+        assert result is None
+        # Tier 3 should be called exactly once, after the loop times out
+        assert tier3_mock.call_count == 1, (
+            f"Expected Tier 3 to be called exactly once, got {tier3_mock.call_count}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_tier3_not_called_when_tier1_or_2_finds_link(self):
+        """If _check_inbox_for_new_email returns a link, Tier 3 should
+        never be invoked."""
+        from unittest.mock import AsyncMock
+
+        handler = RegistrationHandler(
+            RegistrationConfig(
+                signup_url="https://target.com/signup",
+                email="test@target.com",
+                imap_config=IMAPConfig(
+                    host="imap.target.com",
+                    username="test@target.com",
+                    password="fake-pw",
+                ),
+                email_poll_timeout_seconds=10,
+            )
+        )
+        handler._check_inbox_for_new_email = AsyncMock(
+            return_value="https://target.com/confirm"
+        )
+        tier3_mock = AsyncMock()
+        handler._ai_classify_and_extract_latest_unread = tier3_mock
+
+        result = await handler._poll_inbox_for_link("target.com")
+        assert result == "https://target.com/confirm"
+        assert tier3_mock.call_count == 0
+
+
+class TestAIJudgeIsRegistrationEmail:
+    """Test _ai_judge_is_registration_email failure modes — must fail
+    CLOSED (return False), deliberately different from the fail-open
+    pattern used by other AI judges in this codebase."""
+
+    @pytest.mark.asyncio
+    async def test_yes_response_returns_true(self, monkeypatch):
+        from unittest.mock import AsyncMock
+
+        handler = RegistrationHandler(
+            RegistrationConfig(
+                signup_url="https://target.com/signup",
+                email="test@target.com",
+                llm_api_key="fake-key",
+                llm_provider="anthropic",
+                llm_model="claude-test",
+            )
+        )
+        mock_llm = AsyncMock(return_value="YES")
+        monkeypatch.setattr(
+            "ai_browser.registration_handler.handler.call_llm", mock_llm,
+        )
+        result = await handler._ai_judge_is_registration_email(
+            sender="noreply@target.com",
+            subject="Confirm your email",
+            body_text="Please confirm your account by clicking the link below...",
+            hostname="target.com",
+        )
+        assert result is True
+
+    @pytest.mark.asyncio
+    async def test_no_response_returns_false(self, monkeypatch):
+        from unittest.mock import AsyncMock
+
+        handler = RegistrationHandler(
+            RegistrationConfig(
+                signup_url="https://target.com/signup",
+                email="test@target.com",
+                llm_api_key="fake-key",
+                llm_provider="anthropic",
+                llm_model="claude-test",
+            )
+        )
+        mock_llm = AsyncMock(return_value="NO")
+        monkeypatch.setattr(
+            "ai_browser.registration_handler.handler.call_llm", mock_llm,
+        )
+        result = await handler._ai_judge_is_registration_email(
+            sender="newsletter@spam.com",
+            subject="Weekly digest",
+            body_text="Here is your weekly newsletter...",
+            hostname="target.com",
+        )
+        assert result is False
+
+    @pytest.mark.asyncio
+    async def test_empty_response_fails_closed(self, monkeypatch):
+        """Empty string from LLM → False (fails CLOSED — this is the
+        intentional deviation from the fail-open pattern)."""
+        from unittest.mock import AsyncMock
+
+        handler = RegistrationHandler(
+            RegistrationConfig(
+                signup_url="https://target.com/signup",
+                email="test@target.com",
+                llm_api_key="fake-key",
+                llm_provider="anthropic",
+                llm_model="claude-test",
+            )
+        )
+        mock_llm = AsyncMock(return_value="")  # empty response
+        monkeypatch.setattr(
+            "ai_browser.registration_handler.handler.call_llm", mock_llm,
+        )
+        result = await handler._ai_judge_is_registration_email(
+            sender="noreply@target.com",
+            subject="Confirm",
+            body_text="Click to confirm...",
+            hostname="target.com",
+        )
+        assert result is False, (
+            "Empty LLM response MUST return False (fails CLOSED) — "
+            "this is a deliberate deviation from the fail-open pattern"
+        )
+
+    @pytest.mark.asyncio
+    async def test_none_response_fails_closed(self, monkeypatch):
+        """None from a failed LLM call → False (fails CLOSED)."""
+        from unittest.mock import AsyncMock
+
+        handler = RegistrationHandler(
+            RegistrationConfig(
+                signup_url="https://target.com/signup",
+                email="test@target.com",
+                llm_api_key="fake-key",
+                llm_provider="anthropic",
+                llm_model="claude-test",
+            )
+        )
+        mock_llm = AsyncMock(return_value=None)  # failed call
+        monkeypatch.setattr(
+            "ai_browser.registration_handler.handler.call_llm", mock_llm,
+        )
+        result = await handler._ai_judge_is_registration_email(
+            sender="noreply@target.com",
+            subject="Confirm",
+            body_text="Click to confirm...",
+            hostname="target.com",
+        )
+        assert result is False, (
+            "None LLM response MUST return False (fails CLOSED) — "
+            "acting on an unrelated email would be worse than missing one"
+        )
+
+    @pytest.mark.asyncio
+    async def test_exception_fails_closed(self, monkeypatch):
+        """Exception during LLM call → False (fails CLOSED)."""
+        from unittest.mock import AsyncMock
+
+        handler = RegistrationHandler(
+            RegistrationConfig(
+                signup_url="https://target.com/signup",
+                email="test@target.com",
+                llm_api_key="fake-key",
+                llm_provider="anthropic",
+                llm_model="claude-test",
+            )
+        )
+        mock_llm = AsyncMock(side_effect=RuntimeError("network error"))
+        monkeypatch.setattr(
+            "ai_browser.registration_handler.handler.call_llm", mock_llm,
+        )
+        result = await handler._ai_judge_is_registration_email(
+            sender="noreply@target.com",
+            subject="Confirm",
+            body_text="Click to confirm...",
+            hostname="target.com",
+        )
+        assert result is False
+
+
+class TestTikTokEndToEndTier2:
+    """End-to-end regression guard: the real TikTok scenario — a
+    domain-mismatched message (dev.tiktok.com sender vs.
+    developers.tiktok.com target) containing a real link is found via
+    Tier 2, without ever needing to fall through to Tier 3."""
+
+    @pytest.mark.asyncio
+    async def test_tiktok_mismatched_domains_found_via_tier2(self):
+        """The exact scenario from the original issue: signup on
+        developers.tiktok.com, confirmation email arrives from
+        noreply@dev.tiktok.com.  This must work via Tier 2 (or
+        Tier 1 with registrable-domain matching) without needing
+        the AI fallback."""
+        import sys
+        from unittest.mock import MagicMock
+
+        fake = TestIMAPChecksAllUnseenMessages._make_fake_imap([
+            ("TikTok Team <noreply@dev.tiktok.com>",
+             "Please verify your TikTok for Developers account",
+             "Click to confirm: https://developers.tiktok.com/confirm?token=real123"),
+        ])
+
+        sys.modules["aioimaplib"] = MagicMock()
+        sys.modules["aioimaplib"].IMAP4_SSL = MagicMock(return_value=fake)
+        sys.modules["aioimaplib"].IMAP4 = MagicMock(return_value=fake)
+
+        config = RegistrationConfig(
+            signup_url="https://developers.tiktok.com/signup",
+            email="test@example.com",
+            imap_config=IMAPConfig(
+                host="imap.example.com",
+                username="test@example.com",
+                password="fake-pw",
+            ),
+        )
+        handler = RegistrationHandler(config)
+        handler._signup_submitted_at = asyncio.get_event_loop().time() - 1
+
+        # This should find the link via Tier 1 (since dev.tiktok.com and
+        # developers.tiktok.com share the registrable domain tiktok.com)
+        result = await handler._check_inbox_for_new_email("developers.tiktok.com")
+        assert result is not None, (
+            "TikTok scenario: confirmation from dev.tiktok.com should be "
+            "found for developers.tiktok.com (same registrable domain)"
+        )
+        assert "developers.tiktok.com" in result
+        assert "confirm" in result

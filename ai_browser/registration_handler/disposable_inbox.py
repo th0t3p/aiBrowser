@@ -63,6 +63,11 @@ async def wait_for_confirmation_link(
     inbox_address: str,
     timeout_seconds: int,
     target_domain: str = "",
+    *,
+    llm_provider: str = "",
+    llm_api_key: str = "",
+    llm_model: str = "",
+    llm_base_url: Optional[str] = None,
 ) -> Optional[str]:
     """Block until a message arrives or *timeout_seconds* expires, then
     extract a confirmation link from its body.
@@ -72,6 +77,12 @@ async def wait_for_confirmation_link(
     but the SDK supports WebSockets for real-time delivery; polling is
     simpler and sufficient for this use case).
 
+    If the polling loop times out without finding a link and the last API
+    response included at least one message, a single AI classification
+    call (Tier 3) is made against the most recent message before giving
+    up entirely.  The *llm_* parameters must be provided for Tier 3 to
+    activate.
+
     Returns ``None`` on timeout — never raises for a normal
     "nothing arrived" outcome.
     """
@@ -80,7 +91,10 @@ async def wait_for_confirmation_link(
 
     base = config.base_url or _AGENTMAIL_DEFAULT_BASE
 
-    from ai_browser.registration_handler.handler import _extract_link_from_body
+    from ai_browser.registration_handler.handler import (
+        _extract_link_from_body,
+        _ai_judge_is_registration_email_text,
+    )
 
     deadline = asyncio.get_event_loop().time() + timeout_seconds
     poll_interval = 5  # seconds between polls
@@ -94,6 +108,7 @@ async def wait_for_confirmation_link(
     # we get the inbox_id from listing inboxes and matching by email.
     async with httpx.AsyncClient(timeout=30.0) as client:
         inbox_id: Optional[str] = None
+        _last_messages: list = []  # saved for Tier 3 fallback
 
         while asyncio.get_event_loop().time() < deadline:
             # Resolve inbox_id on first iteration
@@ -116,6 +131,7 @@ async def wait_for_confirmation_link(
                 resp.raise_for_status()
                 data = resp.json()
                 messages = data.get("data", [])
+                _last_messages = messages
             except Exception as exc:
                 logger.debug("Error listing messages: %s", exc)
                 await asyncio.sleep(poll_interval)
@@ -150,6 +166,58 @@ async def wait_for_confirmation_link(
                         return link
 
             await asyncio.sleep(poll_interval)
+
+        # Tier 3 — last resort, exactly once, after the poll loop timed
+        # out.  Only fires when LLM params were provided AND we have at
+        # least one message to classify.
+        if _last_messages and llm_api_key:
+            logger.info(
+                "No domain-matched or content-extractable email found via "
+                "disposable inbox — trying AI classification of the most "
+                "recent message as a last resort"
+            )
+            most_recent = _last_messages[0]  # API returns newest first
+            body_text = (
+                most_recent.get("body_text", "")
+                or most_recent.get("body_html", "")
+                or ""
+            )
+            if not body_text:
+                msg_id = most_recent.get("id", "")
+                if msg_id:
+                    try:
+                        full_resp = await client.get(
+                            f"{base.rstrip('/')}/v1/inboxes/{inbox_id}/messages/{msg_id}",
+                            headers={"Authorization": f"Bearer {config.api_key}"},
+                        )
+                        full_resp.raise_for_status()
+                        full_data = full_resp.json()
+                        body_text = (
+                            full_data.get("body_text", "")
+                            or full_data.get("body_html", "")
+                            or ""
+                        )
+                    except Exception:
+                        pass
+
+            if body_text:
+                is_reg = await _ai_judge_is_registration_email_text(
+                    sender=most_recent.get("from", ""),
+                    subject=most_recent.get("subject", ""),
+                    body_text=body_text,
+                    hostname=target_domain,
+                    llm_provider=llm_provider,
+                    llm_api_key=llm_api_key,
+                    llm_model=llm_model,
+                    llm_base_url=llm_base_url,
+                )
+                if is_reg:
+                    logger.info(
+                        "AI classified a disposable-inbox message as likely "
+                        "the registration email (from %s)",
+                        most_recent.get("from", ""),
+                    )
+                    return _extract_link_from_body(body_text, target_domain)
 
     logger.warning("Timed out waiting for confirmation email in disposable inbox")
     return None
