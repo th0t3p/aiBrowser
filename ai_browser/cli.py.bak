@@ -323,14 +323,6 @@ def main(ctx: click.Context):
     help="Disable traffic capture entirely.",
 )
 @click.option(
-    "--cookies-file",
-    type=click.Path(exists=True, dir_okay=False),
-    default=None,
-    help="Path to an exported cookie/session file (Playwright storage_state "
-    "JSON or bare cookie array). When set, skips automatic session restore "
-    "and login/registration phases.",
-)
-@click.option(
     "--email-backend",
     type=click.Choice(["imap", "disposable"]),
     default="imap",
@@ -393,7 +385,6 @@ def crawl(
     email_backend: str,
     disposable_inbox_api_key: Optional[str],
     disposable_inbox_domain: Optional[str],
-    cookies_file: Optional[str],
 ):
     """Crawl HOSTNAME, discovering URLs and endpoints.
 
@@ -482,7 +473,6 @@ def crawl(
         storage_dir=Path(storage_dir),
         ca_cert_path=Path(ca_cert) if ca_cert else None,
         expose_cdp=(agent_backend == "browser-use"),
-        cookies_file=Path(cookies_file) if cookies_file else None,
     )
 
     # Build crawl config
@@ -551,7 +541,6 @@ def crawl(
             email_backend=email_backend,
             disposable_inbox_api_key=disposable_inbox_api_key,
             disposable_inbox_domain=disposable_inbox_domain,
-            cookies_file=cookies_file,
         )
     )
 
@@ -937,7 +926,6 @@ async def _run_crawl(
     email_backend: str,
     disposable_inbox_api_key: Optional[str],
     disposable_inbox_domain: Optional[str],
-    cookies_file: Optional[str],
 ) -> None:
     """Run the full crawl pipeline."""
 
@@ -990,9 +978,8 @@ async def _run_crawl(
             await capture.attach_to_session(session, scope_pattern)
             click.echo(f"  Traffic capture enabled -> {_traffic_dir}/")
 
-        login_authenticated: Optional[bool] = None
         # Phase 0: Login (before crawl, if requested)
-        if do_login and not cookies_file:
+        if do_login:
             _email = login_email or register_email
             _password = login_password or register_password
             if not _email or not _password:
@@ -1010,7 +997,6 @@ async def _run_crawl(
             login_handler = LoginHandler(login_config)
             try:
                 await login_handler.login(session)
-                login_authenticated = login_handler.authenticated
                 click.echo("  Login complete!")
             except Exception as exc:
                 click.echo(f"  Login error: {exc}", err=True)
@@ -1069,8 +1055,7 @@ async def _run_crawl(
             )
 
         # Phase 3: Registration
-        skip_registration = bool(cookies_file) or (login_authenticated is True)
-        if do_register and not skip_registration:
+        if do_register:
             # ---- Validate email backend configuration --------------------------
             if email_backend == "disposable":
                 if imap_host or imap_username or imap_password:
@@ -1186,8 +1171,6 @@ async def _run_crawl(
                     )
 
         # -- traffic capture summary ----------------------------------
-        else:
-            click.echo(f"\n[Phase 3] Skipped - using provided cookies or already authenticated for {hostname}.")
         if capture is not None:
             click.echo(f"\n  {capture.summary}")
 

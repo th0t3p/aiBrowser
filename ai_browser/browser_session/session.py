@@ -23,6 +23,35 @@ from .models import BrowserSessionConfig, ProxyConfig, ScopeGuardError, BlockedS
 logger = logging.getLogger(__name__)
 
 
+def _parse_cookies_file(raw: dict | list) -> list[dict]:
+    """Parse a cookie file blob into a list of cookie dicts for
+    ``context.add_cookies()``.
+
+    Accepts two shapes:
+
+    1. Playwright storage_state dict: ``{"cookies": [...], "origins": [...]}``
+    2. Bare cookie array: ``[{"name": ..., "value": ..., ...}, ...]``
+
+    Raises ValueError on unrecognized shapes.
+    """
+    if isinstance(raw, list):
+        return raw
+
+    if isinstance(raw, dict):
+        if "cookies" in raw:
+            return raw["cookies"]
+        raise ValueError(
+            "Unrecognized cookies-file shape: got a JSON object but expected "
+            "either a Playwright storage_state dict (with a 'cookies' key) or "
+            "a bare cookie array."
+        )
+
+    raise ValueError(
+        f"Unrecognized cookies-file shape: expected a JSON array or object, "
+        f"got {type(raw).__name__}"
+    )
+
+
 class BrowserSession:
     """Wraps Playwright's async API with a persistent context, Burp proxy, and hostname scope guard.
 
@@ -150,8 +179,12 @@ class BrowserSession:
             # Best-effort PID file write for orphan reaping on next run
             await self._write_pid_file()
 
-        # Restore persisted storage state if available
-        await self._restore_storage_state()
+        # Restore persisted storage state if available (skip when an explicit
+        # cookies-file is provided — it becomes the sole source of truth)
+        if self.config.cookies_file:
+            await self._apply_cookies_file(self.config.cookies_file)
+        else:
+            await self._restore_storage_state()
 
         # Install the scope guard on every new page
         self._context.on("page", self._on_new_page)
@@ -432,6 +465,26 @@ class BrowserSession:
             logger.info("Storage state restored from %s", self._storage_file)
         except Exception as exc:
             logger.error("Failed to restore storage state: %s", exc)
+
+    async def _apply_cookies_file(self, path: Path) -> None:
+        """Parse *path* as a Playwright storage_state JSON or bare cookie array,
+        and apply its cookies to the current context."""
+        if not self._context:
+            return
+        if not path.exists():
+            raise FileNotFoundError(f"Cookies file not found: {path}")
+
+        try:
+            raw = json.loads(path.read_text())
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Cookies file is not valid JSON: {path}") from exc
+
+        cookies = _parse_cookies_file(raw)
+        await self._context.add_cookies(cookies)
+        logger.info(
+            "Applied %d cookie(s) from %s (skipped automatic session restore)",
+            len(cookies), path,
+        )
 
     # ------------------------------------------------------------------
     # Burp CA certificate trust

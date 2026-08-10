@@ -96,6 +96,12 @@ class BrowserSessionConfig(BaseModel):
         "port so external tools (e.g. browser-use) can attach to the same "
         "browser process via --remote-debugging-port.",
     )
+    cookies_file: Optional[Path] = Field(
+        default=None,
+        description="Path to an exported cookie/session file. When set, skips "
+        "the automatic per-hostname session restore and applies these cookies "
+        "instead. Supports Playwright storage_state JSON and bare cookie arrays.",
+    )
 
     model_config = {"arbitrary_types_allowed": True}
 
