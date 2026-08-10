@@ -302,6 +302,7 @@ class TestPhase0NameErrorRegression:
                         register_email=None,
                         register_password="pw",
                         register_name="Test",
+                        signup_url=None,
                         do_login=False,  # <-- this is the key: no login
                         login_email=None,
                         login_password=None,
@@ -311,6 +312,7 @@ class TestPhase0NameErrorRegression:
                         imap_password=None,
                         email_timeout=120,
                         output_file=None,
+                        no_crawl=False,
                         hostname="example.com",
                         scope_pattern="example.com",
                         traffic_dir=None,

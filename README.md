@@ -46,6 +46,7 @@ room for.
 | `--max-depth INT` | 3 | BFS depth limit. |
 | `--max-pages INT` | 50 | Page count limit. |
 | `--skip-existing FILE` | — | A previous run's output JSON. Already-seen URLs aren't re-crawled; their entries are merged into this run's output. |
+| `--no-crawl` | off | **Skip Phase 1 entirely.** Use with `--register --signup-url` to go straight to registration, or `--login` to authenticate without discovering new pages first. Phase 2 (agent exploration) is auto-skipped when this is set. |
 | `--output TEXT` | stdout | Where to write the final JSON. |
 | `--storage-dir PATH` | `storage/browser_states` | Where session state, credentials, and PID files persist. |
 | `--headless` / `--visible` | headless | Whether you can see the browser window. |
@@ -98,6 +99,7 @@ crashes.
 | `--register-email TEXT` | — | Required *unless* `--email-backend disposable` (address is provisioned dynamically in that mode). |
 | `--register-password TEXT` | random, auto-generated | Saved to the credentials file either way. |
 | `--register-name TEXT` | — | |
+| `--signup-url TEXT` | — | **Directly specify the registration page URL**, bypassing automatic discovery from crawled endpoints. Essential when running with `--no-crawl` (since there are no endpoints to discover from), but also useful anytime you already know the signup URL and don't want automatic guessing to interfere. |
 
 ### Login (Phase 0)
 
@@ -180,18 +182,15 @@ fast, log-free smoke test with no persistent traffic record at all.
 
 ## Running from different phases
 
-The tool always runs Phase 1 (crawl); everything else is opt-in or
-conditionally skipped:
+Phase 1 (crawl) runs by default but can be skipped with `--no-crawl`.
+Everything else is opt-in or conditionally skipped:
 
+- **Skip Phase 1 entirely**: `--no-crawl`. Phase 2 is auto-skipped when this is set (no crawl seed to explore from). Phase 3 still runs if `--register` is passed — provide `--signup-url` to avoid falling back to the bare hostname root.
 - **Skip crawling already-known URLs**: `--skip-existing <prior-run.json>`. Their entries get merged into this run's output rather than re-fetched.
 - **Skip Phase 0 and Phase 3 entirely, start already-authenticated**: `--cookies-file <path>`. Two accepted shapes — Playwright's `storage_state()` JSON, or a bare browser-extension-style cookie array (auto-detected).
 - **Skip Phase 3 only, log in fresh instead of registering**: `--login` with credentials. If login succeeds (verified, not just attempted — see below), registration is skipped automatically even if `--register` was also passed.
 - **Skip Phase 2**: `--no-agent`. Crawl + optional login/register, no autonomous exploration.
 - **Skip Phase 3 explicitly**: just don't pass `--register`. (Phase 0/`--login` is independent of this.)
-
-There's no flag to skip Phase 1 itself — every run crawls first, since
-Phase 2/3 both depend on what Phase 1 discovers (candidate signup URLs,
-in-scope endpoints to explore further).
 
 ### Two backends for Phase 2
 
@@ -242,6 +241,15 @@ documentation-flavored false positives (a `/doc/getting-started-create-an-app`
 page is *about* registering an app, it isn't a signup form). If nothing
 plausible turns up, it falls back to the bare hostname root. This is
 purely deterministic — there's no AI involved in picking the URL itself.
+
+When `--skip-existing <prior-run.json>` is combined with `--register`,
+the URLs from the prior run are **also** added to the candidate list
+(prior URLs first, then fresh URLs), so discovery benefits from the
+full history rather than only the current crawl's endpoints. This is
+especially useful when `--no-crawl` is also set — the prior-run data
+becomes the *only* source of candidate endpoints, making
+`--signup-url`-less registration with a skipped Phase 1 actually
+functional rather than falling back to a bare hostname root every time.
 
 ### Filling the form, and *not* filling the wrong one
 

@@ -16,7 +16,7 @@ from typing import List, Optional, Union
 import click
 
 from ai_browser.browser_session import BrowserSession, BrowserSessionConfig, ProxyConfig
-from ai_browser.crawler import Crawler, CrawlConfig, DiscoveryMethod
+from ai_browser.crawler import Crawler, CrawlConfig, CrawlResult, DiscoveryMethod
 from ai_browser.agent_explorer import AgentExplorer, ExplorerConfig
 from ai_browser.registration_handler import RegistrationHandler, RegistrationConfig, IMAPConfig
 from ai_browser.login_handler import LoginHandler, LoginConfig
@@ -229,6 +229,13 @@ def main(ctx: click.Context):
     help="Full name for registration.",
 )
 @click.option(
+    "--signup-url",
+    default=None,
+    help="Directly specify the signup/registration page URL, "
+    "bypassing automatic discovery from crawled endpoints. "
+    "Useful when you already know the URL, or when running with --no-crawl.",
+)
+@click.option(
     "--login",
     is_flag=True,
     default=False,
@@ -279,6 +286,16 @@ def main(ctx: click.Context):
     "--output",
     default=None,
     help="Path to write JSON crawl results. Prints to stdout if not set.",
+)
+@click.option(
+    "--no-crawl",
+    is_flag=True,
+    default=False,
+    help="Skip Phase 1 (deterministic crawl) entirely. Registration "
+    "(--register) will use --signup-url if provided, otherwise fall "
+    "back to guessing the bare hostname root. Phase 2 (agent "
+    "exploration) is skipped automatically when this is set, since "
+    "it has no crawl seed to build on.",
 )
 @click.option(
     "--skip-existing",
@@ -375,6 +392,7 @@ def crawl(
     register_email: Optional[str],
     register_password: Optional[str],
     register_name: str,
+    signup_url: Optional[str],
     login: bool,
     login_email: Optional[str],
     login_password: Optional[str],
@@ -384,6 +402,7 @@ def crawl(
     imap_password: Optional[str],
     email_timeout: int,
     output: Optional[str],
+    no_crawl: bool,
     skip_existing: Optional[str],
     headless: bool,
     ca_cert: Optional[str],
@@ -426,6 +445,22 @@ def crawl(
     # is always saved to the credentials file after registration.
     if register_password is None:
         register_password = secrets.token_urlsafe(16)
+
+    # --signup-url without --register is a harmless no-op — log it so the
+    # user isn't confused about why it had no visible effect.
+    if signup_url and not register:
+        logger.debug("--signup-url was set but --register is not — the "
+                      "signup URL will not be used this run.")
+
+    # --no-crawl without --register and without --signup-url: nothing to
+    # crawl, nothing to register, Phase 2 has no seed. Print a clarifying
+    # message rather than silently doing nothing.
+    if no_crawl and not register and not signup_url and not login:
+        click.echo(
+            "Phase 1 skipped (--no-crawl). Nothing else was requested — "
+            "no crawler, no agent (auto-skipped), no registration, no login. "
+            "Pass --register or --login for the other phases to run.",
+        )
 
     start_url = f"https://{hostname}"
     scope_pattern: Union[str, List[str]]
@@ -535,6 +570,7 @@ def crawl(
             register_email=register_email,
             register_password=register_password,
             register_name=register_name,
+            signup_url=signup_url,
             do_login=login,
             login_email=login_email,
             login_password=login_password,
@@ -544,6 +580,7 @@ def crawl(
             imap_password=imap_password,
             email_timeout=email_timeout,
             output_file=output,
+            no_crawl=no_crawl,
             hostname=hostname,
             scope_pattern=scope_pattern,
             traffic_dir=traffic_dir,
@@ -921,6 +958,7 @@ async def _run_crawl(
     register_email: Optional[str],
     register_password: str,
     register_name: str,
+    signup_url: Optional[str],
     do_login: bool,
     login_email: Optional[str],
     login_password: Optional[str],
@@ -930,6 +968,7 @@ async def _run_crawl(
     imap_password: Optional[str],
     email_timeout: int,
     output_file: Optional[str],
+    no_crawl: bool,
     hostname: str,
     scope_pattern: Union[str, List[str]],
     traffic_dir: Optional[str],
@@ -1015,18 +1054,24 @@ async def _run_crawl(
             except Exception as exc:
                 click.echo(f"  Login error: {exc}", err=True)
 
-        # Phase 1: Deterministic crawl
-        click.echo(f"\n[Phase 1] Starting deterministic crawl of {hostname}...")
-        crawler = Crawler(crawl_config, seed_visited=seed_visited)
-        result = await crawler.run(session)
-        click.echo(
-            f"  Crawl complete: {result.total_pages_crawled} pages, "
-            f"{len(result.endpoints)} unique endpoints found "
-            f"({result.total_js_endpoints} from JS)."
-        )
+        # Phase 1: Deterministic crawl (skipped when --no-crawl is set)
+        if no_crawl:
+            click.echo("\n[Phase 1] Skipped (--no-crawl).")
+            result = CrawlResult(config=crawl_config)
+        else:
+            click.echo(f"\n[Phase 1] Starting deterministic crawl of {hostname}...")
+            crawler = Crawler(crawl_config, seed_visited=seed_visited)
+            result = await crawler.run(session)
+            click.echo(
+                f"  Crawl complete: {result.total_pages_crawled} pages, "
+                f"{len(result.endpoints)} unique endpoints found "
+                f"({result.total_js_endpoints} from JS)."
+            )
 
-        # Phase 2: Agent explorer for JS-heavy pages
-        if run_agent and llm_api_key:
+        # Phase 2: Agent explorer for JS-heavy pages.
+        # When --no-crawl is set, auto-skip Phase 2 — there's no crawl
+        # seed to build exploration on.
+        if run_agent and llm_api_key and not no_crawl:
             if not llm_model:
                 click.echo(
                     "ERROR: --llm-model is required when using --llm-provider.",
@@ -1118,14 +1163,22 @@ async def _run_crawl(
                 )
 
             reg_config = RegistrationConfig(
-                signup_url=result.endpoints[0].url if result.endpoints else f"https://{hostname}",
+                signup_url=(
+                    signup_url
+                    or (result.endpoints[0].url if result.endpoints else f"https://{hostname}")
+                ),
                 email=register_email,
                 password=register_password,
                 name=register_name,
                 imap_config=imap_config,
                 email_poll_timeout_seconds=email_timeout,
-                # Pass Phase 1 crawl endpoints for signup-page discovery
-                candidate_endpoints=[ep.url for ep in result.endpoints],
+                # Pass prior + fresh crawl endpoints for signup-page discovery.
+                # prior_endpoints entries are dicts (from --skip-existing JSON);
+                # result.endpoints entries are DiscoveredEndpoint objects.
+                candidate_endpoints=(
+                    [ep["url"] for ep in prior_endpoints]
+                    + [ep.url for ep in result.endpoints]
+                ),
                 # LLM fields for AI judge (reuse the crawl's LLM config)
                 llm_provider=llm_provider,
                 llm_model=llm_model or "",
