@@ -70,7 +70,7 @@ async def wait_for_confirmation_link(
     llm_base_url: Optional[str] = None,
 ) -> Optional[str]:
     """Block until a message arrives or *timeout_seconds* expires, then
-    extract a confirmation link from its body.
+    extract a confirmation link or verification code from its body.
 
     Uses the inbox's message list endpoint in a polling loop (the
     AgentMail REST API does not have a dedicated long-poll wait endpoint,
@@ -93,6 +93,7 @@ async def wait_for_confirmation_link(
 
     from ai_browser.registration_handler.handler import (
         _extract_link_from_body,
+        _extract_verification_code_from_body,
         _ai_judge_is_registration_email_text,
     )
 
@@ -163,7 +164,11 @@ async def wait_for_confirmation_link(
                     link = _extract_link_from_body(body_text, target_domain)
                     if link:
                         logger.info("Confirmation link found via disposable inbox: %s", link)
-                        return link
+                        return ("link", link)
+                    code = _extract_verification_code_from_body(body_text)
+                    if code:
+                        logger.info("Verification code found via disposable inbox: %s", code)
+                        return ("code", code)
 
             await asyncio.sleep(poll_interval)
 
@@ -217,7 +222,13 @@ async def wait_for_confirmation_link(
                         "the registration email (from %s)",
                         most_recent.get("from", ""),
                     )
-                    return _extract_link_from_body(body_text, target_domain)
+                    link = _extract_link_from_body(body_text, target_domain)
+                    if link:
+                        return ("link", link)
+                    code = _extract_verification_code_from_body(body_text)
+                    if code:
+                        return ("code", code)
+                    return None
 
     logger.warning("Timed out waiting for confirmation email in disposable inbox")
     return None

@@ -125,6 +125,17 @@ def _same_registrable_domain(a: str, b: str) -> bool:
         return False
 
 
+# Regex for extracting a verification code/PIN from email body text.
+# Keyword-anchored (pin/code/otp) to avoid matching unrelated short
+# alphanumeric tokens (sender names, footer boilerplate, unsubscribe IDs).
+# Tolerates markdown-style emphasis (**8R7H3W**) that HTML-to-text
+# conversion often leaves behind.
+_CODE_RE = re.compile(
+    r"(?:pin|code|otp)\s*(?:is|:)?\s*\**\s*([A-Z0-9]{4,8})\**",
+    re.IGNORECASE,
+)
+
+
 def _looks_like_docs_page(path: str) -> bool:
     """Return True if *path* looks like a documentation/tutorial page rather
     than an actual signup form."""
@@ -174,6 +185,27 @@ def _extract_link_from_body(body_text: str, target_domain: str = "") -> Optional
                 return link
 
     return non_asset_links[0]
+
+
+def _extract_verification_code_from_body(body_text: str) -> Optional[str]:
+    """Extract a short alphanumeric verification code/PIN from an email body.
+
+    Handles phrasing like 'PIN: 8R7H3W', 'your code is 8R7H3W',
+    'verification code: 8R7H3W', tolerant of markdown-style emphasis
+    (**8R7H3W**) that HTML-to-text conversion often leaves behind.
+
+    The regex is keyword-anchored (pin/code/otp) — it won't match a
+    bare alphanumeric token elsewhere in the body (footer boilerplate,
+    unsubscribe IDs, etc.).
+    """
+    if not body_text:
+        return None
+    match = _CODE_RE.search(body_text)
+    if match:
+        code = match.group(1)
+        logger.debug("Found verification code in email body: %s", code)
+        return code
+    return None
 
 
 async def _ai_judge_is_registration_email_text(
@@ -349,19 +381,13 @@ class RegistrationHandler:
                 llm_base_url=self.config.llm_base_url or None,
             )
             if confirmation_link:
-                logger.info("Confirmation link found: %s", confirmation_link)
-                await page.goto(confirmation_link, timeout=30_000)
-                await page.wait_for_load_state("networkidle", timeout=15_000)
-                self.confirmed = True
+                await self._handle_confirmation_result(page, confirmation_link)
             else:
                 logger.warning("No confirmation link found within timeout window")
         elif self.config.imap_config:
-            confirmation_link = await self._poll_inbox_for_link(target_domain)
-            if confirmation_link:
-                logger.info("Confirmation link found: %s", confirmation_link)
-                await page.goto(confirmation_link, timeout=30_000)
-                await page.wait_for_load_state("networkidle", timeout=15_000)
-                self.confirmed = True
+            result = await self._poll_inbox_for_link(target_domain)
+            if result:
+                await self._handle_confirmation_result(page, result)
             else:
                 logger.warning("No confirmation link found within timeout window")
         else:
@@ -386,11 +412,9 @@ class RegistrationHandler:
         if self.config.imap_config:
             from urllib.parse import urlparse
             target_domain = urlparse(self.config.signup_url).hostname or ""
-            confirmation_link = await self._poll_inbox_for_link(target_domain)
-            if confirmation_link:
-                await self._current_page.goto(confirmation_link, timeout=30_000)
-                await self._current_page.wait_for_load_state("networkidle", timeout=15_000)
-                self.confirmed = True
+            result = await self._poll_inbox_for_link(target_domain)
+            if result:
+                await self._handle_confirmation_result(self._current_page, result)
 
         return self._current_page
 
@@ -434,6 +458,35 @@ class RegistrationHandler:
             "button:has-text('Submit')",
         ]
         await submit_form(page, extra_selectors=signup_selectors)
+
+    async def _submit_verification_code(self, page: Page, code: str) -> bool:
+        """Fill a verification code into the page and submit the form.
+
+        Returns True if a code field was found and filled, False otherwise.
+        """
+        filled = await fill_form_fields(page, [
+            (["code", "otp", "pin", "verification_code",
+              "confirmation_code", "verificationCode"], code),
+        ])
+        if not filled:
+            logger.info(
+                "Verification code %s was extracted but no matching code-entry "
+                "field was found on the page — the verification page may use "
+                "separate single-digit inputs or a custom widget",
+                code,
+            )
+            return False
+
+        logger.info("Filled verification code field; submitting...")
+        verify_selectors = [
+            "button:has-text('Verify')",
+            "button:has-text('Confirm')",
+            "button:has-text('Submit')",
+            "button:has-text('Continue')",
+            "button:has-text('Next')",
+        ]
+        await submit_form(page, extra_selectors=verify_selectors)
+        return True
 
     # ------------------------------------------------------------------
     # Signup URL resolution + AI judge
@@ -491,7 +544,10 @@ class RegistrationHandler:
                         "Does this page look like a new-account registration was "
                         "just submitted? Indicators include: 'check your email to "
                         "confirm', 'account created', 'verify your email', "
-                        "'welcome', 'thank you for registering', or similar. "
+                        "'welcome', 'thank you for registering', a request to "
+                        "enter a verification code or PIN that was sent to your "
+                        "email ('enter the code below', 'we sent you a code', "
+                        "a code/PIN input field), or similar. "
                         "Answer with exactly one word: YES or NO."
                     ),
                 },
@@ -554,6 +610,36 @@ class RegistrationHandler:
     # IMAP polling for confirmation email
     # ------------------------------------------------------------------
 
+    async def _handle_confirmation_result(
+        self, page: Page, result: tuple[str, str],
+    ) -> None:
+        """Dispatch on the extraction result: link → navigate, code → fill + submit."""
+        kind, value = result
+        if kind == "link":
+            logger.info("Confirmation link found: %s", value)
+            await page.goto(value, timeout=30_000)
+            await page.wait_for_load_state("networkidle", timeout=15_000)
+            self.confirmed = True
+        elif kind == "code":
+            logger.info("Verification code extracted: %s", value)
+            code_submitted = await self._submit_verification_code(page, value)
+            if code_submitted:
+                # Code entry field found and submitted — treat as confirmed.
+                # A detected code-entry field is also strong evidence this
+                # is a real registration, overriding any prior AI false negative.
+                self.confirmed = True
+                if self._registration_looked_real is False:
+                    logger.info(
+                        "Code-entry field detected on page — overriding "
+                        "earlier 'NOT a registration' AI judge verdict"
+                    )
+                    self._registration_looked_real = True
+            else:
+                logger.warning(
+                    "Verification code was extracted but no matching code "
+                    "field was found on the page (reason=code_found_no_field)"
+                )
+
     async def _poll_inbox_for_link(self, target_domain="") -> Optional[str]:
         if not self.config.imap_config:
             return None
@@ -565,12 +651,18 @@ class RegistrationHandler:
         )
 
         deadline = asyncio.get_event_loop().time() + self.config.email_poll_timeout_seconds
+        reason = "no_email_received"
 
         while asyncio.get_event_loop().time() < deadline:
             link = await self._check_inbox_for_new_email(target_domain)
             if link:
                 return link
             await asyncio.sleep(self.config.email_poll_interval_seconds)
+
+        # No extractable link found in Tiers 1-2 — at this point we know
+        # that if any mail arrived, it didn't contain a URL the regex could
+        # pick up.  (A PIN/code-only email lands here, for instance.)
+        reason = "email_found_no_extractable_content"
 
         # Tier 3 — last resort, exactly once, only after Tiers 1-2 found
         # nothing across the ENTIRE poll window. This is deliberately placed
@@ -587,7 +679,15 @@ class RegistrationHandler:
         if link:
             return link
 
-        logger.warning("Timed out waiting for confirmation email")
+        # If Tier 3 ran and the AI judge explicitly said NO, override the
+        # reason so the operator knows the email arrived but was rejected.
+        if getattr(self, "_tier3_ai_judge_rejected", False):
+            reason = "ai_judge_rejected"
+
+        logger.warning(
+            "No confirmation link found within timeout window (reason=%s)",
+            reason,
+        )
         return None
 
     async def _check_inbox_for_new_email(self, target_domain="") -> Optional[str]:
@@ -645,6 +745,15 @@ class RegistrationHandler:
                             continue
                     except Exception:
                         pass
+
+                # Diagnostic: log every inspected candidate
+                body_preview = self._get_email_body_text(msg)[:300].replace("\n", " ")
+                logger.info(
+                    "Candidate confirmation email — from=%s subject=%r body_preview=%r",
+                    msg.get("From", ""),
+                    msg.get("Subject", ""),
+                    body_preview,
+                )
 
                 if target_domain and _same_registrable_domain(_sender_domain(msg), target_domain):
                     domain_matched.append(msg)
@@ -733,20 +842,38 @@ class RegistrationHandler:
                     pass
 
             body_text = self._get_email_body_text(msg)
+            logger.info(
+                "Tier 3 candidate — from=%s subject=%r body_preview=%r",
+                msg.get("From", ""),
+                msg.get("Subject", ""),
+                body_text[:300].replace("\n", " "),
+            )
             is_registration_email = await self._ai_judge_is_registration_email(
                 sender=msg.get("From", ""),
                 subject=msg.get("Subject", ""),
                 body_text=body_text,
                 hostname=target_domain,
             )
+            logger.info(
+                "AI judge verdict on latest unread mail: %s",
+                "REGISTRATION EMAIL" if is_registration_email else "not a registration email",
+            )
             if not is_registration_email:
+                self._tier3_ai_judge_rejected = True
                 return None
 
             logger.info(
                 "AI classified latest unread mail (from %s) as likely the "
                 "registration email", msg.get("From", ""),
             )
-            return _extract_link_from_body(body_text, target_domain)
+            # Try link first, then code
+            link = _extract_link_from_body(body_text, target_domain)
+            if link:
+                return ("link", link)
+            code = _extract_verification_code_from_body(body_text)
+            if code:
+                return ("code", code)
+            return None
 
         except ImportError:
             logger.error("aioimaplib is required for IMAP polling")
@@ -799,8 +926,23 @@ class RegistrationHandler:
         return body_text
 
     def _extract_link_from_email(self, msg, target_domain=""):
+        """Try to extract a confirmation link or verification code from *msg*.
+
+        Returns ``("link", url)``, ``("code", code)``, or ``None``.
+        """
         body_text = self._get_email_body_text(msg)
-        return _extract_link_from_body(body_text, target_domain)
+
+        # Try link extraction first (primary path)
+        link = _extract_link_from_body(body_text, target_domain)
+        if link:
+            return ("link", link)
+
+        # Fall back to code extraction (PIN/OTP verification emails)
+        code = _extract_verification_code_from_body(body_text)
+        if code:
+            return ("code", code)
+
+        return None
 
     @property
     def is_paused(self) -> bool:

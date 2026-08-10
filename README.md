@@ -307,6 +307,33 @@ check outright.
    a stranger's unrelated email, so the safe default under uncertainty
    is to not act, not to guess yes.
 
+### Verification codes (PIN/OTP), not just links
+
+The confirmation email may contain a verification code (PIN or OTP)
+instead of a clickable link — e.g. "Your code is: 8R7H3W". Flow:
+
+1. **Extraction**: The same Tiers 1–3 that look for links also attempt
+   to extract a keyword-anchored code (`pin`, `code`, `otp`) between 4–8
+   alphanumeric characters.
+
+2. **Filling**: If a code is extracted, the tool looks for a code-entry
+   field on the current page (matching `code`, `otp`, `pin`,
+   `verification_code`, etc.) via the existing `fill_form_fields`
+   helper, fills it, and submits the form.
+
+3. **Failure modes logged distinctly** — the `reason=` field in the
+   final warning distinguishes "code found but no input field on the
+   page" (`reason=code_found_no_field`) from "no email received at all"
+   (`reason=no_email_received`), "email found but no extractable content"
+   (`reason=email_found_no_extractable_content`), and "AI judge rejected
+   the email" (`reason=ai_judge_rejected`). Each represents a different
+   real-world failure and the log makes it clear which one happened.
+
+4. **Deterministic signal**: A code-entry field detected on the page is
+   treated as strong evidence the registration flow is real — it
+   overrides an earlier false-negative AI judge verdict ("NOT a
+   registration") if the earlier verdict was wrong.
+
 ### CAPTCHA
 
 Detected, never solved. The tool pauses and takes a screenshot rather
