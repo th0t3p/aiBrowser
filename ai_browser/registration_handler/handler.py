@@ -640,6 +640,48 @@ class RegistrationHandler:
                     "field was found on the page (reason=code_found_no_field)"
                 )
 
+    async def _log_recent_mailbox_state(self, imap_config) -> None:
+        """Diagnostic only — logs the most recent messages in the mailbox
+        regardless of Seen status, so a silent 'nothing found' can be told
+        apart from 'genuinely nothing arrived' vs 'arrived but not UNSEEN
+        anymore' vs 'arrived in a different folder than we're polling'."""
+        try:
+            import aioimaplib
+            imap = (aioimaplib.IMAP4_SSL(imap_config.host, imap_config.port)
+                    if imap_config.use_ssl else
+                    aioimaplib.IMAP4(imap_config.host, imap_config.port))
+            await imap.wait_hello_from_server()
+            await imap.login(imap_config.username, imap_config.password)
+            await imap.select(imap_config.mailbox)
+            result, messages = await imap.search("ALL")
+            if result != "OK" or not messages or not messages[0]:
+                logger.info(
+                    "Diagnostic: mailbox %s has 0 messages total",
+                    imap_config.mailbox,
+                )
+                await imap.logout()
+                return
+            ids = messages[0].split()[-5:]
+            logger.info(
+                "Diagnostic: %d most recent message(s) in %s (any read status):",
+                len(ids), imap_config.mailbox,
+            )
+            for msg_id in reversed(ids):
+                result, msg_data = await imap.fetch(msg_id, "(BODY.PEEK[HEADER])")
+                if result != "OK" or not msg_data or not msg_data[0]:
+                    continue
+                raw = msg_data[1]
+                if isinstance(raw, tuple):
+                    raw = raw[1]
+                msg = email.message_from_bytes(raw)
+                logger.info(
+                    "  from=%s subject=%r date=%s",
+                    msg.get("From", ""), msg.get("Subject", ""), msg.get("Date", ""),
+                )
+            await imap.logout()
+        except Exception as exc:
+            logger.error("Diagnostic mailbox scan failed: %s", exc)
+
     async def _poll_inbox_for_link(self, target_domain="") -> Optional[str]:
         if not self.config.imap_config:
             return None
@@ -663,6 +705,13 @@ class RegistrationHandler:
         # that if any mail arrived, it didn't contain a URL the regex could
         # pick up.  (A PIN/code-only email lands here, for instance.)
         reason = "email_found_no_extractable_content"
+
+        # Diagnostic: log what's actually in the mailbox right now,
+        # regardless of read status, so the operator can see whether mail
+        # arrived but isn't UNSEEN (wrong folder, spam, seen-mutation),
+        # or genuinely never arrived at all.
+        if self.config.imap_config:
+            await self._log_recent_mailbox_state(self.config.imap_config)
 
         # Tier 3 — last resort, exactly once, only after Tiers 1-2 found
         # nothing across the ENTIRE poll window. This is deliberately placed
@@ -706,7 +755,13 @@ class RegistrationHandler:
             await imap.select(imap_config.mailbox)
 
             result, messages = await imap.search("UNSEEN")
-            if result != "OK" or not messages or not messages[0]:
+            count = (
+                len(messages[0].split())
+                if (result == "OK" and messages and messages[0])
+                else 0
+            )
+            logger.info("IMAP poll: %d UNSEEN message(s) in %s", count, imap_config.mailbox)
+            if count == 0:
                 await imap.logout()
                 return None
 
@@ -725,7 +780,7 @@ class RegistrationHandler:
             domain_matched: list = []
             others: list = []
             for msg_id in reversed(_to_check):
-                result, msg_data = await imap.fetch(msg_id, "(RFC822)")
+                result, msg_data = await imap.fetch(msg_id, "(BODY.PEEK[])")
 
                 if result != "OK" or not msg_data or not msg_data[0]:
                     continue
@@ -807,7 +862,13 @@ class RegistrationHandler:
             await imap.select(imap_config.mailbox)
 
             result, messages = await imap.search("UNSEEN")
-            if result != "OK" or not messages or not messages[0]:
+            count = (
+                len(messages[0].split())
+                if (result == "OK" and messages and messages[0])
+                else 0
+            )
+            logger.info("IMAP poll (Tier 3): %d UNSEEN message(s) in %s", count, imap_config.mailbox)
+            if count == 0:
                 await imap.logout()
                 return None
 
@@ -817,7 +878,7 @@ class RegistrationHandler:
                 return None
             latest_id = message_ids[-1]
 
-            result, msg_data = await imap.fetch(latest_id, "(RFC822)")
+            result, msg_data = await imap.fetch(latest_id, "(BODY.PEEK[])")
             await imap.logout()
             if result != "OK" or not msg_data or not msg_data[0]:
                 return None

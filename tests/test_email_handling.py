@@ -1218,3 +1218,240 @@ class TestAIJudgePromptUpdated:
         )
         assert "enter the code below" in source
         assert "we sent you a code" in source
+
+
+# ---------------------------------------------------------------------------
+# Tests for IMAP polling observability (UNSEEN count logging, Seen-mutation fix,
+# mailbox diagnostic)
+# ---------------------------------------------------------------------------
+
+
+class TestIMAPPollObservability:
+    """Verify that every poll iteration logs what it found, including zero."""
+
+    @pytest.mark.asyncio
+    async def test_empty_unseen_logs_zero(self, caplog):
+        """When search('UNSEEN') returns empty, the count log fires before
+        the early return."""
+        import sys
+        from unittest.mock import MagicMock
+
+        fake = TestIMAPChecksAllUnseenMessages._make_fake_imap([])
+
+        # Override search to return empty
+        async def _empty_search(_criteria):
+            return ("OK", [b""])
+        fake.search = AsyncMock(side_effect=_empty_search)
+
+        sys.modules["aioimaplib"] = MagicMock()
+        sys.modules["aioimaplib"].IMAP4_SSL = MagicMock(return_value=fake)
+        sys.modules["aioimaplib"].IMAP4 = MagicMock(return_value=fake)
+
+        handler = TestIMAPChecksAllUnseenMessages._make_handler(
+            submitted_at=asyncio.get_event_loop().time() - 1,
+        )
+        with caplog.at_level(logging.INFO):
+            result = await handler._check_inbox_for_new_email("target.com")
+
+        assert result is None
+        poll_logs = [r for r in caplog.records
+                     if "IMAP poll:" in r.message and "UNSEEN" in r.message]
+        assert len(poll_logs) >= 1, "Should log 'IMAP poll: 0 UNSEEN...' when empty"
+
+    @pytest.mark.asyncio
+    async def test_fetch_uses_body_peek_not_rfc822(self):
+        """Regression test: _check_inbox_for_new_email uses BODY.PEEK[]
+        not RFC822 to avoid silently mutating Seen status."""
+        import sys
+        from unittest.mock import MagicMock
+
+        fake = TestIMAPChecksAllUnseenMessages._make_fake_imap([
+            ("noreply@target.com", "Confirm",
+             "Click https://target.com/confirm?token=abc"),
+        ])
+
+        # Wrap the real fetch to capture the argument
+        _real_fetch = fake.fetch
+        _fetch_calls = []
+        async def _tracking_fetch(msg_id, fmt):
+            _fetch_calls.append(fmt)
+            return await _real_fetch(msg_id, fmt)
+        fake.fetch = AsyncMock(side_effect=_tracking_fetch)
+
+        sys.modules["aioimaplib"] = MagicMock()
+        sys.modules["aioimaplib"].IMAP4_SSL = MagicMock(return_value=fake)
+        sys.modules["aioimaplib"].IMAP4 = MagicMock(return_value=fake)
+
+        handler = TestIMAPChecksAllUnseenMessages._make_handler(
+            submitted_at=asyncio.get_event_loop().time() - 1,
+        )
+        await handler._check_inbox_for_new_email("target.com")
+
+        assert len(_fetch_calls) > 0, "Should have called fetch at least once"
+        for call in _fetch_calls:
+            assert "BODY.PEEK[]" in call, (
+                f"fetch should use BODY.PEEK[] not RFC822, got: {call}"
+            )
+
+    @pytest.mark.asyncio
+    async def test_fetch_uses_body_peek_not_rfc822_tier3(self):
+        """Same regression test for _ai_classify_and_extract_latest_unread."""
+        import sys
+        from unittest.mock import MagicMock
+
+        fake = TestIMAPChecksAllUnseenMessages._make_fake_imap([
+            ("noreply@target.com", "Confirm",
+             "Click https://target.com/confirm?token=abc"),
+        ])
+
+        _fetch_calls = []
+        async def _tracking_fetch(msg_id, fmt):
+            _fetch_calls.append(fmt)
+            return ("OK", [b"1 (BODY[] ...)", b"raw body"])
+        fake.fetch = AsyncMock(side_effect=_tracking_fetch)
+
+        sys.modules["aioimaplib"] = MagicMock()
+        sys.modules["aioimaplib"].IMAP4_SSL = MagicMock(return_value=fake)
+        sys.modules["aioimaplib"].IMAP4 = MagicMock(return_value=fake)
+
+        handler = TestIMAPChecksAllUnseenMessages._make_handler(
+            submitted_at=asyncio.get_event_loop().time() - 1,
+        )
+        handler.config.llm_api_key = "fake-key"
+        handler.config.llm_provider = "anthropic"
+        handler.config.llm_model = "claude-test"
+
+        # We just want to exercise the fetch path before the LLM call
+        # (which will fail since there's no real API key, but that's fine
+        # for checking the fetch argument)
+        try:
+            await handler._ai_classify_and_extract_latest_unread("target.com")
+        except Exception:
+            pass
+
+        assert len(_fetch_calls) > 0, "Should have called fetch at least once"
+        for call in _fetch_calls:
+            assert "BODY.PEEK[]" in call, (
+                f"fetch should use BODY.PEEK[] not RFC822, got: {call}"
+            )
+
+
+class TestDiagnosticMailboxScan:
+    """Verify the _log_recent_mailbox_state diagnostic helper."""
+
+    @pytest.mark.asyncio
+    async def test_scans_all_not_unseen(self, caplog):
+        """The diagnostic uses search('ALL'), not search('UNSEEN')."""
+        import sys
+        from unittest.mock import MagicMock, AsyncMock
+
+        # Build a fake IMAP that will record the search argument
+        _search_calls = []
+
+        fake = AsyncMock()
+        fake.wait_hello_from_server = AsyncMock()
+        fake.login = AsyncMock()
+        fake.select = AsyncMock()
+        fake.logout = AsyncMock()
+
+        async def _search(criteria):
+            _search_calls.append(criteria)
+            if criteria == "ALL":
+                return ("OK", [b"1 2 3"])
+            return ("OK", [b""])
+        fake.search = AsyncMock(side_effect=_search)
+
+        async def _fetch(msg_id, fmt):
+            # Return a minimal RFC822 header
+            header = (
+                b"From: test@example.com\r\n"
+                b"Subject: Test subject\r\n"
+                b"Date: Tue, 5 Aug 2026 10:00:00 +0000\r\n"
+                b"\r\n"
+            )
+            return ("OK", [b"1 (BODY[HEADER] ...)", header])
+
+        fake.fetch = AsyncMock(side_effect=_fetch)
+
+        sys.modules["aioimaplib"] = MagicMock()
+        sys.modules["aioimaplib"].IMAP4_SSL = MagicMock(return_value=fake)
+        sys.modules["aioimaplib"].IMAP4 = MagicMock(return_value=fake)
+
+        handler = TestIMAPChecksAllUnseenMessages._make_handler(
+            submitted_at=asyncio.get_event_loop().time() - 1,
+        )
+
+        with caplog.at_level(logging.INFO):
+            await handler._log_recent_mailbox_state(handler.config.imap_config)
+
+        # Should have searched ALL (not UNSEEN)
+        assert "ALL" in _search_calls, (
+            f"Diagnostic should search ALL, got {_search_calls}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_uses_body_peek_header(self):
+        """Fetch in the diagnostic uses BODY.PEEK[HEADER] not RFC822."""
+        import sys
+        from unittest.mock import MagicMock, AsyncMock
+
+        _fetch_calls = []
+
+        fake = AsyncMock()
+        fake.wait_hello_from_server = AsyncMock()
+        fake.login = AsyncMock()
+        fake.select = AsyncMock()
+        fake.logout = AsyncMock()
+        fake.search = AsyncMock(return_value=("OK", [b"1 2"]))
+
+        async def _fetch(msg_id, fmt):
+            _fetch_calls.append(fmt)
+            header = b"From: test@example.com\r\nSubject: S\r\nDate: ...\r\n\r\n"
+            return ("OK", [b"1 (BODY[HEADER] ...)", header])
+        fake.fetch = AsyncMock(side_effect=_fetch)
+
+        sys.modules["aioimaplib"] = MagicMock()
+        sys.modules["aioimaplib"].IMAP4_SSL = MagicMock(return_value=fake)
+        sys.modules["aioimaplib"].IMAP4 = MagicMock(return_value=fake)
+
+        handler = TestIMAPChecksAllUnseenMessages._make_handler(
+            submitted_at=asyncio.get_event_loop().time() - 1,
+        )
+        await handler._log_recent_mailbox_state(handler.config.imap_config)
+
+        assert len(_fetch_calls) > 0
+        for call in _fetch_calls:
+            assert "BODY.PEEK[HEADER]" in call, (
+                f"Diagnostic fetch should use BODY.PEEK[HEADER], got: {call}"
+            )
+
+    @pytest.mark.asyncio
+    async def test_diagnostic_runs_once_not_per_iteration(self, caplog, monkeypatch):
+        """The diagnostic fires exactly once, right before Tier 3, not
+        on every poll iteration."""
+        from unittest.mock import AsyncMock
+
+        handler = TestIMAPChecksAllUnseenMessages._make_handler(
+            submitted_at=asyncio.get_event_loop().time() - 1,
+        )
+        handler.config.email_poll_timeout_seconds = 10
+        handler.config.email_poll_interval_seconds = 1
+        handler._check_inbox_for_new_email = AsyncMock(return_value=None)
+        tier3_mock = AsyncMock(return_value=None)
+        handler._ai_classify_and_extract_latest_unread = tier3_mock
+
+        # Speed up the poll loop
+        monkeypatch.setattr(
+            "ai_browser.registration_handler.handler.asyncio.sleep",
+            AsyncMock(),
+        )
+
+        diag_mock = AsyncMock()
+        monkeypatch.setattr(handler, "_log_recent_mailbox_state", diag_mock)
+
+        with caplog.at_level(logging.INFO):
+            await handler._poll_inbox_for_link("target.com")
+
+        assert diag_mock.call_count == 1, (
+            f"Diagnostic should fire exactly once, got {diag_mock.call_count}"
+        )
