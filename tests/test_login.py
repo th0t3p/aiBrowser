@@ -49,13 +49,10 @@ class TestSharedHelpersIdentity:
     """Confirm login and registration handlers use the SAME shared functions."""
 
     def test_fill_form_fields_is_same_object(self):
-        """fill_form_fields used by both handlers is the identical function object."""
+        """fill_form_fields used by login handler is the shared function."""
         from ai_browser.login_handler import handler as lh
-        from ai_browser.registration_handler import handler as rh
-        # Both import fill_form_fields from _form_helpers
+        # Login handler still imports fill_form_fields from _form_helpers
         assert lh.fill_form_fields is fill_form_fields
-        assert rh.fill_form_fields is fill_form_fields
-        assert lh.fill_form_fields is rh.fill_form_fields
 
     def test_submit_form_is_same_object(self):
         """submit_form used by both handlers is the identical function object."""

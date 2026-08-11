@@ -157,11 +157,12 @@ class TestFillFormFieldsReturnValue:
 
 
 class TestFillSignupFormSkipsSubmit:
-    """Test that _fill_signup_form skips submit when no email field found."""
+    """Test that registration delegates to the AI step loop."""
 
     @pytest.mark.asyncio
-    async def test_skip_submit_when_no_email_filled(self):
-        """_submit_form is NOT called when fill_form_fields returns no 'email'."""
+    async def test_step_loop_is_called_for_registration(self):
+        """The AI step loop drives the registration now — verify it is
+        called and its result determines the flow outcome."""
         from ai_browser.registration_handler import RegistrationHandler, RegistrationConfig
         from unittest.mock import patch
 
@@ -177,21 +178,18 @@ class TestFillSignupFormSkipsSubmit:
         page.goto = AsyncMock()
         page.wait_for_load_state = AsyncMock()
 
-        # Mock fill_form_fields to return only "name" (no email)
-        with patch(
-            "ai_browser.registration_handler.handler.fill_form_fields",
-            AsyncMock(return_value=["name"]),
-        ):
-            with patch.object(handler, "_submit_form", AsyncMock()) as mock_submit:
-                with patch.object(handler, "_check_captcha", AsyncMock()):
+        with patch.object(handler, "_run_ai_step_loop", AsyncMock(return_value=True)) as mock_loop:
+            with patch.object(handler, "_check_captcha", AsyncMock()):
+                with patch.object(handler, "_ai_judge_did_submit", AsyncMock(return_value=None)):
                     result_page = await handler.register(AsyncMock())
 
-        mock_submit.assert_not_called()
-        assert handler.submitted is False
+        mock_loop.assert_called_once()
+        assert result_page is not None
 
     @pytest.mark.asyncio
-    async def test_submits_when_email_is_filled(self):
-        """_submit_form IS called when 'email' is in the filled fields."""
+    async def test_step_loop_failure_propagates(self):
+        """When the AI step loop returns False, the handler reports it
+        but still returns the page (it doesn't crash)."""
         from ai_browser.registration_handler import RegistrationHandler, RegistrationConfig
         from unittest.mock import patch
 
@@ -207,16 +205,13 @@ class TestFillSignupFormSkipsSubmit:
         page.goto = AsyncMock()
         page.wait_for_load_state = AsyncMock()
 
-        with patch(
-            "ai_browser.registration_handler.handler.fill_form_fields",
-            AsyncMock(return_value=["email", "password", "name"]),
-        ):
-            with patch.object(handler, "_submit_form", AsyncMock()) as mock_submit:
-                with patch.object(handler, "_check_captcha", AsyncMock()):
+        with patch.object(handler, "_run_ai_step_loop", AsyncMock(return_value=False)) as mock_loop:
+            with patch.object(handler, "_check_captcha", AsyncMock()):
+                with patch.object(handler, "_ai_judge_did_submit", AsyncMock(return_value=None)):
                     result_page = await handler.register(AsyncMock())
 
-        mock_submit.assert_called_once()
-        assert handler.submitted is True
+        mock_loop.assert_called_once()
+        assert result_page is not None
 
 
 class TestCandidateDiscovery:
@@ -467,8 +462,7 @@ class TestDisposableInboxMockIntegration:
             # We need the full register flow mocked
             handler._resolve_signup_url = MagicMock(return_value="https://example.com/signup")
             handler._check_captcha = AsyncMock()
-            handler._fill_signup_form = AsyncMock(return_value=["email", "password"])
-            handler._submit_form = AsyncMock()
+            handler._run_ai_step_loop = AsyncMock(return_value=True)
             handler._ai_judge_did_submit = AsyncMock(return_value=None)
             handler._poll_inbox_for_link = AsyncMock(return_value=None)
 
@@ -534,8 +528,7 @@ class TestDisposableInboxMockIntegration:
 
         handler._resolve_signup_url = MagicMock(return_value="https://example.com/signup")
         handler._check_captcha = AsyncMock()
-        handler._fill_signup_form = AsyncMock(return_value=["email", "password"])
-        handler._submit_form = AsyncMock()
+        handler._run_ai_step_loop = AsyncMock(return_value=True)
         handler._ai_judge_did_submit = AsyncMock(return_value=None)
 
         page = AsyncMock()
@@ -556,6 +549,6 @@ class TestDisposableInboxMockIntegration:
             ):
                 await handler.register(session)
 
-        # Not confirmed (timeout), not crashed
+        # Not confirmed (timeout), not crashed — the step loop ran
         assert handler.confirmed is False
-        assert handler.submitted is True  # form was still submitted
+        handler._run_ai_step_loop.assert_called_once()

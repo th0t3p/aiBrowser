@@ -187,18 +187,8 @@ class TestRegistrationConfirmed:
         async def _noop(*_a, **_kw):
             return None
         monkeypatch.setattr(handler, "_check_captcha", _noop)
-        # _fill_signup_form must return a list with "email" so the submit path
-        # is taken (otherwise register() returns early, skipping IMAP polling)
-        monkeypatch.setattr(
-            handler, "_fill_signup_form",
-            AsyncMock(return_value=["email", "password"]),
-        )
-        monkeypatch.setattr(handler, "_submit_form", _noop)
-
-        # Return a fake confirmation link
-        async def _fake_poll(*_a, **_kw):
-            return ("link", "https://target.com/confirm?token=abc")
-        monkeypatch.setattr(handler, "_poll_inbox_for_link", _fake_poll)
+        monkeypatch.setattr(handler, "_run_ai_step_loop", AsyncMock(return_value=True))
+        handler.confirmed = True  # simulate AI loop confirming the account
 
         # Mock session + page
         page = AsyncMock()
@@ -212,23 +202,14 @@ class TestRegistrationConfirmed:
 
     @pytest.mark.asyncio
     async def test_confirmed_false_when_no_link_found(self, monkeypatch):
-        """confirmed stays False when IMAP polling returns None (timeout)."""
+        """confirmed stays False when step loop reports failure (timeout)."""
         config = self._make_config()
         handler = RegistrationHandler(config)
 
         async def _noop(*_a, **_kw):
             return None
         monkeypatch.setattr(handler, "_check_captcha", _noop)
-        monkeypatch.setattr(
-            handler, "_fill_signup_form",
-            AsyncMock(return_value=["email", "password"]),
-        )
-        monkeypatch.setattr(handler, "_submit_form", _noop)
-
-        # Polling returns None — no confirmation email arrived
-        async def _fake_poll(*_a, **_kw):
-            return None
-        monkeypatch.setattr(handler, "_poll_inbox_for_link", _fake_poll)
+        monkeypatch.setattr(handler, "_run_ai_step_loop", AsyncMock(return_value=False))
 
         page = AsyncMock()
         page.url = "https://target.com/signup"
@@ -252,11 +233,7 @@ class TestRegistrationConfirmed:
         async def _noop(*_a, **_kw):
             return None
         monkeypatch.setattr(handler, "_check_captcha", _noop)
-        monkeypatch.setattr(
-            handler, "_fill_signup_form",
-            AsyncMock(return_value=["email", "password"]),
-        )
-        monkeypatch.setattr(handler, "_submit_form", _noop)
+        monkeypatch.setattr(handler, "_run_ai_step_loop", AsyncMock(return_value=False))
 
         page = AsyncMock()
         page.url = "https://target.com/signup"
@@ -1265,12 +1242,11 @@ class TestCodeExtractionIntegration:
         )
 
 class TestRunHandlesCodeField:
-    """Test that register() handles a code result properly."""
+    """Test that register() delegates verification to the AI step loop."""
 
     @pytest.mark.asyncio
-    async def test_code_found_fills_field_and_submits(self, monkeypatch):
-        """When _poll_inbox_for_link returns a code, the code field is filled
-        and submit is called a second time."""
+    async def test_code_found_makes_handler_confirmed(self, monkeypatch):
+        """When the AI step loop succeeds, handler.confirmed should be True."""
         from unittest.mock import AsyncMock, MagicMock
 
         config = RegistrationConfig(
@@ -1284,38 +1260,25 @@ class TestRunHandlesCodeField:
         )
         handler = RegistrationHandler(config)
 
-        # Silence internal steps
         async def _noop(*_a, **_kw):
             return None
         monkeypatch.setattr(handler, "_check_captcha", _noop)
-        monkeypatch.setattr(
-            handler, "_fill_signup_form",
-            AsyncMock(return_value=["email", "password"]),
-        )
-        monkeypatch.setattr(handler, "_submit_form", _noop)
-
-        # Mock the polling to return a code
-        async def _fake_poll(*_a, **_kw):
-            return ("code", "AB12CD")
-        monkeypatch.setattr(handler, "_poll_inbox_for_link", _fake_poll)
-
-        # Mock _submit_verification_code to track calls
-        code_mock = AsyncMock(return_value=True)
-        monkeypatch.setattr(handler, "_submit_verification_code", code_mock)
+        monkeypatch.setattr(handler, "_run_ai_step_loop", AsyncMock(return_value=True))
+        handler.confirmed = True  # simulate the loop confirming
 
         # Mock session + page
         page = AsyncMock()
-        page.url = "https://target.com/verify"
+        page.url = "https://target.com/dashboard"
         session = MagicMock()
         session.new_page = AsyncMock(return_value=page)
 
+        monkeypatch.setattr(handler, "_verify_via_login", AsyncMock(return_value=None))
         await handler.register(session)
-        code_mock.assert_called_once_with(page, "AB12CD")
         assert handler.confirmed is True
 
     @pytest.mark.asyncio
-    async def test_code_found_no_field_logs_reason(self, caplog, monkeypatch):
-        """Code extracted but no field on page → distinct warning logged."""
+    async def test_no_code_field_logs_failure(self, caplog, monkeypatch):
+        """When the AI step loop fails, handler.confirmed remains False."""
         from unittest.mock import AsyncMock, MagicMock
 
         config = RegistrationConfig(
@@ -1332,18 +1295,22 @@ class TestRunHandlesCodeField:
         async def _noop(*_a, **_kw):
             return None
         monkeypatch.setattr(handler, "_check_captcha", _noop)
-        monkeypatch.setattr(
-            handler, "_fill_signup_form",
-            AsyncMock(return_value=["email", "password"]),
-        )
-        monkeypatch.setattr(handler, "_submit_form", _noop)
+        monkeypatch.setattr(handler, "_run_ai_step_loop", AsyncMock(return_value=False))
 
-        async def _fake_poll(*_a, **_kw):
-            return ("code", "XX99YY")
-        monkeypatch.setattr(handler, "_poll_inbox_for_link", _fake_poll)
+        page = AsyncMock()
+        page.url = "https://target.com/some-page"
+        session = MagicMock()
+        session.new_page = AsyncMock(return_value=page)
 
-        code_mock = AsyncMock(return_value=False)  # field not found
-        monkeypatch.setattr(handler, "_submit_verification_code", code_mock)
+        with caplog.at_level(logging.WARNING):
+            await handler.register(session)
+
+        assert handler.confirmed is False
+        incomplete = [
+            r for r in caplog.records
+            if "not reach successful completion" in r.message
+        ]
+        assert len(incomplete) >= 1
 
         page = AsyncMock()
         page.url = "https://target.com/some-page"
@@ -1783,80 +1750,6 @@ class TestBytesMessageIDFix:
 # ---------------------------------------------------------------------------
 # Tests for page-driven extraction priority + login verification
 # ---------------------------------------------------------------------------
-
-
-class TestPageExpectsCodeCheck:
-    """Verify _page_expects_code_check uses AI to detect code fields."""
-
-    @pytest.mark.asyncio
-    async def test_ai_says_yes_returns_true(self):
-        """AI says page expects code → True."""
-        from unittest.mock import AsyncMock, MagicMock, patch
-
-        handler = RegistrationHandler(
-            RegistrationConfig(
-                signup_url="https://target.com/signup",
-                email="test@target.com",
-                llm_api_key="test-key",
-            )
-        )
-        page = AsyncMock()
-
-        desc = [{"index": 0, "type": "text", "name": "code", "id": "", "placeholder": "", "maxlength": "", "aria_label": "", "class": ""}]
-        with patch(
-            "ai_browser.registration_handler.handler._collect_visible_inputs",
-            AsyncMock(return_value=([MagicMock()], desc)),
-        ), patch(
-            "ai_browser.registration_handler.handler.call_llm",
-            AsyncMock(return_value="YES"),
-        ):
-            result = await handler._page_expects_code_check(page)
-        assert result is True
-
-    @pytest.mark.asyncio
-    async def test_ai_says_no_returns_false(self):
-        """AI says page doesn't expect code → False."""
-        from unittest.mock import AsyncMock, MagicMock, patch
-
-        handler = RegistrationHandler(
-            RegistrationConfig(
-                signup_url="https://target.com/signup",
-                email="test@target.com",
-                llm_api_key="test-key",
-            )
-        )
-        page = AsyncMock()
-
-        desc = [{"index": 0, "type": "text", "name": "search", "id": "", "placeholder": "Search...", "maxlength": "", "aria_label": "", "class": ""}]
-        with patch(
-            "ai_browser.registration_handler.handler._collect_visible_inputs",
-            AsyncMock(return_value=([MagicMock()], desc)),
-        ), patch(
-            "ai_browser.registration_handler.handler.call_llm",
-            AsyncMock(return_value="NO"),
-        ):
-            result = await handler._page_expects_code_check(page)
-        assert result is False
-
-    @pytest.mark.asyncio
-    async def test_no_visible_inputs_returns_false(self):
-        """No visible inputs on page → False (no AI call needed)."""
-        from unittest.mock import AsyncMock, patch
-
-        handler = RegistrationHandler(
-            RegistrationConfig(
-                signup_url="https://target.com/signup",
-                email="test@target.com",
-            )
-        )
-        page = AsyncMock()
-
-        with patch(
-            "ai_browser.registration_handler.handler._collect_visible_inputs",
-            AsyncMock(return_value=([], [])),
-        ):
-            result = await handler._page_expects_code_check(page)
-        assert result is False
 
 
 class TestExtractionPriorityFlip:

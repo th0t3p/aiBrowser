@@ -1,4 +1,10 @@
-"""RegistrationHandler — automated signup, IMAP email confirmation polling, CAPTCHA detection."""
+"""RegistrationHandler — automated signup, IMAP email confirmation polling, CAPTCHA detection.
+
+The signup-through-confirmation flow is driven by an observe-decide-act AI
+step loop rather than hardcoded scripted steps — the AI observes the
+page, decides which element to interact with next, and the harness executes
+that action safely against the live target.
+"""
 
 from __future__ import annotations
 
@@ -17,7 +23,7 @@ from urllib.parse import urlparse
 from playwright.async_api import Page
 
 from ai_browser.browser_session import BrowserSession
-from ai_browser._form_helpers import fill_form_fields, submit_form, check_captcha
+from ai_browser._form_helpers import submit_form, check_captcha
 from ai_browser._llm_client import call_llm
 
 from .models import CaptchaDetected, DisposableInboxConfig, IMAPConfig, RegistrationConfig
@@ -126,149 +132,6 @@ def _same_registrable_domain(a: str, b: str) -> bool:
         return False
 
 
-async def _collect_visible_inputs(page: Page) -> tuple[list, list[dict]]:
-    """Return (element_handles, descriptions) for every visible <input>
-    on the page, in DOM order. Purely descriptive — no filtering by
-    purpose, no assumptions about which inputs matter. The AI decides
-    that; this just gathers facts.
-    """
-    elements = await page.query_selector_all("input")
-    handles = []
-    descriptions = []
-    for el in elements:
-        try:
-            if not await el.is_visible():
-                continue
-        except Exception:
-            continue
-        handles.append(el)
-        descriptions.append({
-            "index": len(handles) - 1,
-            "type": await el.get_attribute("type") or "",
-            "name": await el.get_attribute("name") or "",
-            "id": await el.get_attribute("id") or "",
-            "placeholder": await el.get_attribute("placeholder") or "",
-            "maxlength": await el.get_attribute("maxlength") or "",
-            "aria_label": await el.get_attribute("aria-label") or "",
-            "class": (await el.get_attribute("class") or "")[:100],
-        })
-    return handles, descriptions
-
-
-async def _ai_plan_code_input_fill(
-    *,
-    descriptions: list[dict],
-    code: str,
-    llm_provider: str,
-    llm_api_key: str,
-    llm_model: str,
-    llm_base_url: Optional[str] = None,
-) -> Optional[list[dict]]:
-    """Ask the AI how a verification code should be distributed across
-    the visible input elements on the page. Returns a list of
-    {"index": int, "value": str} assignments (possibly a single entry
-    covering the whole code, or one entry per box for a split-digit
-    UI), or None if no plan could be determined.
-
-    Fails closed: any error, empty/unparseable response, or a response
-    that fails validation against the actual candidate list and code
-    returns None — the caller should treat this the same as 'no code
-    field found', not attempt a best-guess fallback that might type the
-    code into the wrong place on a live target.
-    """
-    try:
-        messages = [{
-            "role": "user",
-            "content": (
-                f"A web form needs a verification code entered: {code}\n\n"
-                "Below is a JSON list of visible <input> elements "
-                "currently on the page, described by their attributes "
-                "(not their live content — these are empty form "
-                "fields). Some may be unrelated to the code (email, "
-                "name, search boxes, etc.) — ignore those entirely.\n\n"
-                "Decide how the code should be entered:\n"
-                "- If ONE input is clearly the code field, it should "
-                "receive the whole code.\n"
-                "- If SEVERAL inputs together form a split-digit/split-"
-                "character code entry (e.g. maxlength of 1, sequential "
-                "naming, or simply several small inputs grouped "
-                "together with no other plausible purpose), each "
-                "should receive one character, in left-to-right/DOM "
-                "order, together spelling out the full code.\n"
-                "- If none of these inputs look like the right place "
-                "for this code, say so.\n\n"
-                f"Inputs:\n{json.dumps(descriptions, indent=2)}\n\n"
-                "Respond with ONLY a JSON array, nothing else — no "
-                "explanation, no markdown code fences. Each element: "
-                '{"index": <int from the list above>, "value": '
-                '"<exact substring of the code for this input>"}. '
-                "If no inputs are appropriate, respond with exactly: []"
-            ),
-        }]
-        response = await call_llm(
-            provider=llm_provider,
-            api_key=llm_api_key,
-            model=llm_model,
-            base_url=llm_base_url,
-            messages=messages,
-        )
-        if not response:
-            logger.warning(
-                "AI code-input planning: call failed or returned empty response"
-            )
-            return None
-
-        text = response.strip()
-        if text.startswith("```"):
-            text = text.strip("`").lstrip("json").strip()
-
-        try:
-            plan = json.loads(text)
-        except Exception:
-            logger.warning(
-                "AI code-input planning: response wasn't valid JSON: %r",
-                text[:200],
-            )
-            return None
-
-        if not isinstance(plan, list):
-            logger.warning(
-                "AI code-input planning: response wasn't a JSON array: %r",
-                text[:200],
-            )
-            return None
-        if not plan:
-            logger.info(
-                "AI code-input planning: model found no appropriate "
-                "input for this code"
-            )
-            return None
-
-        valid_indices = {d["index"] for d in descriptions}
-        validated = []
-        for item in plan:
-            if not isinstance(item, dict):
-                continue
-            idx = item.get("index")
-            value = item.get("value", "")
-            if (
-                idx not in valid_indices
-                or not isinstance(value, str)
-                or not value
-                or value not in code
-            ):
-                logger.warning(
-                    "AI code-input planning: discarding invalid "
-                    "assignment %r", item,
-                )
-                continue
-            validated.append({"index": idx, "value": value})
-
-        return validated if validated else None
-    except Exception as exc:
-        logger.warning("AI code-input planning: error calling LLM: %s", exc)
-        return None
-
 # Diagnostic-only error phrases for post-submit page text — logged as a
 # hint for the operator but never used to drive control flow (keyword-
 # matching arbitrary error copy is too fragile for pass/fail decisions).
@@ -285,6 +148,11 @@ def _looks_like_docs_page(path: str) -> bool:
     return bool(_DOCS_FALSE_POSITIVE_RE.search(path))
 
 
+# ---------------------------------------------------------------------------
+# AI email extraction helpers (unchanged — these are external to the loop)
+# ---------------------------------------------------------------------------
+
+
 async def _ai_extract_confirmation_action(
     *,
     body_text: str,
@@ -294,7 +162,7 @@ async def _ai_extract_confirmation_action(
     llm_api_key: str,
     llm_model: str,
     llm_base_url: Optional[str] = None,
-) -> Optional[Tuple[str, str]]:
+) -> Optional[tuple[str, str]]:
     """AI-based extraction of the confirmation action from a registration/
     verification email — replaces separate regex link-extraction and
     AI code-extraction with a single read that decides which kind of
@@ -468,8 +336,165 @@ async def _ai_judge_is_registration_email_text(
         return False
 
 
+# ---------------------------------------------------------------------------
+# Observe: describe the page as plain facts
+# ---------------------------------------------------------------------------
+
+
+async def _observe_page_state(page: Page) -> tuple[dict, dict]:
+    """Capture a structural description of the current page for the AI
+    to reason about, plus a lookup from element ref -> live ElementHandle
+    for execution. Purely descriptive — no judgment about what any
+    element is for.
+    """
+    handles: dict[str, object] = {}
+    elements: list[dict] = []
+    for tag in ("input", "button", "a", "textarea", "select"):
+        try:
+            found = await page.query_selector_all(tag)
+        except Exception:
+            continue
+        for i, el in enumerate(found):
+            try:
+                if not await el.is_visible():
+                    continue
+            except Exception:
+                continue
+            ref = f"{tag}:{i}"
+            handles[ref] = el
+            text = ""
+            if tag in ("button", "a"):
+                try:
+                    text = (await el.inner_text())[:100]
+                except Exception:
+                    pass
+            elements.append({
+                "ref": ref,
+                "tag": tag,
+                "type": await el.get_attribute("type") or "",
+                "name": await el.get_attribute("name") or "",
+                "id": await el.get_attribute("id") or "",
+                "placeholder": await el.get_attribute("placeholder") or "",
+                "aria_label": await el.get_attribute("aria-label") or "",
+                "maxlength": await el.get_attribute("maxlength") or "",
+                "text": text,
+            })
+    visible_text = ""
+    try:
+        visible_text = await page.inner_text("body")
+    except Exception:
+        pass
+    state = {
+        "url": page.url,
+        "title": await page.title(),
+        "visible_text": visible_text[:2000],
+        "elements": elements,
+    }
+    return state, handles
+
+
+# ---------------------------------------------------------------------------
+# Decide: AI picks the next action from a fixed vocabulary
+# ---------------------------------------------------------------------------
+
+_KNOWN_VALUE_KEYS = ("email", "password", "name", "code")
+
+
+async def _ai_decide_next_action(
+    *,
+    page_state: dict,
+    known_values: dict[str, str],
+    goal: str,
+    history: list[dict],
+    llm_provider: str,
+    llm_api_key: str,
+    llm_model: str,
+    llm_base_url: Optional[str] = None,
+) -> Optional[dict]:
+    """Ask the AI what to do next on this page, given the current goal
+    and a small set of known safe values it may use (never arbitrary
+    literal text). Returns a validated action dict, or None if no valid
+    action could be determined (caller should treat this as 'stuck').
+    """
+    try:
+        messages = [{
+            "role": "user",
+            "content": (
+                f"Goal: {goal}\n\n"
+                f"Known values available to use (referenced by key, "
+                f"never write the actual value yourself):\n"
+                f"{json.dumps(sorted(known_values.keys()))}\n\n"
+                f"Steps already taken this session:\n"
+                f"{json.dumps(history[-6:], indent=2)}\n\n"
+                f"Current page:\n{json.dumps(page_state, indent=2)[:6000]}\n\n"
+                "Decide the single next action. Respond with ONLY one "
+                "JSON object, no explanation, no markdown fences, one "
+                "of exactly these shapes:\n"
+                '{"action": "fill", "ref": "<element ref>", "value_key": "<one of the known value keys>"}\n'
+                '{"action": "click", "ref": "<element ref>"}\n'
+                '{"action": "need_confirmation_code"}  // if the page is waiting on a code you do not have yet\n'
+                '{"action": "done", "success": true}   // goal achieved\n'
+                '{"action": "done", "success": false, "reason": "<why>"}\n'
+                '{"action": "stuck", "reason": "<why nothing appropriate could be done>"}'
+            ),
+        }]
+        response = await call_llm(
+            provider=llm_provider, api_key=llm_api_key, model=llm_model,
+            base_url=llm_base_url, messages=messages,
+        )
+        if not response:
+            logger.warning("AI step decision: call failed or returned empty response")
+            return None
+        text = response.strip()
+        if text.startswith("```"):
+            text = text.strip("`").lstrip("json").strip()
+        try:
+            action = json.loads(text)
+        except Exception:
+            logger.warning("AI step decision: response wasn't valid JSON: %r", text[:200])
+            return None
+        if not isinstance(action, dict) or "action" not in action:
+            logger.warning("AI step decision: malformed action: %r", action)
+            return None
+
+        kind = action.get("action")
+        if kind == "fill":
+            ref, value_key = action.get("ref"), action.get("value_key")
+            if ref not in {e["ref"] for e in page_state["elements"]}:
+                logger.warning("AI step decision: fill referenced unknown ref %r", ref)
+                return None
+            if value_key not in _KNOWN_VALUE_KEYS:
+                logger.warning("AI step decision: fill referenced unknown value_key %r", value_key)
+                return None
+            return action
+        if kind == "click":
+            ref = action.get("ref")
+            if ref not in {e["ref"] for e in page_state["elements"]}:
+                logger.warning("AI step decision: click referenced unknown ref %r", ref)
+                return None
+            return action
+        if kind in ("need_confirmation_code", "done", "stuck"):
+            return action
+
+        logger.warning("AI step decision: unrecognized action kind %r", kind)
+        return None
+    except Exception as exc:
+        logger.warning("AI step decision: error calling LLM: %s", exc)
+        return None
+
+
+# ===================================================================
+# RegistrationHandler
+# ===================================================================
+
+
 class RegistrationHandler:
     """Handles automated registration form filling, email confirmation, and CAPTCHA detection.
+
+    The signup-through-confirmation portion is driven by an AI step loop
+    (observe → decide → act) rather than hardcoded field-name matching
+    and scripted steps — the AI observes visible elements on each page,
+    decides the next interaction, and the harness executes it safely.
 
     Usage::
 
@@ -496,6 +521,9 @@ class RegistrationHandler:
         self.login_verified: Optional[bool] = None
         self._registration_looked_real: Optional[bool] = None
         self._provisioned_email: Optional[str] = None
+        # Optional TrafficCapture reference — set externally before register()
+        # if request logging is desired.
+        self._traffic_capture: Optional[object] = None
 
     # ------------------------------------------------------------------
     # Main registration flow
@@ -512,7 +540,7 @@ class RegistrationHandler:
                 self.config.disposable_inbox_config.provider,
             )
             try:
-                email = await disposable_inbox.provision_inbox(
+                email_addr = await disposable_inbox.provision_inbox(
                     self.config.disposable_inbox_config
                 )
             except Exception:
@@ -521,9 +549,9 @@ class RegistrationHandler:
 
             # Set the email address dynamically (overwrites config.email which
             # should be None in disposable mode)
-            self.config.email = email
-            self._provisioned_email = email
-            logger.info("Disposable inbox provisioned: %s", email)
+            self.config.email = email_addr
+            self._provisioned_email = email_addr
+            logger.info("Disposable inbox provisioned: %s", email_addr)
 
         signup_url = self._resolve_signup_url()
         if not signup_url:
@@ -538,74 +566,44 @@ class RegistrationHandler:
         logger.info("Starting registration for %s on %s", self.config.email, signup_url)
 
         page = await session.new_page()
+        self._current_page = page
 
         await page.goto(signup_url, timeout=30_000)
         await page.wait_for_load_state("networkidle", timeout=15_000)
 
         await self._check_captcha(page, "signup_form")
-        filled_fields = await self._fill_signup_form(page)
-        await self._check_captcha(page, "signup_submit")
 
-        # Do NOT submit if the email field was never found — this does not
-        # look like a registration form at all (could be a newsletter box,
-        # login form, or a completely unrelated page).
-        if "email" not in filled_fields:
+        # ---- AI step loop: signup through confirmation ----------------------
+        signup_goal = (
+            "Complete the account registration/signup process on this site. "
+            "Fill in the form fields using the known values, submit the "
+            "registration, and handle any verification steps (code entry, "
+            "confirmation link click, etc.) until the account is fully "
+            "registered and confirmed. If the page asks for a confirmation "
+            "code that you do not have, say 'need_confirmation_code' — do "
+            "NOT invent one. At each visible page, observe what's there and "
+            "decide the single best next action."
+        )
+        known_values: dict[str, str] = {
+            "email": self.config.email,
+            "password": self.config.password,
+        }
+        if self.config.name:
+            known_values["name"] = self.config.name
+
+        success = await self._run_ai_step_loop(
+            page, session, goal=signup_goal, known_values=known_values,
+        )
+
+        if not success:
             logger.warning(
-                "No email field found on %s — this does not look like a "
-                "registration form (filled_fields=%s). Skipping submission.",
-                signup_url, filled_fields,
+                "AI step loop did not reach successful completion — "
+                "the registration may be incomplete"
             )
-            self._current_page = page
-            return page
-
-        self._signup_submitted_at = asyncio.get_event_loop().time()
-        await self._submit_form(page)
-
-        await asyncio.sleep(2)
-        await self._check_captcha(page, "post_submit")
 
         # ---- AI judge: did the submission actually look like a registration?
         if self.config.use_ai_judge and self.config.llm_api_key:
             self._registration_looked_real = await self._ai_judge_did_submit(page)
-
-        # ---- Check what the page is asking for -------------------------------
-        # Before touching the email, inspect the page's own DOM: if it shows
-        # a code/PIN/OTP input field, extraction should prioritize code over
-        # link — the page is the ground truth for what mechanism is in play.
-        self._page_expects_code = await self._page_expects_code_check(page)
-        if self._page_expects_code:
-            logger.info(
-                "Post-submit page has a code-entry field — will prioritize "
-                "extracting a code from the confirmation email over a link"
-            )
-
-        # ---- Confirmation email: dispatch on backend ------------------------
-        target_domain = urlparse(signup_url).hostname or ""
-        if self.config.disposable_inbox_config:
-            from . import disposable_inbox
-
-            confirmation_link = await disposable_inbox.wait_for_confirmation_link(
-                config=self.config.disposable_inbox_config,
-                inbox_address=self.config.email or "",
-                timeout_seconds=self.config.email_poll_timeout_seconds,
-                target_domain=target_domain,
-                llm_provider=self.config.llm_provider,
-                llm_api_key=self.config.llm_api_key,
-                llm_model=self.config.llm_model,
-                llm_base_url=self.config.llm_base_url or None,
-            )
-            if confirmation_link:
-                await self._handle_confirmation_result(page, confirmation_link)
-            else:
-                logger.warning("No confirmation link found within timeout window")
-        elif self.config.imap_config:
-            result = await self._poll_inbox_for_link(target_domain)
-            if result:
-                await self._handle_confirmation_result(page, result)
-            else:
-                logger.warning("No confirmation link found within timeout window")
-        else:
-            logger.info("No IMAP or disposable inbox config; skipping email confirmation")
 
         # ---- Post-confirmation: verify the account actually works ---------
         if self.confirmed:
@@ -637,174 +635,203 @@ class RegistrationHandler:
         self._captcha_info = None
         logger.info("Resuming registration after manual CAPTCHA solve")
 
-        await self._submit_form(self._current_page)
+        known_values: dict[str, str] = {
+            "email": self.config.email,
+            "password": self.config.password,
+        }
+        if self.config.name:
+            known_values["name"] = self.config.name
 
-        if self.config.imap_config:
-            from urllib.parse import urlparse
-            target_domain = urlparse(self.config.signup_url).hostname or ""
-            result = await self._poll_inbox_for_link(target_domain)
-            if result:
-                await self._handle_confirmation_result(self._current_page, result)
+        resume_goal = (
+            "Continue the registration/signup process from where it "
+            "left off. Fill any remaining form fields, submit, handle "
+            "verification steps until the account is confirmed."
+        )
+        await self._run_ai_step_loop(
+            self._current_page, session, goal=resume_goal, known_values=known_values,
+        )
 
         return self._current_page
 
     # ------------------------------------------------------------------
-    # Form filling (uses shared helpers)
+    # AI step loop: observe → decide → act
     # ------------------------------------------------------------------
 
-    async def _fill_signup_form(self, page: Page) -> list[str]:
-        logger.info("Attempting to fill signup form fields")
-
-        field_mappings: list[tuple[list[str], str]] = [
-            (["email", "email_address", "signup_email", "user[email]", "registration_email"],
-             self.config.email),
-            (["password", "passwd", "pwd", "user[password]", "registration_password"],
-             self.config.password),
-            (["password_confirmation", "confirm_password", "passwd_confirm", "password2",
-              "user[password_confirmation]"],
-             self.config.password),
-        ]
-
-        if self.config.name:
-            field_mappings.extend([
-                (["name", "full_name", "fullname", "display_name", "username",
-                  "user[name]", "user[full_name]"],
-                 self.config.name),
-                (["first_name", "firstname", "given_name", "user[first_name]"],
-                 self.config.name.split()[0] if self.config.name else ""),
-                (["last_name", "lastname", "family_name", "surname", "user[last_name]"],
-                 self.config.name.split()[-1] if self.config.name and " " in self.config.name else ""),
-            ])
-
-        return await fill_form_fields(page, field_mappings)
-
-    async def _submit_form(self, page: Page) -> None:
-        signup_selectors = [
-            "button:has-text('Sign Up')",
-            "button:has-text('Register')",
-            "button:has-text('Create Account')",
-            "button:has-text('Sign up')",
-            "button:has-text('register')",
-            "button:has-text('Submit')",
-        ]
-        await submit_form(page, extra_selectors=signup_selectors)
-
-    async def _page_expects_code_check(self, page: Page) -> bool:
-        """True if the page's visible inputs look to the AI like they
-        expect a verification code/PIN/OTP — a *before-the-fact* check
-        (no filling), used to decide extraction priority before ever
-        looking at the email.
+    async def _run_ai_step_loop(
+        self, page: Page, session, goal: str, known_values: dict[str, str],
+        max_steps: int = 12,
+    ) -> bool:
+        """Drive registration/confirmation via the observe-decide-act loop.
+        Returns True if the AI reported success, False otherwise (stuck,
+        failed, or step budget exhausted).
         """
-        _, descriptions = await _collect_visible_inputs(page)
-        if not descriptions:
-            return False
-        try:
-            messages = [{
-                "role": "user",
-                "content": (
-                    "Below is a JSON list of visible <input> elements on a "
-                    "web page, described by their attributes.\n\n"
-                    f"{json.dumps(descriptions, indent=2)}\n\n"
-                    "Does this look like a page asking the user to enter a "
-                    "verification code, PIN, or OTP (whether as one field "
-                    "or several small boxes forming one code together)? "
-                    "Answer with exactly one word: YES or NO."
-                ),
-            }]
-            response = await call_llm(
-                provider=self.config.llm_provider,
-                api_key=self.config.llm_api_key,
-                model=self.config.llm_model,
-                base_url=self.config.llm_base_url or None,
-                messages=messages,
+        capture = getattr(self, "_traffic_capture", None)
+        history: list[dict] = []
+
+        for step_num in range(max_steps):
+            page_state, handles = await _observe_page_state(page)
+            action = await _ai_decide_next_action(
+                page_state=page_state, known_values=known_values, goal=goal,
+                history=history,
+                llm_provider=self.config.llm_provider,
+                llm_api_key=self.config.llm_api_key,
+                llm_model=self.config.llm_model,
+                llm_base_url=self.config.llm_base_url or None,
             )
-            return bool(response) and "yes" in response.strip().lower()
-        except Exception as exc:
-            logger.debug("Page-expects-code AI check failed: %s", exc)
-            return False
+            if action is None:
+                logger.warning("Step %d: no valid action determined, stopping", step_num)
+                return False
 
-    async def _submit_verification_code(self, page: Page, code: str) -> bool:
-        """Fill a verification code into the page and submit the form.
+            logger.info("Step %d: %s", step_num, action)
+            history.append({
+                "step": step_num, "url": page_state["url"], "action": action,
+            })
 
-        Uses AI to decide how to distribute the code across visible
-        inputs — handles single-field, split-digit boxes, and custom
-        widgets without any hardcoded assumptions about markup.
-        """
-        handles, descriptions = await _collect_visible_inputs(page)
-        if not descriptions:
-            logger.info(
-                "No visible input fields found on the page to fill "
-                "the code into"
-            )
-            return False
+            if action["action"] == "need_confirmation_code":
+                self._signup_submitted_at = asyncio.get_event_loop().time()
+                code = await self._fetch_confirmation_code_via_email()
+                if not code:
+                    logger.warning(
+                        "Step %d: needed a confirmation code but none "
+                        "could be fetched", step_num,
+                    )
+                    return False
+                known_values["code"] = code
+                continue
 
-        plan = await _ai_plan_code_input_fill(
-            descriptions=descriptions,
-            code=code,
-            llm_provider=self.config.llm_provider,
-            llm_api_key=self.config.llm_api_key,
-            llm_model=self.config.llm_model,
-            llm_base_url=self.config.llm_base_url or None,
-        )
-        if not plan:
-            logger.info(
-                "AI could not determine how to enter the code %s into "
-                "any field on this page", code,
-            )
-            return False
+            if action["action"] == "done":
+                success = action.get("success", False)
+                logger.info(
+                    "Step %d: AI reported done (success=%s)", step_num, success,
+                )
+                if success:
+                    self.confirmed = True
+                return bool(success)
 
-        for assignment in plan:
-            el = handles[assignment["index"]]
-            try:
-                await el.click()
-                await el.press_sequentially(assignment["value"])
-            except Exception as exc:
+            if action["action"] == "stuck":
                 logger.warning(
-                    "Failed to fill input at index %d: %s",
-                    assignment["index"], exc,
+                    "Step %d: AI reported stuck: %s",
+                    step_num, action.get("reason"),
                 )
                 return False
 
-        logger.info(
-            "Filled code across %d input(s) per AI plan; submitting...",
-            len(plan),
-        )
-        verify_selectors = [
-            "button:has-text('Verify')",
-            "button:has-text('Confirm')",
-            "button:has-text('Submit')",
-            "button:has-text('Continue')",
-            "button:has-text('Next')",
-        ]
-        url_before = page.url
-        await submit_form(page, extra_selectors=verify_selectors)
-
-        # Log what the page shows after submission — purely diagnostic.
-        try:
-            await page.wait_for_load_state("networkidle", timeout=8000)
-        except Exception:
-            pass
-
-        url_after = page.url
-        body_text = await self._get_visible_page_text(page)
-
-        logger.info(
-            "Post-submit page state — url_before=%s url_after=%s navigated=%s",
-            url_before, url_after, url_before != url_after,
-        )
-        logger.info(
-            "Post-submit page text (first 500 chars): %r",
-            body_text[:500].replace("\n", " "),
-        )
-
-        error_indicators = _detect_error_text(body_text)
-        if error_indicators:
-            logger.warning(
-                "Post-submit page appears to show an error/rejection: %r",
-                error_indicators,
+            await self._execute_step_action(
+                page, action, handles, known_values, capture=capture,
             )
 
-        return True
+            # Check for CAPTCHA after action
+            try:
+                await check_captcha(
+                    page, f"step_{step_num}",
+                    self.config.captcha_screenshot_dir,
+                    self.config.signup_url,
+                )
+            except CaptchaDetected as exc:
+                self._captcha_info = exc
+                self._paused = True
+                self._current_page = page
+                raise
+
+        logger.warning("Step budget (%d) exhausted without reaching 'done'", max_steps)
+        return False
+
+    async def _execute_step_action(
+        self, page: Page, action: dict, handles: dict,
+        known_values: dict, capture=None,
+    ) -> None:
+        """Execute the action chosen by the AI and log any HTTP requests
+        the TrafficCapture recorded as a result."""
+        kind = action["action"]
+        count_before = capture._record_count if capture else None
+
+        if kind == "fill":
+            el = handles[action["ref"]]
+            value = known_values[action["value_key"]]
+            await el.click()
+            await el.press_sequentially(value)
+        elif kind == "click":
+            el = handles[action["ref"]]
+            await el.click()
+            try:
+                await page.wait_for_load_state("networkidle", timeout=8000)
+            except Exception:
+                pass
+
+        if capture and count_before is not None:
+            await self._log_new_captured_requests(capture, count_before)
+
+    async def _log_new_captured_requests(self, capture, count_before: int) -> None:
+        """After an action, summarize any new HTTP requests TrafficCapture
+        recorded as a result — this is the 'let us see the request format'
+        visibility the action produced, sourced from the capture mechanism
+        that's already attached to the page rather than a new one."""
+        count_after = capture._record_count
+        if count_after <= count_before:
+            return
+        try:
+            with open(capture.index_path) as fh:
+                lines = fh.readlines()
+            new_lines = lines[count_before:count_after]
+            for line in new_lines:
+                record = json.loads(line)
+                logger.info(
+                    "  -> %s %s (status=%s)",
+                    record.get("method"), record.get("url"), record.get("status"),
+                )
+        except Exception as exc:
+            logger.debug("Could not summarize new captured requests: %s", exc)
+
+    async def _fetch_confirmation_code_via_email(self) -> Optional[str]:
+        """Wrap the existing IMAP/disposable-inbox polling + AI extraction
+        logic to fetch a confirmation code (or link) from the inbox.
+
+        Returns the code string, or None if nothing extractable arrived
+        within the poll window.
+        """
+        signup_url = self._resolve_signup_url()
+        target_domain = urlparse(signup_url).hostname or "" if signup_url else ""
+
+        if self.config.disposable_inbox_config:
+            from . import disposable_inbox
+
+            result = await disposable_inbox.wait_for_confirmation_link(
+                config=self.config.disposable_inbox_config,
+                inbox_address=self.config.email or "",
+                timeout_seconds=self.config.email_poll_timeout_seconds,
+                target_domain=target_domain,
+                llm_provider=self.config.llm_provider,
+                llm_api_key=self.config.llm_api_key,
+                llm_model=self.config.llm_model,
+                llm_base_url=self.config.llm_base_url or None,
+            )
+        elif self.config.imap_config:
+            result = await self._poll_inbox_for_link(target_domain)
+        else:
+            logger.info("No IMAP or disposable inbox config; cannot fetch confirmation code")
+            return None
+
+        if not result:
+            logger.warning("No confirmation code/link arrived in inbox within timeout")
+            return None
+
+        kind, value = result
+        if kind == "code":
+            logger.info("Confirmation code extracted from email: %s", value)
+            return value
+        if kind == "link":
+            # For link-based confirmation, navigate to it now
+            logger.info("Confirmation link extracted from email: %s", value)
+            try:
+                await self._current_page.goto(value, timeout=30_000)
+                await self._current_page.wait_for_load_state(
+                    "networkidle", timeout=15_000,
+                )
+                self.confirmed = True
+            except Exception as exc:
+                logger.warning("Failed to navigate confirmation link: %s", exc)
+            return None
+
+        return None
 
     # ------------------------------------------------------------------
     # Signup URL resolution + AI judge
@@ -846,7 +873,7 @@ class RegistrationHandler:
         else), or None if the LLM call failed (fail open).
         """
         try:
-            visible_text = await self._extract_visible_form_text(page)
+            visible_text = await self._get_visible_page_text(page)
             if not visible_text or len(visible_text) < 20:
                 logger.debug("Not enough visible text for AI judge post-submit")
                 return None  # fail open
@@ -891,24 +918,6 @@ class RegistrationHandler:
         except Exception as exc:
             logger.debug("AI judge post-submit error: %s — failing open", exc)
             return None  # fail open
-
-    async def _extract_visible_form_text(self, page: Page) -> str:
-        """Extract visible text near forms/headings from *page* for AI judging."""
-        try:
-            text = await page.evaluate("""
-                () => {
-                    const form = document.querySelector('form');
-                    const els = [
-                        ...document.querySelectorAll('h1, h2, h3, h4, p, label, button, .alert, .message, [role="alert"]'),
-                    ];
-                    if (form) els.push(form);
-                    return els.map(el => el.textContent?.trim() || '').filter(t => t).join('\\n');
-                }
-            """)
-            return text or ""
-        except Exception as exc:
-            logger.debug("Failed to extract visible text: %s", exc)
-            return ""
 
     async def _get_visible_page_text(self, page: Page) -> str:
         """Best-effort extraction of the page's visible text, for diagnostic
@@ -961,36 +970,6 @@ class RegistrationHandler:
             logger.warning("Post-confirmation login verification failed to run: %s", exc)
             return None
 
-    async def _handle_confirmation_result(
-        self, page: Page, result: tuple[str, str],
-    ) -> None:
-        """Dispatch on the extraction result: link → navigate, code → fill + submit."""
-        kind, value = result
-        if kind == "link":
-            logger.info("Confirmation link found: %s", value)
-            await page.goto(value, timeout=30_000)
-            await page.wait_for_load_state("networkidle", timeout=15_000)
-            self.confirmed = True
-        elif kind == "code":
-            logger.info("Verification code extracted: %s", value)
-            code_submitted = await self._submit_verification_code(page, value)
-            if code_submitted:
-                # Code entry field found and submitted — treat as confirmed.
-                # A detected code-entry field is also strong evidence this
-                # is a real registration, overriding any prior AI false negative.
-                self.confirmed = True
-                if self._registration_looked_real is False:
-                    logger.info(
-                        "Code-entry field detected on page — overriding "
-                        "earlier 'NOT a registration' AI judge verdict"
-                    )
-                    self._registration_looked_real = True
-            else:
-                logger.warning(
-                    "Verification code was extracted but no matching code "
-                    "field was found on the page (reason=code_found_no_field)"
-                )
-
     async def _log_recent_mailbox_state(self, imap_config) -> None:
         """Diagnostic only — logs the most recent messages in the mailbox
         regardless of Seen status, so a silent 'nothing found' can be told
@@ -1041,7 +1020,7 @@ class RegistrationHandler:
         except Exception as exc:
             logger.error("Diagnostic mailbox scan failed: %s", exc)
 
-    async def _poll_inbox_for_link(self, target_domain="") -> Optional[str]:
+    async def _poll_inbox_for_link(self, target_domain="") -> Optional[tuple[str, str]]:
         if not self.config.imap_config:
             return None
 
@@ -1098,7 +1077,7 @@ class RegistrationHandler:
         )
         return None
 
-    async def _check_inbox_for_new_email(self, target_domain="") -> Optional[str]:
+    async def _check_inbox_for_new_email(self, target_domain="") -> Optional[tuple[str, str]]:
         try:
             import aioimaplib
 
@@ -1182,10 +1161,6 @@ class RegistrationHandler:
                     others.append(msg)
 
             # Tier 1: domain-matching candidates, deterministic extraction.
-            # NOTE: target_domain is still passed through to
-            # _extract_link_from_email — that's a SEPARATE use (preferring
-            # links WITHIN the email body whose own hostname matches the
-            # target), not the sender check. Don't conflate the two.
             for msg in domain_matched:
                 found = await self._extract_link_from_email(msg, target_domain)
                 if found:
@@ -1211,7 +1186,7 @@ class RegistrationHandler:
             logger.error("IMAP check failed: %s", exc)
             return None
 
-    async def _ai_classify_and_extract_latest_unread(self, target_domain="") -> Optional[str]:
+    async def _ai_classify_and_extract_latest_unread(self, target_domain="") -> Optional[tuple[str, str]]:
         """Fetch the single latest UNSEEN message (any sender domain, still
         respecting the date-after-submission filter), ask the LLM whether it
         looks like the registration/verification email for this signup, and
@@ -1301,15 +1276,7 @@ class RegistrationHandler:
                 "AI classified latest unread mail (from %s) as likely the "
                 "registration email", msg.get("From", ""),
             )
-            return await _ai_extract_confirmation_action(
-                body_text=body_text,
-                target_domain=target_domain,
-                page_expects_code=getattr(self, "_page_expects_code", False),
-                llm_provider=self.config.llm_provider,
-                llm_api_key=self.config.llm_api_key,
-                llm_model=self.config.llm_model,
-                llm_base_url=self.config.llm_base_url or None,
-            )
+            return await self._extract_link_from_email(msg, target_domain)
 
         except ImportError:
             logger.error("aioimaplib is required for IMAP polling")
@@ -1361,7 +1328,7 @@ class RegistrationHandler:
                 pass
         return body_text
 
-    async def _extract_link_from_email(self, msg, target_domain=""):
+    async def _extract_link_from_email(self, msg, target_domain="") -> Optional[tuple[str, str]]:
         """Extract a confirmation action from *msg* using a single AI call
         that decides code-vs-link and returns the value — no regex fallback.
 
