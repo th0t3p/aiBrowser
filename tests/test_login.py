@@ -111,6 +111,177 @@ class TestCookiesFileParsing:
         assert result == []
 
 
+class TestPlainCookieParser:
+    """Test _parse_plain_cookie_lines for 'name=value' per line format."""
+
+    def test_simple_name_value_lines(self):
+        from ai_browser.browser_session.session import _parse_plain_cookie_lines
+        text = "session_id=abc123\ncsrf_token=def456"
+        result = _parse_plain_cookie_lines(text)
+        assert len(result) == 2
+        assert result[0] == {"name": "session_id", "value": "abc123"}
+        assert result[1] == {"name": "csrf_token", "value": "def456"}
+
+    def test_value_contains_equals_sign(self):
+        """Values with '=' (base64 padding, JWTs) are preserved whole."""
+        from ai_browser.browser_session.session import _parse_plain_cookie_lines
+        text = "token=eyJhbGciOiJIUzI1NiJ9.xyz=="
+        result = _parse_plain_cookie_lines(text)
+        assert len(result) == 1
+        assert result[0]["name"] == "token"
+        assert result[0]["value"] == "eyJhbGciOiJIUzI1NiJ9.xyz=="
+
+    def test_value_with_multiple_equals(self):
+        """Only the first '=' splits — values with multiple '=' stay intact."""
+        from ai_browser.browser_session.session import _parse_plain_cookie_lines
+        text = "kv=base64=encoded==thing"
+        result = _parse_plain_cookie_lines(text)
+        assert result[0]["name"] == "kv"
+        assert result[0]["value"] == "base64=encoded==thing"
+
+    def test_blank_lines_skipped(self):
+        from ai_browser.browser_session.session import _parse_plain_cookie_lines
+        text = "a=b\n\n\nc=d\n"
+        result = _parse_plain_cookie_lines(text)
+        assert len(result) == 2
+        assert result[0]["name"] == "a"
+        assert result[1]["name"] == "c"
+
+    def test_comment_lines_skipped(self):
+        from ai_browser.browser_session.session import _parse_plain_cookie_lines
+        text = "# this is a comment\na=b\n# another comment\nc=d"
+        result = _parse_plain_cookie_lines(text)
+        assert len(result) == 2
+        assert result[0]["name"] == "a"
+        assert result[1]["name"] == "c"
+
+    def test_no_equals_sign_skipped(self):
+        from ai_browser.browser_session.session import _parse_plain_cookie_lines
+        text = "a=b\nline_without_equals\nc=d"
+        result = _parse_plain_cookie_lines(text)
+        assert len(result) == 2
+
+    def test_empty_name_skipped(self):
+        from ai_browser.browser_session.session import _parse_plain_cookie_lines
+        text = "=value_only\na=b"
+        result = _parse_plain_cookie_lines(text)
+        assert len(result) == 1
+        assert result[0]["name"] == "a"
+
+    def test_whitespace_stripped_around_name_and_value(self):
+        from ai_browser.browser_session.session import _parse_plain_cookie_lines
+        text = "  name  =  value with spaces  "
+        result = _parse_plain_cookie_lines(text)
+        assert result[0] == {"name": "name", "value": "value with spaces"}
+
+
+class TestApplyCookiesFilePlainFormat:
+    """Integration tests for _apply_cookies_file with plain-text format."""
+
+    @pytest.mark.asyncio
+    async def test_plain_text_format_detected_and_domain_applied(self, tmp_path, caplog):
+        """Plain-text file gets detected as 'plain text (name=value)' and
+        default_domain is applied to every cookie."""
+        import logging
+        from unittest.mock import AsyncMock, MagicMock
+        from ai_browser.browser_session import BrowserSession, BrowserSessionConfig
+
+        config = BrowserSessionConfig(
+            authorized_hostname="example.com",
+            cookies_file=tmp_path / "cookies.txt",
+            cookies_domain=".example.com",
+        )
+        cookie_file = config.cookies_file
+        cookie_file.parent.mkdir(parents=True, exist_ok=True)
+        cookie_file.write_text("session_id=abc123\ncsrf=def456")
+
+        session = BrowserSession(config)
+        session._context = MagicMock()
+        session._context.add_cookies = AsyncMock()
+
+        with caplog.at_level(logging.INFO):
+            await session._apply_cookies_file(cookie_file, default_domain=".example.com")
+
+        call_args = session._context.add_cookies.call_args[0][0]
+        assert len(call_args) == 2
+        for c in call_args:
+            assert c["domain"] == ".example.com"
+            assert c["path"] == "/"
+        assert "detected format: plain text" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_plain_text_no_default_domain_raises(self, tmp_path):
+        """Plain-text cookies with no default_domain → ValueError naming
+        the cookies that are missing a domain."""
+        from unittest.mock import AsyncMock, MagicMock
+        from ai_browser.browser_session import BrowserSession, BrowserSessionConfig
+
+        config = BrowserSessionConfig(
+            authorized_hostname="example.com",
+            cookies_file=tmp_path / "cookies.txt",
+        )
+        cookie_file = config.cookies_file
+        cookie_file.parent.mkdir(parents=True, exist_ok=True)
+        cookie_file.write_text("session_id=abc123\ncsrf=def456")
+
+        session = BrowserSession(config)
+        session._context = MagicMock()
+        session._context.add_cookies = AsyncMock()
+
+        with pytest.raises(ValueError, match="session_id"):
+            await session._apply_cookies_file(cookie_file, default_domain=None)
+
+    @pytest.mark.asyncio
+    async def test_json_format_still_works_and_logs_json(self, tmp_path, caplog):
+        """JSON file is detected as JSON, plain-text parser is never invoked."""
+        import logging
+        from unittest.mock import AsyncMock, MagicMock
+        from ai_browser.browser_session import BrowserSession, BrowserSessionConfig
+
+        config = BrowserSessionConfig(
+            authorized_hostname="example.com",
+            cookies_file=tmp_path / "cookies.json",
+        )
+        cookie_file = config.cookies_file
+        cookie_file.parent.mkdir(parents=True, exist_ok=True)
+        cookie_file.write_text(
+            '[{"name": "s", "value": "v", "domain": ".example.com", "path": "/"}]'
+        )
+
+        session = BrowserSession(config)
+        session._context = MagicMock()
+        session._context.add_cookies = AsyncMock()
+
+        with caplog.at_level(logging.INFO):
+            await session._apply_cookies_file(cookie_file, default_domain=None)
+
+        call_args = session._context.add_cookies.call_args[0][0]
+        assert len(call_args) == 1
+        assert call_args[0]["name"] == "s"
+        assert "detected format: JSON" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_invalid_file_neither_json_nor_plain_text(self, tmp_path):
+        """A file that's not JSON and has no name=value lines raises ValueError."""
+        from unittest.mock import AsyncMock, MagicMock
+        from ai_browser.browser_session import BrowserSession, BrowserSessionConfig
+
+        config = BrowserSessionConfig(
+            authorized_hostname="example.com",
+            cookies_file=tmp_path / "bad.txt",
+        )
+        cookie_file = config.cookies_file
+        cookie_file.parent.mkdir(parents=True, exist_ok=True)
+        cookie_file.write_text("not json and also no equals sign anywhere")
+
+        session = BrowserSession(config)
+        session._context = MagicMock()
+        session._context.add_cookies = AsyncMock()
+
+        with pytest.raises(ValueError, match="neither valid JSON"):
+            await session._apply_cookies_file(cookie_file, default_domain=".example.com")
+
+
 class TestLoginHandlerAuthenticated:
     """Test LoginHandler.authenticated detection logic."""
 

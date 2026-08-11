@@ -354,8 +354,17 @@ def main(ctx: click.Context):
     type=click.Path(exists=True, dir_okay=False),
     default=None,
     help="Path to an exported cookie/session file (Playwright storage_state "
-    "JSON or bare cookie array). When set, skips automatic session restore "
-    "and login/registration phases.",
+    "JSON, bare cookie array, or plain 'name=value' per line text dump). "
+    "When set, skips automatic session restore and login/registration phases.",
+)
+@click.option(
+    "--cookies-domain",
+    default=None,
+    help=(
+        "Domain to apply to cookies that don't specify their own "
+        "(required for plain 'name=value' text cookie files, which "
+        "carry no domain info). Defaults to '.<hostname>' if not set."
+    ),
 )
 @click.option(
     "--email-backend",
@@ -424,6 +433,7 @@ def crawl(
     disposable_inbox_api_key: Optional[str],
     disposable_inbox_domain: Optional[str],
     cookies_file: Optional[str],
+    cookies_domain: Optional[str],
 ):
     """Crawl HOSTNAME, discovering URLs and endpoints.
 
@@ -529,6 +539,7 @@ def crawl(
         ca_cert_path=Path(ca_cert) if ca_cert else None,
         expose_cdp=(agent_backend == "browser-use"),
         cookies_file=Path(cookies_file) if cookies_file else None,
+        cookies_domain=cookies_domain,
     )
 
     # Build crawl config

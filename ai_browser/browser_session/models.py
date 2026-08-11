@@ -100,7 +100,15 @@ class BrowserSessionConfig(BaseModel):
         default=None,
         description="Path to an exported cookie/session file. When set, skips "
         "the automatic per-hostname session restore and applies these cookies "
-        "instead. Supports Playwright storage_state JSON and bare cookie arrays.",
+        "instead. Supports Playwright storage_state JSON, bare cookie arrays, "
+        "and plain 'name=value' per line text dumps.",
+    )
+    cookies_domain: Optional[str] = Field(
+        default=None,
+        description="Domain to apply to cookies that don't specify their own "
+        "(required for plain 'name=value' text cookie files, which carry no "
+        "domain info). When not set, falls back to '.<hostname>' for the "
+        "target hostname.",
     )
 
     model_config = {"arbitrary_types_allowed": True}

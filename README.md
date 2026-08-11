@@ -130,7 +130,8 @@ failed, `null` = verification didn't run or was inconclusive).
 
 | Flag | Default | Notes |
 |---|---|---|
-| `--cookies-file FILE` | — | Import an existing session (Playwright `storage_state()` JSON, or a bare cookie array). Skips the automatic per-hostname session restore. |
+| `--cookies-file FILE` | — | Import an existing session. Accepts Playwright `storage_state()` JSON, a bare cookie array, or a plain `name=value` per line text dump (e.g. copied from browser devtools). Skips automatic per-hostname session restore. |
+| `--cookies-domain DOMAIN` | — | Domain to apply to cookies that don't specify their own (required for plain `name=value` text files, which carry no domain info). Defaults to `.<hostname>` if not set. |
 
 ---
 
@@ -194,7 +195,7 @@ Everything else is opt-in or conditionally skipped:
 
 - **Skip Phase 1 entirely**: `--no-crawl`. Phase 2 is auto-skipped when this is set (no crawl seed to explore from). Phase 3 still runs if `--register` is passed — provide `--signup-url` to avoid falling back to the bare hostname root.
 - **Skip crawling already-known URLs**: `--skip-existing <prior-run.json>`. Their entries get merged into this run's output rather than re-fetched.
-- **Skip Phase 0 and Phase 3 entirely, start already-authenticated**: `--cookies-file <path>`. Two accepted shapes — Playwright's `storage_state()` JSON, or a bare browser-extension-style cookie array (auto-detected).
+- **Skip Phase 0 and Phase 3 entirely, start already-authenticated**: `--cookies-file <path>`. Three accepted shapes — Playwright's `storage_state()` JSON, a bare browser-extension-style cookie array, or plain `name=value` lines (auto-detected by whether the file parses as valid JSON first). For the plain-text format, use `--cookies-domain` to supply the domain (defaults to `.<hostname>`).
 - **Skip Phase 3 only, log in fresh instead of registering**: `--login` with credentials. If login succeeds (verified, not just attempted — see below), registration is skipped automatically even if `--register` was also passed.
 - **Skip Phase 2**: `--no-agent`. Crawl + optional login/register, no autonomous exploration.
 - **Skip Phase 3 explicitly**: just don't pass `--register`. (Phase 0/`--login` is independent of this.)

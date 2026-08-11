@@ -52,6 +52,30 @@ def _parse_cookies_file(raw: dict | list) -> list[dict]:
     )
 
 
+def _parse_plain_cookie_lines(raw_text: str) -> list[dict]:
+    """Parse a plain 'name=value' per line cookie dump (e.g. copied
+    directly from browser devtools) into cookie dicts with name/value
+    only — domain and path are not present in this format and must be
+    supplied by the caller.
+    """
+    cookies: list[dict] = []
+    for line in raw_text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            continue
+        name, value = line.split("=", 1)  # split on FIRST '=' only —
+                                            # values may contain '=' too
+                                            # (base64 padding, JWTs, etc.)
+        name = name.strip()
+        value = value.strip()
+        if not name:
+            continue
+        cookies.append({"name": name, "value": value})
+    return cookies
+
+
 class BrowserSession:
     """Wraps Playwright's async API with a persistent context, Burp proxy, and hostname scope guard.
 
@@ -182,7 +206,13 @@ class BrowserSession:
         # Restore persisted storage state if available (skip when an explicit
         # cookies-file is provided — it becomes the sole source of truth)
         if self.config.cookies_file:
-            await self._apply_cookies_file(self.config.cookies_file)
+            default_domain = self.config.cookies_domain
+            if not default_domain:
+                # Fall back to the target hostname with leading dot so
+                # cookies apply across subdomains by default
+                raw_host = self._resolve_storage_key()
+                default_domain = f".{raw_host}"
+            await self._apply_cookies_file(self.config.cookies_file, default_domain=default_domain)
         else:
             await self._restore_storage_state()
 
@@ -466,24 +496,57 @@ class BrowserSession:
         except Exception as exc:
             logger.error("Failed to restore storage state: %s", exc)
 
-    async def _apply_cookies_file(self, path: Path) -> None:
-        """Parse *path* as a Playwright storage_state JSON or bare cookie array,
-        and apply its cookies to the current context."""
+    async def _apply_cookies_file(self, path: Path, default_domain: Optional[str] = None) -> None:
+        """Parse *path* as a Playwright storage_state JSON, a bare cookie
+        array, or a plain 'name=value' per line text dump, and apply its
+        cookies to the current context.
+
+        *default_domain* is used to fill in domain/path for any cookie that
+        doesn't already carry them (always true for the plain-text format;
+        possible but less common for the JSON formats too) — required if the
+        cookies file might be plain-text, since that format has no domain
+        information of its own.
+        """
         if not self._context:
             return
         if not path.exists():
             raise FileNotFoundError(f"Cookies file not found: {path}")
 
+        text = path.read_text()
         try:
-            raw = json.loads(path.read_text())
-        except json.JSONDecodeError as exc:
-            raise ValueError(f"Cookies file is not valid JSON: {path}") from exc
+            raw = json.loads(text)
+            cookies = _parse_cookies_file(raw)
+            detected_format = "JSON"
+        except json.JSONDecodeError:
+            cookies = _parse_plain_cookie_lines(text)
+            detected_format = "plain text (name=value)"
+            if not cookies:
+                raise ValueError(
+                    f"Cookies file is neither valid JSON nor parseable as "
+                    f"plain 'name=value' lines: {path}"
+                )
 
-        cookies = _parse_cookies_file(raw)
+        if default_domain:
+            for cookie in cookies:
+                if "domain" not in cookie and "url" not in cookie:
+                    cookie["domain"] = default_domain
+                    cookie["path"] = cookie.get("path", "/")
+
+        missing_domain = [c["name"] for c in cookies if "domain" not in c and "url" not in c]
+        if missing_domain:
+            raise ValueError(
+                f"{len(missing_domain)} cookie(s) have no domain/url and no "
+                f"default_domain was supplied to fall back on: {missing_domain[:5]}"
+                f"{'...' if len(missing_domain) > 5 else ''}. "
+                f"Pass --cookies-domain or use a cookies file format that "
+                f"includes domain per cookie."
+            )
+
         await self._context.add_cookies(cookies)
         logger.info(
-            "Applied %d cookie(s) from %s (skipped automatic session restore)",
-            len(cookies), path,
+            "Applied %d cookie(s) from %s (detected format: %s, skipped "
+            "automatic session restore)",
+            len(cookies), path, detected_format,
         )
 
     # ------------------------------------------------------------------
