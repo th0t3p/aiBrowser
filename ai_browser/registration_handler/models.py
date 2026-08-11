@@ -142,6 +142,15 @@ class RegistrationConfig(BaseModel):
         description="When set, use a purpose-built disposable inbox instead of "
         "a pre-configured email + IMAP. Mutually exclusive with imap_config.",
     )
+    login_verify_url: Optional[str] = Field(
+        default=None,
+        description="Override the login URL used for post-confirmation "
+        "verification. Defaults to https://<hostname>/login when unset. "
+        "Use this when the target's login page lives somewhere other than "
+        "/login (the same class of problem --signup-url was added for). "
+        "Follows the same pattern as --signup-url: if set, it's used "
+        "verbatim; if not, the /login guess is applied.",
+    )
 
     @model_validator(mode="after")
     def _validate_email_backend(self) -> "RegistrationConfig":

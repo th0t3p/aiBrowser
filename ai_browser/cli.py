@@ -236,6 +236,16 @@ def main(ctx: click.Context):
     "Useful when you already know the URL, or when running with --no-crawl.",
 )
 @click.option(
+    "--login-verify-url",
+    default=None,
+    envvar="AIBROWSER_LOGIN_VERIFY_URL",
+    help="Override the login URL used for post-confirmation account "
+    "verification. Defaults to https://<hostname>/login when unset "
+    "(--register attempts a real login after confirmation to prove "
+    "the account is active). Use this when the target's login page "
+    "lives somewhere other than /login.",
+)
+@click.option(
     "--login",
     is_flag=True,
     default=False,
@@ -393,6 +403,7 @@ def crawl(
     register_password: Optional[str],
     register_name: str,
     signup_url: Optional[str],
+    login_verify_url: Optional[str],
     login: bool,
     login_email: Optional[str],
     login_password: Optional[str],
@@ -571,6 +582,7 @@ def crawl(
             register_password=register_password,
             register_name=register_name,
             signup_url=signup_url,
+            login_verify_url=login_verify_url,
             do_login=login,
             login_email=login_email,
             login_password=login_password,
@@ -599,6 +611,7 @@ def _save_credentials(
     email: str,
     password: str,
     confirmed: bool,
+    login_verified: Optional[bool] = None,
 ) -> None:
     """Persist registration credentials to a local file with restricted permissions.
 
@@ -616,6 +629,7 @@ def _save_credentials(
         "password": password,
         "registered_at": datetime.now(timezone.utc).isoformat(),
         "confirmed": confirmed,
+        "login_verified": login_verified,
     }
     cred_file.write_text(json.dumps(cred_data, indent=2) + "\n")
     cred_file.chmod(stat.S_IRUSR | stat.S_IWUSR)  # 0o600 — owner read/write only
@@ -959,6 +973,7 @@ async def _run_crawl(
     register_password: str,
     register_name: str,
     signup_url: Optional[str],
+    login_verify_url: Optional[str],
     do_login: bool,
     login_email: Optional[str],
     login_password: Optional[str],
@@ -1184,6 +1199,7 @@ async def _run_crawl(
                 llm_model=llm_model or "",
                 llm_api_key=llm_api_key or "",
                 llm_base_url=llm_base_url or "",
+                login_verify_url=login_verify_url,
                 disposable_inbox_config=disposable_config,
             )
             handler = RegistrationHandler(reg_config)
@@ -1254,6 +1270,7 @@ async def _run_crawl(
                         email=handler.provisioned_email or register_email or "",
                         password=register_password,
                         confirmed=handler.confirmed,
+                        login_verified=handler.login_verified,
                     )
 
         # -- traffic capture summary ----------------------------------

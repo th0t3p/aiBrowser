@@ -303,6 +303,7 @@ class TestPhase0NameErrorRegression:
                         register_password="pw",
                         register_name="Test",
                         signup_url=None,
+                        login_verify_url=None,
                         do_login=False,  # <-- this is the key: no login
                         login_email=None,
                         login_password=None,

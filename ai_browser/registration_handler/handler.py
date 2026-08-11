@@ -144,6 +144,15 @@ _CODE_FIELD_NAMES = [
     "confirmation_code", "verificationCode",
 ]
 
+# Diagnostic-only error phrases for post-submit page text — logged as a
+# hint for the operator but never used to drive control flow (keyword-
+# matching arbitrary error copy is too fragile for pass/fail decisions).
+_ERROR_TEXT_PATTERNS = [
+    "invalid code", "incorrect code", "wrong code", "code expired",
+    "code has expired", "please try again", "verification failed",
+    "invalid verification", "expired verification",
+]
+
 
 def _looks_like_docs_page(path: str) -> bool:
     """Return True if *path* looks like a documentation/tutorial page rather
@@ -214,6 +223,17 @@ def _extract_verification_code_from_body(body_text: str) -> Optional[str]:
         code = match.group(1)
         logger.debug("Found verification code in email body: %s", code)
         return code
+    return None
+
+
+def _detect_error_text(body_text: str) -> Optional[str]:
+    """Return the first matching error phrase found in the page's visible
+    text, or None. Diagnostic only — logged as a hint for the operator,
+    never used to alter control flow or set self.confirmed."""
+    lowered = body_text.lower()
+    for pattern in _ERROR_TEXT_PATTERNS:
+        if pattern in lowered:
+            return pattern
     return None
 
 
@@ -539,7 +559,34 @@ class RegistrationHandler:
             "button:has-text('Continue')",
             "button:has-text('Next')",
         ]
+        url_before = page.url
         await submit_form(page, extra_selectors=verify_selectors)
+
+        # Log what the page shows after submission — purely diagnostic.
+        try:
+            await page.wait_for_load_state("networkidle", timeout=8000)
+        except Exception:
+            pass
+
+        url_after = page.url
+        body_text = await self._get_visible_page_text(page)
+
+        logger.info(
+            "Post-submit page state — url_before=%s url_after=%s navigated=%s",
+            url_before, url_after, url_before != url_after,
+        )
+        logger.info(
+            "Post-submit page text (first 500 chars): %r",
+            body_text[:500].replace("\n", " "),
+        )
+
+        error_indicators = _detect_error_text(body_text)
+        if error_indicators:
+            logger.warning(
+                "Post-submit page appears to show an error/rejection: %r",
+                error_indicators,
+            )
+
         return True
 
     # ------------------------------------------------------------------
@@ -647,6 +694,15 @@ class RegistrationHandler:
             logger.debug("Failed to extract visible text: %s", exc)
             return ""
 
+    async def _get_visible_page_text(self, page: Page) -> str:
+        """Best-effort extraction of the page's visible text, for diagnostic
+        logging only — not used for any pass/fail decision."""
+        try:
+            return await page.inner_text("body")
+        except Exception as exc:
+            logger.debug("Could not read page body text: %s", exc)
+            return ""
+
     # ------------------------------------------------------------------
     # CAPTCHA detection (delegates to shared helper)
     # ------------------------------------------------------------------
@@ -672,8 +728,13 @@ class RegistrationHandler:
             from ai_browser.login_handler import LoginHandler
             from ai_browser.login_handler.models import LoginConfig
 
+            hostname = urlparse(self.config.signup_url).hostname or ""
+            login_url = (
+                self.config.login_verify_url
+                or f"https://{hostname}/login"
+            )
             login_config = LoginConfig(
-                login_url=self.config.signup_url,
+                login_url=login_url,
                 email=self.config.email or "",
                 password=self.config.password,
             )

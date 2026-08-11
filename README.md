@@ -97,9 +97,16 @@ crashes.
 |---|---|---|
 | `--register` | off | Attempt registration after crawling. |
 | `--register-email TEXT` | — | Required *unless* `--email-backend disposable` (address is provisioned dynamically in that mode). |
-| `--register-password TEXT` | random, auto-generated | Saved to the credentials file either way. |
+| `--register-password TEXT` | random, auto-generated | Saved to the credentials file either way. See below for the saved JSON fields. |
 | `--register-name TEXT` | — | |
 | `--signup-url TEXT` | — | **Directly specify the registration page URL**, bypassing automatic discovery from crawled endpoints. Essential when running with `--no-crawl` (since there are no endpoints to discover from), but also useful anytime you already know the signup URL and don't want automatic guessing to interfere. |
+| `--login-verify-url TEXT` | `https://<hostname>/login` (guessed) | Override the login URL used for post-confirmation account verification. After registration and email confirmation, the tool attempts a real login with the same credentials to prove the account is active — this flag tells it where the login page actually lives, since `/login` is a guess that won't always be right. Env: `AIBROWSER_LOGIN_VERIFY_URL`. |
+
+Credentials are saved to `storage/<storage_dir>/credentials/<hostname>.json` after
+registration. The JSON includes: `hostname`, `email`, `password` (plaintext —
+chmod 0600), `registered_at`, `confirmed` (whether a confirmation action was
+attempted), and `login_verified` (`true` = login succeeded, `false` = login
+failed, `null` = verification didn't run or was inconclusive).
 
 ### Login (Phase 0)
 

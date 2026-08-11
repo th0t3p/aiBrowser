@@ -5,6 +5,7 @@ import email
 import logging
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -1879,3 +1880,250 @@ class TestLoginVerification:
         await handler.register(session)
         assert handler.confirmed is True
         assert handler.login_verified is False  # distinct from None
+
+
+class TestLoginVerifyURLConstruction:
+    """Verify that _verify_via_login builds the correct login URL."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.asyncio
+    async def test_login_url_derived_from_signup_hostname(self):
+        """With no login_verify_url override, the login URL is
+        https://<hostname>/login where <hostname> comes from signup_url.
+        A signup URL with a path/query is stripped to just the hostname."""
+        from urllib.parse import urlparse
+
+        signup_url = "https://example.com/app/signup?ref=x"
+        hostname = urlparse(signup_url).hostname
+        assert hostname == "example.com", "Should extract just hostname"
+
+        login_url = f"https://{hostname}/login"
+        assert login_url == "https://example.com/login", (
+            "Should build /login from hostname, not reuse signup_url path"
+        )
+
+    def test_login_verify_url_override_used_verbatim(self):
+        """When login_verify_url is set, it's used directly."""
+        from urllib.parse import urlparse
+        config = RegistrationConfig(
+            signup_url="https://example.com/signup",
+            email="test@example.com",
+            password="test-pw",
+            login_verify_url="https://example.com/custom-login",
+        )
+        hostname = urlparse(config.signup_url).hostname or ""
+        login_url = config.login_verify_url or f"https://{hostname}/login"
+        assert login_url == "https://example.com/custom-login", (
+            "login_verify_url override should be used verbatim"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Tests for --login-verify-url CLI option
+# ---------------------------------------------------------------------------
+
+
+class TestLoginVerifyUrlCLI:
+    """Verify CLI wiring of --login-verify-url."""
+
+    def test_login_verify_url_parsed(self):
+        """--login-verify-url is a recognized option."""
+        from click.testing import CliRunner
+        from ai_browser.cli import main
+
+        runner = CliRunner()
+        result = runner.invoke(main, ["crawl", "--help"])
+        assert "--login-verify-url" in result.output
+
+    def test_flag_omitted_leaves_config_none(self):
+        """Without the flag, RegistrationConfig.login_verify_url is None."""
+        from ai_browser.registration_handler.models import RegistrationConfig
+        config = RegistrationConfig(
+            signup_url="https://example.com/signup",
+            email="test@example.com",
+        )
+        assert config.login_verify_url is None
+
+
+# ---------------------------------------------------------------------------
+# Tests for login_verified persistence to credentials file
+# ---------------------------------------------------------------------------
+
+
+class TestSaveCredentialsLoginVerified:
+    """Verify _save_credentials writes login_verified to the JSON."""
+
+    def test_saves_login_verified_true(self, tmp_path: Path):
+        from ai_browser.cli import _save_credentials
+        import json
+
+        _save_credentials(tmp_path, "example.com", "test@example.com",
+                          "pw", confirmed=True, login_verified=True)
+        cred_file = tmp_path / "credentials" / "example.com.json"
+        data = json.loads(cred_file.read_text())
+        assert data["login_verified"] is True
+
+    def test_saves_login_verified_false(self, tmp_path: Path):
+        from ai_browser.cli import _save_credentials
+        import json
+
+        _save_credentials(tmp_path, "example.com", "test@example.com",
+                          "pw", confirmed=True, login_verified=False)
+        cred_file = tmp_path / "credentials" / "example.com.json"
+        data = json.loads(cred_file.read_text())
+        assert data["login_verified"] is False
+
+    def test_saves_login_verified_none(self, tmp_path: Path):
+        from ai_browser.cli import _save_credentials
+        import json
+
+        _save_credentials(tmp_path, "example.com", "test@example.com",
+                          "pw", confirmed=False, login_verified=None)
+        cred_file = tmp_path / "credentials" / "example.com.json"
+        data = json.loads(cred_file.read_text())
+        assert data["login_verified"] is None
+
+    def test_saves_login_verified_default_none(self, tmp_path: Path):
+        """When login_verified is not passed, it defaults to None."""
+        from ai_browser.cli import _save_credentials
+        import json
+
+        _save_credentials(tmp_path, "example.com", "test@example.com",
+                          "pw", confirmed=True)
+        cred_file = tmp_path / "credentials" / "example.com.json"
+        data = json.loads(cred_file.read_text())
+        assert data["login_verified"] is None
+
+
+# ---------------------------------------------------------------------------
+# Tests for post-submit page-state logging (diagnostic only)
+# ---------------------------------------------------------------------------
+
+
+class TestGetVisiblePageText:
+    """Test the _get_visible_page_text diagnostic helper."""
+
+    @pytest.mark.asyncio
+    async def test_returns_page_text(self):
+        handler = TestGetEmailBodyText._handler()
+        page = AsyncMock()
+        page.inner_text = AsyncMock(return_value="Welcome back! Your code was accepted.")
+        text = await handler._get_visible_page_text(page)
+        assert text == "Welcome back! Your code was accepted."
+
+    @pytest.mark.asyncio
+    async def test_returns_empty_on_error(self):
+        handler = TestGetEmailBodyText._handler()
+        page = AsyncMock()
+        page.inner_text = AsyncMock(side_effect=RuntimeError("no body"))
+        text = await handler._get_visible_page_text(page)
+        assert text == ""
+
+
+class TestDetectErrorText:
+    """Test the _detect_error_text diagnostic helper."""
+
+    def test_finds_error_phrase(self):
+        from ai_browser.registration_handler.handler import _detect_error_text
+        text = "Invalid code, please try again."
+        result = _detect_error_text(text)
+        assert result == "invalid code", f"Expected 'invalid code', got {result!r}"
+
+    def test_finds_another_error_phrase(self):
+        from ai_browser.registration_handler.handler import _detect_error_text
+        text = "The verification code has expired. Please request a new one."
+        result = _detect_error_text(text)
+        assert result == "code has expired"
+
+    def test_returns_none_for_success_text(self):
+        from ai_browser.registration_handler.handler import _detect_error_text
+        text = "Welcome! Your account has been verified."
+        result = _detect_error_text(text)
+        assert result is None
+
+    def test_case_insensitive(self):
+        from ai_browser.registration_handler.handler import _detect_error_text
+        text = "INVALID verification, please contact support."
+        result = _detect_error_text(text)
+        assert result == "invalid verification"
+
+
+class TestSubmitVerificationCodeLogging:
+    """Test that _submit_verification_code logs post-submit state."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.asyncio
+    async def test_logs_navigation_true_when_url_changes(self, caplog):
+        handler = TestGetEmailBodyText._handler()
+        from unittest.mock import patch
+
+        page = AsyncMock()
+        page.url = "https://example.com/verify"
+        page.inner_text = AsyncMock(return_value="Welcome")
+        page.wait_for_load_state = AsyncMock()
+
+        # submit_form updates page.url to simulate navigation
+        async def _submit_and_navigate(*_a, **_kw):
+            page.url = "https://example.com/dashboard"
+
+        with patch("ai_browser.registration_handler.handler.fill_form_fields",
+                   AsyncMock(return_value=["code"])), \
+             patch("ai_browser.registration_handler.handler.submit_form",
+                   AsyncMock(side_effect=_submit_and_navigate)):
+            with caplog.at_level(logging.INFO):
+                await handler._submit_verification_code(page, "ABC123")
+
+        navigated_logs = [r for r in caplog.records
+                          if "Post-submit page state" in r.message]
+        assert len(navigated_logs) >= 1
+        assert "navigated=True" in navigated_logs[0].message
+
+
+    @pytest.mark.asyncio
+    async def test_logs_error_when_page_shows_rejection(self, caplog):
+        handler = TestGetEmailBodyText._handler()
+        page = AsyncMock()
+        page.url = "https://example.com/verify"
+        page.inner_text = AsyncMock(
+            return_value="Invalid code, please try again."
+        )
+        page.wait_for_load_state = AsyncMock()
+
+        from unittest.mock import patch
+        with patch("ai_browser.registration_handler.handler.fill_form_fields",
+                   AsyncMock(return_value=["code"])), \
+             patch("ai_browser.registration_handler.handler.submit_form",
+                   AsyncMock()):
+            with caplog.at_level(logging.WARNING):
+                await handler._submit_verification_code(page, "WRONG")
+
+        error_logs = [r for r in caplog.records
+                      if "error/rejection" in r.message]
+        assert len(error_logs) >= 1
+        assert "invalid code" in error_logs[0].message
+
+    @pytest.mark.asyncio
+    async def test_returns_true_in_all_cases(self):
+        """Even with error text, _submit_verification_code still returns
+        True — logging is diagnostic only, no control flow change."""
+        from unittest.mock import patch
+
+        for body_text, label in [
+            ("Welcome!", "success"),
+            ("Invalid code, please try again.", "error"),
+            ("", "empty"),
+        ]:
+            handler = TestGetEmailBodyText._handler()
+            page = AsyncMock()
+            page.url = "https://example.com/verify"
+            page.inner_text = AsyncMock(return_value=body_text)
+            page.wait_for_load_state = AsyncMock()
+
+            with patch("ai_browser.registration_handler.handler.fill_form_fields",
+                       AsyncMock(return_value=["code"])), \
+                 patch("ai_browser.registration_handler.handler.submit_form",
+                       AsyncMock()):
+                result = await handler._submit_verification_code(page, "ABC")
+            assert result is True, (
+                f"Expected True for {label} case, got {result}"
+            )
