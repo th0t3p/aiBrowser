@@ -242,11 +242,16 @@ async def _ai_extract_verification_code(
             max_tokens=20,
         )
         if not response:
-            logger.debug("AI code extraction call failed or empty")
+            logger.warning(
+                "AI code extraction: call failed or returned empty response"
+            )
             return None
 
         candidate = response.strip().strip("\"'` \n")
         if not candidate or candidate.upper() == "NONE":
+            logger.info(
+                "AI code extraction: model reported no code present in this email"
+            )
             return None
 
         # Guardrail, not a primary extraction mechanism: reject anything
@@ -255,14 +260,16 @@ async def _ai_extract_verification_code(
         # target's form.
         if not re.fullmatch(r"[A-Za-z0-9\-]{3,12}", candidate):
             logger.warning(
-                "AI code extraction returned something that doesn't "
-                "look like a code, discarding: %r", candidate,
+                "AI code extraction: response doesn't look like a code, "
+                "discarding: %r", candidate,
             )
             return None
 
         return candidate
     except Exception as exc:
-        logger.debug("AI code extraction error: %s", exc)
+        logger.warning(
+            "AI code extraction: error calling LLM: %s", exc
+        )
         return None
 
 
@@ -1137,9 +1144,14 @@ class RegistrationHandler:
                 )
                 if code:
                     return ("code", code)
-                link = _extract_link_from_body(body_text, target_domain)
-                if link:
-                    return ("link", link)
+                # Same reasoning as in _extract_link_from_email — the
+                # page has already told us what kind of confirmation this
+                # is. Don't fall back to link extraction; let the caller
+                # retry instead of committing to the wrong action.
+                logger.info(
+                    "Tier 3: page expects a code but none could be "
+                    "extracted — returning None so the poll loop can retry"
+                )
                 return None
             # Try link first, then code
             link = _extract_link_from_body(body_text, target_domain)
@@ -1229,9 +1241,17 @@ class RegistrationHandler:
             )
             if code:
                 return ("code", code)
-            link = _extract_link_from_body(body_text, target_domain)
-            if link:
-                return ("link", link)
+            # Do NOT fall back to link extraction here — the page has
+            # already told us (via a visible code-entry field) what kind
+            # of confirmation this is. A link found via regex against the
+            # same email is not a substitute action; returning None lets
+            # the existing poll loop retry on the next iteration instead
+            # of committing to the wrong kind of action.
+            logger.info(
+                "Page expects a code but none could be extracted from "
+                "this candidate email — will retry on next poll "
+                "iteration rather than falling back to link extraction"
+            )
             return None
 
         # Default: link first (existing behavior for link-based flows)

@@ -1778,9 +1778,10 @@ class TestExtractionPriorityFlip:
         assert result == ("code", "XYZ789")
 
     @pytest.mark.asyncio
-    async def test_prefer_code_falls_back_to_link(self, monkeypatch):
-        """When _page_expects_code is set but email has only a link, the
-        link is still returned."""
+    async def test_prefer_code_no_fallback_to_link(self, monkeypatch):
+        """When _page_expects_code is set but no code can be extracted,
+        the function returns None — it does NOT fall back to link
+        extraction, since a link is not a substitute for a typed code."""
         from unittest.mock import AsyncMock
         handler = TestGetEmailBodyText._handler()
         handler._page_expects_code = True
@@ -1790,7 +1791,7 @@ class TestExtractionPriorityFlip:
         )
         msg = _make_email(html_body="""<a href="https://target.com/confirm?token=abc">Confirm</a>""")
         result = await handler._extract_link_from_email(msg, "target.com")
-        assert result == ("link", "https://target.com/confirm?token=abc")
+        assert result is None
 
     @pytest.mark.asyncio
     async def test_default_link_first_no_code_field(self, monkeypatch):
@@ -2222,3 +2223,132 @@ class TestSubmitVerificationCodeLogging:
             assert result is True, (
                 f"Expected True for {label} case, got {result}"
             )
+
+
+class TestNoLinkFallbackWhenPageExpectsCode:
+    """Verify that link extraction is NOT used as a fallback when the
+    page has a visible code-entry field."""
+
+    @pytest.mark.asyncio
+    async def test_extract_link_from_email_no_link_fallback(self, monkeypatch):
+        """_page_expects_code=True, AI returns None → returns None overall,
+        _extract_link_from_body is never called."""
+        from unittest.mock import AsyncMock, patch
+        handler = TestGetEmailBodyText._handler()
+        handler._page_expects_code = True
+
+        # Mock AI to return no code
+        monkeypatch.setattr(
+            "ai_browser.registration_handler.handler._ai_extract_verification_code",
+            AsyncMock(return_value=None),
+        )
+
+        # Spy on link extraction
+        with patch("ai_browser.registration_handler.handler._extract_link_from_body",
+                   wraps=lambda body, domain=None: "https://example.com/confirm") as mock_link:
+            msg = _make_email(html_body="""<a href="https://example.com/confirm">Confirm</a>""")
+            result = await handler._extract_link_from_email(msg, "example.com")
+
+        assert result is None, "Should return None, not fall back to link"
+        mock_link.assert_not_called(), (
+            "_extract_link_from_body should NOT be called when page expects code"
+        )
+
+    @pytest.mark.asyncio
+    async def test_default_branch_still_calls_link_first(self, monkeypatch):
+        """_page_expects_code=False (default), link extraction still
+        works normally — this branch is unchanged."""
+        from unittest.mock import AsyncMock, patch
+        handler = TestGetEmailBodyText._handler()
+        # _page_expects_code not set — defaults to False
+
+        monkeypatch.setattr(
+            "ai_browser.registration_handler.handler._ai_extract_verification_code",
+            AsyncMock(return_value=None),
+        )
+
+        with patch("ai_browser.registration_handler.handler._extract_link_from_body",
+                   wraps=lambda body, domain=None: "https://example.com/confirm") as mock_link:
+            msg = _make_email(html_body="""<a href="https://example.com/confirm">Confirm</a>""")
+            result = await handler._extract_link_from_email(msg, "example.com")
+
+        assert result == ("link", "https://example.com/confirm")
+        mock_link.assert_called(), (
+            "Default branch should still call link extraction first"
+        )
+
+
+class TestAIExtractionLogLevels:
+    """Verify _ai_extract_verification_code logs at WARNING/INFO, not DEBUG."""
+
+    @pytest.mark.asyncio
+    async def test_empty_response_logs_warning(self, monkeypatch, caplog):
+        from unittest.mock import AsyncMock
+        from ai_browser.registration_handler.handler import _ai_extract_verification_code
+        monkeypatch.setattr(
+            "ai_browser.registration_handler.handler.call_llm",
+            AsyncMock(return_value=""),
+        )
+        with caplog.at_level("WARNING"):
+            result = await _ai_extract_verification_code(
+                body_text="dummy",
+                llm_provider="x", llm_api_key="x", llm_model="x",
+            )
+        assert result is None
+        warnings = [r for r in caplog.records
+                    if "call failed" in r.message or "empty response" in r.message]
+        assert len(warnings) >= 1, f"Should log WARNING on empty response, got {caplog.records}"
+
+    @pytest.mark.asyncio
+    async def test_none_response_logs_info(self, monkeypatch, caplog):
+        from unittest.mock import AsyncMock
+        from ai_browser.registration_handler.handler import _ai_extract_verification_code
+        monkeypatch.setattr(
+            "ai_browser.registration_handler.handler.call_llm",
+            AsyncMock(return_value="NONE"),
+        )
+        with caplog.at_level("INFO"):
+            result = await _ai_extract_verification_code(
+                body_text="dummy",
+                llm_provider="x", llm_api_key="x", llm_model="x",
+            )
+        assert result is None
+        info_logs = [r for r in caplog.records
+                     if "no code present" in r.message]
+        assert len(info_logs) >= 1
+
+    @pytest.mark.asyncio
+    async def test_guardrail_reject_logs_warning(self, monkeypatch, caplog):
+        from unittest.mock import AsyncMock
+        from ai_browser.registration_handler.handler import _ai_extract_verification_code
+        monkeypatch.setattr(
+            "ai_browser.registration_handler.handler.call_llm",
+            AsyncMock(return_value="Your verification code is 97VJ5D"),
+        )
+        with caplog.at_level("WARNING"):
+            result = await _ai_extract_verification_code(
+                body_text="dummy",
+                llm_provider="x", llm_api_key="x", llm_model="x",
+            )
+        assert result is None
+        warnings = [r for r in caplog.records
+                    if "doesn't look like a code" in r.message]
+        assert len(warnings) >= 1, f"Should log WARNING on guardrail reject"
+
+    @pytest.mark.asyncio
+    async def test_exception_logs_warning(self, monkeypatch, caplog):
+        from unittest.mock import AsyncMock
+        from ai_browser.registration_handler.handler import _ai_extract_verification_code
+        monkeypatch.setattr(
+            "ai_browser.registration_handler.handler.call_llm",
+            AsyncMock(side_effect=RuntimeError("network error")),
+        )
+        with caplog.at_level("WARNING"):
+            result = await _ai_extract_verification_code(
+                body_text="dummy",
+                llm_provider="x", llm_api_key="x", llm_model="x",
+            )
+        assert result is None
+        warnings = [r for r in caplog.records
+                    if "error calling LLM" in r.message]
+        assert len(warnings) >= 1
