@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import email
 import email.utils
+import json
 import logging
 import re
 from datetime import datetime
@@ -17,7 +18,6 @@ from playwright.async_api import Page
 
 from ai_browser.browser_session import BrowserSession
 from ai_browser._form_helpers import fill_form_fields, submit_form, check_captcha
-from ai_browser._form_helpers import _escape_css_string
 from ai_browser._llm_client import call_llm
 
 from .models import CaptchaDetected, DisposableInboxConfig, IMAPConfig, RegistrationConfig
@@ -126,13 +126,148 @@ def _same_registrable_domain(a: str, b: str) -> bool:
         return False
 
 
-# Shared list of field names for code/OTP/PIN inputs — used by both
-# _page_expects_code_check (read-only check) and _submit_verification_code
-# (fill + submit).  Keep in sync if either is updated.
-_CODE_FIELD_NAMES = [
-    "code", "otp", "pin", "verification_code",
-    "confirmation_code", "verificationCode",
-]
+async def _collect_visible_inputs(page: Page) -> tuple[list, list[dict]]:
+    """Return (element_handles, descriptions) for every visible <input>
+    on the page, in DOM order. Purely descriptive — no filtering by
+    purpose, no assumptions about which inputs matter. The AI decides
+    that; this just gathers facts.
+    """
+    elements = await page.query_selector_all("input")
+    handles = []
+    descriptions = []
+    for el in elements:
+        try:
+            if not await el.is_visible():
+                continue
+        except Exception:
+            continue
+        handles.append(el)
+        descriptions.append({
+            "index": len(handles) - 1,
+            "type": await el.get_attribute("type") or "",
+            "name": await el.get_attribute("name") or "",
+            "id": await el.get_attribute("id") or "",
+            "placeholder": await el.get_attribute("placeholder") or "",
+            "maxlength": await el.get_attribute("maxlength") or "",
+            "aria_label": await el.get_attribute("aria-label") or "",
+            "class": (await el.get_attribute("class") or "")[:100],
+        })
+    return handles, descriptions
+
+
+async def _ai_plan_code_input_fill(
+    *,
+    descriptions: list[dict],
+    code: str,
+    llm_provider: str,
+    llm_api_key: str,
+    llm_model: str,
+    llm_base_url: Optional[str] = None,
+) -> Optional[list[dict]]:
+    """Ask the AI how a verification code should be distributed across
+    the visible input elements on the page. Returns a list of
+    {"index": int, "value": str} assignments (possibly a single entry
+    covering the whole code, or one entry per box for a split-digit
+    UI), or None if no plan could be determined.
+
+    Fails closed: any error, empty/unparseable response, or a response
+    that fails validation against the actual candidate list and code
+    returns None — the caller should treat this the same as 'no code
+    field found', not attempt a best-guess fallback that might type the
+    code into the wrong place on a live target.
+    """
+    try:
+        messages = [{
+            "role": "user",
+            "content": (
+                f"A web form needs a verification code entered: {code}\n\n"
+                "Below is a JSON list of visible <input> elements "
+                "currently on the page, described by their attributes "
+                "(not their live content — these are empty form "
+                "fields). Some may be unrelated to the code (email, "
+                "name, search boxes, etc.) — ignore those entirely.\n\n"
+                "Decide how the code should be entered:\n"
+                "- If ONE input is clearly the code field, it should "
+                "receive the whole code.\n"
+                "- If SEVERAL inputs together form a split-digit/split-"
+                "character code entry (e.g. maxlength of 1, sequential "
+                "naming, or simply several small inputs grouped "
+                "together with no other plausible purpose), each "
+                "should receive one character, in left-to-right/DOM "
+                "order, together spelling out the full code.\n"
+                "- If none of these inputs look like the right place "
+                "for this code, say so.\n\n"
+                f"Inputs:\n{json.dumps(descriptions, indent=2)}\n\n"
+                "Respond with ONLY a JSON array, nothing else — no "
+                "explanation, no markdown code fences. Each element: "
+                '{"index": <int from the list above>, "value": '
+                '"<exact substring of the code for this input>"}. '
+                "If no inputs are appropriate, respond with exactly: []"
+            ),
+        }]
+        response = await call_llm(
+            provider=llm_provider,
+            api_key=llm_api_key,
+            model=llm_model,
+            base_url=llm_base_url,
+            messages=messages,
+        )
+        if not response:
+            logger.warning(
+                "AI code-input planning: call failed or returned empty response"
+            )
+            return None
+
+        text = response.strip()
+        if text.startswith("```"):
+            text = text.strip("`").lstrip("json").strip()
+
+        try:
+            plan = json.loads(text)
+        except Exception:
+            logger.warning(
+                "AI code-input planning: response wasn't valid JSON: %r",
+                text[:200],
+            )
+            return None
+
+        if not isinstance(plan, list):
+            logger.warning(
+                "AI code-input planning: response wasn't a JSON array: %r",
+                text[:200],
+            )
+            return None
+        if not plan:
+            logger.info(
+                "AI code-input planning: model found no appropriate "
+                "input for this code"
+            )
+            return None
+
+        valid_indices = {d["index"] for d in descriptions}
+        validated = []
+        for item in plan:
+            if not isinstance(item, dict):
+                continue
+            idx = item.get("index")
+            value = item.get("value", "")
+            if (
+                idx not in valid_indices
+                or not isinstance(value, str)
+                or not value
+                or value not in code
+            ):
+                logger.warning(
+                    "AI code-input planning: discarding invalid "
+                    "assignment %r", item,
+                )
+                continue
+            validated.append({"index": idx, "value": value})
+
+        return validated if validated else None
+    except Exception as exc:
+        logger.warning("AI code-input planning: error calling LLM: %s", exc)
+        return None
 
 # Diagnostic-only error phrases for post-submit page text — logged as a
 # hint for the operator but never used to drive control flow (keyword-
@@ -555,41 +690,85 @@ class RegistrationHandler:
         await submit_form(page, extra_selectors=signup_selectors)
 
     async def _page_expects_code_check(self, page: Page) -> bool:
-        """True if the current page has a visible field matching known
-        code/OTP/PIN input names — a *before-the-fact* check (no filling),
-        used to decide extraction priority before ever looking at the email.
+        """True if the page's visible inputs look to the AI like they
+        expect a verification code/PIN/OTP — a *before-the-fact* check
+        (no filling), used to decide extraction priority before ever
+        looking at the email.
         """
-        for name in _CODE_FIELD_NAMES:
-            try:
-                escaped = _escape_css_string(name)
-                field = await page.query_selector(
-                    f"input[name='{escaped}'], input[id='{escaped}'], "
-                    f"input[placeholder*='{_escape_css_string(name.replace('_', ' '))}' i]"
-                )
-                if field and await field.is_visible():
-                    return True
-            except Exception:
-                continue
-        return False
+        _, descriptions = await _collect_visible_inputs(page)
+        if not descriptions:
+            return False
+        try:
+            messages = [{
+                "role": "user",
+                "content": (
+                    "Below is a JSON list of visible <input> elements on a "
+                    "web page, described by their attributes.\n\n"
+                    f"{json.dumps(descriptions, indent=2)}\n\n"
+                    "Does this look like a page asking the user to enter a "
+                    "verification code, PIN, or OTP (whether as one field "
+                    "or several small boxes forming one code together)? "
+                    "Answer with exactly one word: YES or NO."
+                ),
+            }]
+            response = await call_llm(
+                provider=self.config.llm_provider,
+                api_key=self.config.llm_api_key,
+                model=self.config.llm_model,
+                base_url=self.config.llm_base_url or None,
+                messages=messages,
+            )
+            return bool(response) and "yes" in response.strip().lower()
+        except Exception as exc:
+            logger.debug("Page-expects-code AI check failed: %s", exc)
+            return False
 
     async def _submit_verification_code(self, page: Page, code: str) -> bool:
         """Fill a verification code into the page and submit the form.
 
-        Returns True if a code field was found and filled, False otherwise.
+        Uses AI to decide how to distribute the code across visible
+        inputs — handles single-field, split-digit boxes, and custom
+        widgets without any hardcoded assumptions about markup.
         """
-        filled = await fill_form_fields(page, [
-            (_CODE_FIELD_NAMES, code),
-        ])
-        if not filled:
+        handles, descriptions = await _collect_visible_inputs(page)
+        if not descriptions:
             logger.info(
-                "Verification code %s was extracted but no matching code-entry "
-                "field was found on the page — the verification page may use "
-                "separate single-digit inputs or a custom widget",
-                code,
+                "No visible input fields found on the page to fill "
+                "the code into"
             )
             return False
 
-        logger.info("Filled verification code field; submitting...")
+        plan = await _ai_plan_code_input_fill(
+            descriptions=descriptions,
+            code=code,
+            llm_provider=self.config.llm_provider,
+            llm_api_key=self.config.llm_api_key,
+            llm_model=self.config.llm_model,
+            llm_base_url=self.config.llm_base_url or None,
+        )
+        if not plan:
+            logger.info(
+                "AI could not determine how to enter the code %s into "
+                "any field on this page", code,
+            )
+            return False
+
+        for assignment in plan:
+            el = handles[assignment["index"]]
+            try:
+                await el.click()
+                await el.press_sequentially(assignment["value"])
+            except Exception as exc:
+                logger.warning(
+                    "Failed to fill input at index %d: %s",
+                    assignment["index"], exc,
+                )
+                return False
+
+        logger.info(
+            "Filled code across %d input(s) per AI plan; submitting...",
+            len(plan),
+        )
         verify_selectors = [
             "button:has-text('Verify')",
             "button:has-text('Confirm')",

@@ -1786,46 +1786,62 @@ class TestBytesMessageIDFix:
 
 
 class TestPageExpectsCodeCheck:
-    """Verify _page_expects_code_check detects visible code fields."""
+    """Verify _page_expects_code_check uses AI to detect code fields."""
 
     @pytest.mark.asyncio
-    async def test_visible_code_field_returns_true(self):
-        """Page with a visible input[name=code] → True."""
-        from unittest.mock import AsyncMock, MagicMock
+    async def test_ai_says_yes_returns_true(self):
+        """AI says page expects code → True."""
+        from unittest.mock import AsyncMock, MagicMock, patch
 
         handler = RegistrationHandler(
             RegistrationConfig(
                 signup_url="https://target.com/signup",
                 email="test@target.com",
+                llm_api_key="test-key",
             )
         )
         page = AsyncMock()
-        mock_field = MagicMock()
-        mock_field.is_visible = AsyncMock(return_value=True)
-        page.query_selector = AsyncMock(return_value=mock_field)
 
-        result = await handler._page_expects_code_check(page)
+        desc = [{"index": 0, "type": "text", "name": "code", "id": "", "placeholder": "", "maxlength": "", "aria_label": "", "class": ""}]
+        with patch(
+            "ai_browser.registration_handler.handler._collect_visible_inputs",
+            AsyncMock(return_value=([MagicMock()], desc)),
+        ), patch(
+            "ai_browser.registration_handler.handler.call_llm",
+            AsyncMock(return_value="YES"),
+        ):
+            result = await handler._page_expects_code_check(page)
         assert result is True
 
     @pytest.mark.asyncio
-    async def test_no_matching_field_returns_false(self):
-        from unittest.mock import AsyncMock
+    async def test_ai_says_no_returns_false(self):
+        """AI says page doesn't expect code → False."""
+        from unittest.mock import AsyncMock, MagicMock, patch
 
         handler = RegistrationHandler(
             RegistrationConfig(
                 signup_url="https://target.com/signup",
                 email="test@target.com",
+                llm_api_key="test-key",
             )
         )
         page = AsyncMock()
-        page.query_selector = AsyncMock(return_value=None)
 
-        result = await handler._page_expects_code_check(page)
+        desc = [{"index": 0, "type": "text", "name": "search", "id": "", "placeholder": "Search...", "maxlength": "", "aria_label": "", "class": ""}]
+        with patch(
+            "ai_browser.registration_handler.handler._collect_visible_inputs",
+            AsyncMock(return_value=([MagicMock()], desc)),
+        ), patch(
+            "ai_browser.registration_handler.handler.call_llm",
+            AsyncMock(return_value="NO"),
+        ):
+            result = await handler._page_expects_code_check(page)
         assert result is False
 
     @pytest.mark.asyncio
-    async def test_invisible_field_returns_false(self):
-        from unittest.mock import AsyncMock, MagicMock
+    async def test_no_visible_inputs_returns_false(self):
+        """No visible inputs on page → False (no AI call needed)."""
+        from unittest.mock import AsyncMock, patch
 
         handler = RegistrationHandler(
             RegistrationConfig(
@@ -1834,11 +1850,12 @@ class TestPageExpectsCodeCheck:
             )
         )
         page = AsyncMock()
-        mock_field = MagicMock()
-        mock_field.is_visible = AsyncMock(return_value=False)
-        page.query_selector = AsyncMock(return_value=mock_field)
 
-        result = await handler._page_expects_code_check(page)
+        with patch(
+            "ai_browser.registration_handler.handler._collect_visible_inputs",
+            AsyncMock(return_value=([], [])),
+        ):
+            result = await handler._page_expects_code_check(page)
         assert result is False
 
 
@@ -2232,7 +2249,14 @@ class TestDetectErrorText:
 class TestSubmitVerificationCodeLogging:
     """Test that _submit_verification_code logs post-submit state."""
 
-    @pytest.mark.asyncio
+    @staticmethod
+    def _make_handle():
+        """Return a MagicMock with click() and press_sequentially() set up."""
+        h = MagicMock()
+        h.click = AsyncMock()
+        h.press_sequentially = AsyncMock()
+        return h
+
     @pytest.mark.asyncio
     async def test_logs_navigation_true_when_url_changes(self, caplog):
         handler = TestGetEmailBodyText._handler()
@@ -2243,14 +2267,25 @@ class TestSubmitVerificationCodeLogging:
         page.inner_text = AsyncMock(return_value="Welcome")
         page.wait_for_load_state = AsyncMock()
 
+        handle = self._make_handle()
+        desc = [{"index": 0, "type": "text", "name": "code", "id": "",
+                 "placeholder": "", "maxlength": "", "aria_label": "",
+                 "class": ""}]
+
         # submit_form updates page.url to simulate navigation
         async def _submit_and_navigate(*_a, **_kw):
             page.url = "https://example.com/dashboard"
 
-        with patch("ai_browser.registration_handler.handler.fill_form_fields",
-                   AsyncMock(return_value=["code"])), \
-             patch("ai_browser.registration_handler.handler.submit_form",
-                   AsyncMock(side_effect=_submit_and_navigate)):
+        with patch(
+            "ai_browser.registration_handler.handler._collect_visible_inputs",
+            AsyncMock(return_value=([handle], desc)),
+        ), patch(
+            "ai_browser.registration_handler.handler._ai_plan_code_input_fill",
+            AsyncMock(return_value=[{"index": 0, "value": "ABC"}]),
+        ), patch(
+            "ai_browser.registration_handler.handler.submit_form",
+            AsyncMock(side_effect=_submit_and_navigate),
+        ):
             with caplog.at_level(logging.INFO):
                 await handler._submit_verification_code(page, "ABC123")
 
@@ -2258,7 +2293,6 @@ class TestSubmitVerificationCodeLogging:
                           if "Post-submit page state" in r.message]
         assert len(navigated_logs) >= 1
         assert "navigated=True" in navigated_logs[0].message
-
 
     @pytest.mark.asyncio
     async def test_logs_error_when_page_shows_rejection(self, caplog):
@@ -2270,11 +2304,22 @@ class TestSubmitVerificationCodeLogging:
         )
         page.wait_for_load_state = AsyncMock()
 
+        handle = self._make_handle()
+        desc = [{"index": 0, "type": "text", "name": "code", "id": "",
+                 "placeholder": "", "maxlength": "", "aria_label": "",
+                 "class": ""}]
+
         from unittest.mock import patch
-        with patch("ai_browser.registration_handler.handler.fill_form_fields",
-                   AsyncMock(return_value=["code"])), \
-             patch("ai_browser.registration_handler.handler.submit_form",
-                   AsyncMock()):
+        with patch(
+            "ai_browser.registration_handler.handler._collect_visible_inputs",
+            AsyncMock(return_value=([handle], desc)),
+        ), patch(
+            "ai_browser.registration_handler.handler._ai_plan_code_input_fill",
+            AsyncMock(return_value=[{"index": 0, "value": "WRONG"}]),
+        ), patch(
+            "ai_browser.registration_handler.handler.submit_form",
+            AsyncMock(),
+        ):
             with caplog.at_level(logging.WARNING):
                 await handler._submit_verification_code(page, "WRONG")
 
@@ -2300,10 +2345,21 @@ class TestSubmitVerificationCodeLogging:
             page.inner_text = AsyncMock(return_value=body_text)
             page.wait_for_load_state = AsyncMock()
 
-            with patch("ai_browser.registration_handler.handler.fill_form_fields",
-                       AsyncMock(return_value=["code"])), \
-                 patch("ai_browser.registration_handler.handler.submit_form",
-                       AsyncMock()):
+            handle = self._make_handle()
+            desc = [{"index": 0, "type": "text", "name": "code", "id": "",
+                     "placeholder": "", "maxlength": "", "aria_label": "",
+                     "class": ""}]
+
+            with patch(
+                "ai_browser.registration_handler.handler._collect_visible_inputs",
+                AsyncMock(return_value=([handle], desc)),
+            ), patch(
+                "ai_browser.registration_handler.handler._ai_plan_code_input_fill",
+                AsyncMock(return_value=[{"index": 0, "value": "ABC"}]),
+            ), patch(
+                "ai_browser.registration_handler.handler.submit_form",
+                AsyncMock(),
+            ):
                 result = await handler._submit_verification_code(page, "ABC")
             assert result is True, (
                 f"Expected True for {label} case, got {result}"
