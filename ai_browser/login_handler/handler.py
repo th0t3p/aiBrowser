@@ -216,7 +216,6 @@ class LoginHandler:
                 model=self.config.llm_model,
                 base_url=self.config.llm_base_url or None,
                 messages=messages,
-                max_tokens=10,
             )
             if not response:
                 return None  # fail open

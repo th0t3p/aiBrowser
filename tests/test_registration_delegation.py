@@ -433,47 +433,14 @@ class TestDisposableInboxModelValidation:
 
 
 class TestExtractLinkFromBodyRefactor:
-    """Test that _extract_link_from_body (shared core) produces same results
-    as the original _extract_link_from_email (IMAP path)."""
+    """REMOVED: _extract_link_from_body replaced by
+    _ai_extract_confirmation_action. See TestAIConfirmationAction
+    in test_email_handling.py for replacement coverage."""
 
-    def test_confirm_link_prioritized(self):
-        from ai_browser.registration_handler.handler import _extract_link_from_body
-        body = (
-            '<a href="https://target.com/logo.png">Logo</a>\n'
-            '<a href="https://target.com/confirm?token=abc">Confirm</a>'
-        )
-        result = _extract_link_from_body(body, "target.com")
-        assert result == "https://target.com/confirm?token=abc"
-
-    def test_verify_link_prioritized(self):
-        from ai_browser.registration_handler.handler import _extract_link_from_body
-        body = (
-            '<a href="https://target.com/verify-email?id=123">Verify</a>'
-        )
-        result = _extract_link_from_body(body)
-        assert "verify" in result
-
-    def test_asset_links_skipped(self):
-        from ai_browser.registration_handler.handler import _extract_link_from_body
-        body = '<a href="https://target.com/logo.png">Logo</a>\n<a href="https://target.com/page">Page</a>'
-        result = _extract_link_from_body(body)
-        assert result == "https://target.com/page"
-
-    def test_same_domain_fallback(self):
-        from ai_browser.registration_handler.handler import _extract_link_from_body
-        body = (
-            '<a href="https://other.com/page">Other</a>\n'
-            '<a href="https://target.com/welcome">Welcome</a>'
-        )
-        result = _extract_link_from_body(body, "target.com")
-        assert result == "https://target.com/welcome"
-
-    def test_empty_body_returns_none(self):
-        from ai_browser.registration_handler.handler import _extract_link_from_body
-        assert _extract_link_from_body("") is None
-        assert _extract_link_from_body("   ") is None
-
-
+    def test_removed_function_no_longer_exists(self):
+        import pytest
+        with pytest.raises(ImportError):
+            from ai_browser.registration_handler.handler import _extract_link_from_body
 class TestDisposableInboxMockIntegration:
     """Test handler integration with mocked disposable inbox."""
 

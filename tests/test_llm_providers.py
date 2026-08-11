@@ -586,9 +586,9 @@ class TestMaxTokensConfig:
             assert call_body["max_tokens"] == 4096
 
     @pytest.mark.asyncio
-    async def test_openai_omits_max_tokens_when_none(self):
-        """When llm_max_tokens is None, _call_openai_compatible omits
-        the max_tokens key entirely from the request body."""
+    async def test_openai_falls_back_to_default_when_none(self):
+        """When llm_max_tokens is None, _call_openai_compatible uses the
+        shared DEFAULT_MAX_TOKENS (4096) instead of omitting."""
         explorer = AgentExplorer(
             self._make_config(llm_max_tokens=None)
         )
@@ -603,7 +603,8 @@ class TestMaxTokensConfig:
                 "openai", "key", "gpt-4o", None, [{"role": "user", "content": "test"}]
             )
             call_body = mock_post.call_args[1]["json"]
-            assert "max_tokens" not in call_body
+            from ai_browser._llm_client import DEFAULT_MAX_TOKENS
+            assert call_body["max_tokens"] == DEFAULT_MAX_TOKENS
 
     @pytest.mark.asyncio
     async def test_explicit_value_still_works_for_openai(self):

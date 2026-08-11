@@ -92,8 +92,7 @@ async def wait_for_confirmation_link(
     base = config.base_url or _AGENTMAIL_DEFAULT_BASE
 
     from ai_browser.registration_handler.handler import (
-        _extract_link_from_body,
-        _ai_extract_verification_code,
+        _ai_extract_confirmation_action,
         _ai_judge_is_registration_email_text,
     )
 
@@ -161,20 +160,21 @@ async def wait_for_confirmation_link(
                             pass
 
                 if body_text:
-                    link = _extract_link_from_body(body_text, target_domain)
-                    if link:
-                        logger.info("Confirmation link found via disposable inbox: %s", link)
-                        return ("link", link)
-                    code = await _ai_extract_verification_code(
+                    result = await _ai_extract_confirmation_action(
                         body_text=body_text,
+                        target_domain=target_domain,
+                        page_expects_code=False,
                         llm_provider=llm_provider,
                         llm_api_key=llm_api_key,
                         llm_model=llm_model,
                         llm_base_url=llm_base_url,
                     )
-                    if code:
-                        logger.info("Verification code found via disposable inbox: %s", code)
-                        return ("code", code)
+                    if result:
+                        logger.info(
+                            "Confirmation %s found via disposable inbox: %s",
+                            result[0], result[1],
+                        )
+                        return result
 
             await asyncio.sleep(poll_interval)
 
@@ -228,18 +228,17 @@ async def wait_for_confirmation_link(
                         "the registration email (from %s)",
                         most_recent.get("from", ""),
                     )
-                    link = _extract_link_from_body(body_text, target_domain)
-                    if link:
-                        return ("link", link)
-                    code = await _ai_extract_verification_code(
+                    result = await _ai_extract_confirmation_action(
                         body_text=body_text,
+                        target_domain=target_domain,
+                        page_expects_code=False,
                         llm_provider=llm_provider,
                         llm_api_key=llm_api_key,
                         llm_model=llm_model,
                         llm_base_url=llm_base_url,
                     )
-                    if code:
-                        return ("code", code)
+                    if result:
+                        return result
                     return None
 
     logger.warning("Timed out waiting for confirmation email in disposable inbox")

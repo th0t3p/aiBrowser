@@ -19,6 +19,7 @@ from ai_browser._scope import page_url_matches_any_scope, display_scope
 from ai_browser.registration_handler.models import CaptchaDetected
 from ai_browser._llm_client import _call_anthropic as _shared_call_anthropic
 from ai_browser._llm_client import _call_openai_compatible as _shared_call_openai
+from ai_browser._llm_client import DEFAULT_MAX_TOKENS
 
 from .models import (
     ActionType,
@@ -84,7 +85,7 @@ ACTION_SYSTEM_PROMPT = EXPLORER_SYSTEM_PROMPT  # alias for readability
 
 MAX_ACCESSIBILITY_YAML_CHARS = 8000  # max chars for aria_snapshot() YAML before truncation
 
-_ANTHROPIC_DEFAULT_MAX_TOKENS = 4096  # Anthropic API requires max_tokens on every request
+# max_tokens fallback uses the shared DEFAULT_MAX_TOKENS from _llm_client.py
 
 # Native tool definition for structured output.
 # Anthropic uses "input_schema"; OpenAI-compatible providers use "parameters".
@@ -727,7 +728,7 @@ class AgentExplorer:
             model=model,
             messages=messages,
             system_prompt=ACTION_SYSTEM_PROMPT,
-            max_tokens=self.config.llm_max_tokens or _ANTHROPIC_DEFAULT_MAX_TOKENS,
+            max_tokens=self.config.llm_max_tokens or DEFAULT_MAX_TOKENS,
             tools=[_ACTION_TOOL_ANTHROPIC],
             tool_choice={"type": "tool", "name": "take_action"},
             base_url=base_url,

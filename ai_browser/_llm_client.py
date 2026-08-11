@@ -11,7 +11,10 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
-_ANTHROPIC_DEFAULT_MAX_TOKENS = 4096
+DEFAULT_MAX_TOKENS = 4096  # generous universal ceiling — every caller in this
+                            # codebase should have ample room by default;
+                            # override per-call only if there's a specific
+                            # reason to constrain it further.
 
 
 async def _call_anthropic(
@@ -35,7 +38,7 @@ async def _call_anthropic(
     }
     body: dict = {
         "model": model,
-        "max_tokens": max_tokens or _ANTHROPIC_DEFAULT_MAX_TOKENS,
+        "max_tokens": max_tokens,
         "messages": messages,
     }
     if system_prompt:
@@ -89,9 +92,8 @@ async def _call_openai_compatible(
     body: dict = {
         "model": model,
         "messages": full_messages,
+        "max_tokens": max_tokens or DEFAULT_MAX_TOKENS,
     }
-    if max_tokens is not None:
-        body["max_tokens"] = max_tokens
     if tools:
         body["tools"] = tools
     if tool_choice:
@@ -125,6 +127,8 @@ async def call_llm(
     response object.  Returns ``None`` on any error — callers should always
     fail open.
     """
+    effective_max_tokens = max_tokens if max_tokens is not None else DEFAULT_MAX_TOKENS
+
     try:
         if provider == "anthropic":
             resp = await _call_anthropic(
@@ -132,7 +136,7 @@ async def call_llm(
                 model=model,
                 messages=messages,
                 system_prompt=system_prompt,
-                max_tokens=max_tokens,
+                max_tokens=effective_max_tokens,
                 base_url=base_url,
                 client=client,
             )
@@ -152,7 +156,7 @@ async def call_llm(
                 model=model,
                 messages=messages,
                 system_prompt=system_prompt,
-                max_tokens=max_tokens,
+                max_tokens=effective_max_tokens,
                 base_url=base_url,
                 client=client,
             )
@@ -160,8 +164,21 @@ async def call_llm(
             data = resp.json()
             choices = data.get("choices", [])
             if choices:
-                result = (choices[0].get("message", {}).get("content", "") or "").strip()
+                message = choices[0].get("message", {})
+                result = (message.get("content", "") or "").strip()
+                if not result:
+                    finish_reason = choices[0].get("finish_reason")
+                    other_keys = [k for k in message.keys() if k != "content"]
+                    logger.warning(
+                        "LLM call returned empty content — finish_reason=%s "
+                        "other_message_keys=%s usage=%s",
+                        finish_reason, other_keys, data.get("usage"),
+                    )
                 return result if result else None
+            logger.warning(
+                "LLM call: response had no 'choices' — raw keys: %s",
+                list(data.keys()),
+            )
             return None
 
         else:

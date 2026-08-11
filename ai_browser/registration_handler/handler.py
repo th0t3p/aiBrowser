@@ -150,87 +150,66 @@ def _looks_like_docs_page(path: str) -> bool:
     return bool(_DOCS_FALSE_POSITIVE_RE.search(path))
 
 
-def _extract_link_from_body(body_text: str, target_domain: str = "") -> Optional[str]:
-    """Extract a confirmation/verification link from plain text email body.
-
-    Priority order:
-    1. Links matching confirmation patterns (confirm, verify, activate, token=, code=)
-    2. Links whose hostname contains *target_domain*
-    3. First non-asset link in the body
-    4. None if no links are found
-
-    This is the shared core used by both IMAP (which extracts body_text from
-    a parsed email.message.Message first) and disposable-inbox (which gets
-    body text directly from the API response).
-    """
-    if not body_text:
-        return None
-
-    links = re.findall(r'https?://[^\s<>"\')\]]+', body_text)
-    if not links:
-        return None
-
-    clean_links = [link.rstrip(".,;:'") for link in links]
-
-    non_asset_links = [
-        link for link in clean_links
-        if not re.search(r'\.(png|jpg|jpeg|gif|svg|css|js)(\?|$)', link, re.IGNORECASE)
-    ]
-    if not non_asset_links:
-        return clean_links[0]
-
-    confirm_patterns = [r'confirm', r'verify', r'activate', r'token=', r'code=']
-    for link in non_asset_links:
-        if any(re.search(p, link, re.IGNORECASE) for p in confirm_patterns):
-            logger.debug("Found confirmation link: %s", link)
-            return link
-
-    if target_domain:
-        for link in non_asset_links:
-            parsed = urlparse(link)
-            if parsed.hostname and _same_registrable_domain(target_domain, parsed.hostname):
-                logger.debug("Found same-domain link: %s", link)
-                return link
-
-    return non_asset_links[0]
-
-
-async def _ai_extract_verification_code(
+async def _ai_extract_confirmation_action(
     *,
     body_text: str,
+    target_domain: str,
+    page_expects_code: bool,
     llm_provider: str,
     llm_api_key: str,
     llm_model: str,
     llm_base_url: Optional[str] = None,
-) -> Optional[str]:
-    """AI-based verification code/PIN extraction, replacing brittle regex
-    matching against free-form (and often HTML-formatted) email copy.
+) -> Optional[Tuple[str, str]]:
+    """AI-based extraction of the confirmation action from a registration/
+    verification email — replaces separate regex link-extraction and
+    AI code-extraction with a single read that decides which kind of
+    confirmation this is AND extracts the value.
 
-    Fails closed (returns None) on any error, empty response, model
-    reporting no code present, or a response that doesn't look like a
-    plausible code — a missed code just falls through to the existing
-    'no code found' handling and the poll loop retries next iteration;
-    a WRONG code gets submitted to the target's form, which is strictly
-    worse than finding nothing.
+    Returns ("code", value) or ("link", url), or None.
+
+    Fails closed: any error, empty response, or a response that doesn't
+    parse into one of the two expected forms returns None rather than
+    guessing — a missed extraction just means the poll loop retries next
+    iteration, but acting on a wrong guess (submitting a bogus code, or
+    navigating to an unrelated/tracking link) is a real, harder-to-undo
+    mistake against a live target.
     """
+    page_hint = (
+        "The site's own signup page currently shows a visible code/PIN "
+        "entry field, which suggests (but doesn't guarantee) this flow "
+        "expects a typed code rather than a link click — weigh this "
+        "alongside the actual email content, don't override clear "
+        "evidence in the email itself."
+        if page_expects_code else
+        "No code-entry field was detected on the site's signup page, "
+        "which weakly suggests a link-based flow, but check the email "
+        "content itself rather than relying on this alone."
+    )
     try:
         messages = [{
             "role": "user",
             "content": (
-                "The following is the raw content of an email. It may "
-                "contain HTML markup, tracking pixels, inline styling, "
-                "and unrelated boilerplate — ignore all of that and any "
-                "unrelated links or images.\n\n"
-                "Find the account verification code, PIN, or one-time "
-                "code this email is providing to the recipient (the "
-                "short alphanumeric string the person is meant to type "
-                "into a form — not a token embedded in a URL, not a "
-                "tracking ID, not part of the sender's boilerplate).\n\n"
+                "The following is the raw content of an account "
+                "registration/verification email. It may contain HTML "
+                "markup, inline styling, tracking pixels, footer "
+                "boilerplate, unsubscribe links, and other noise — "
+                "ignore all of that.\n\n"
+                f"{page_hint}\n\n"
+                "Determine how this email wants the recipient to "
+                "confirm their account:\n"
+                "- If it provides a short code/PIN the recipient is "
+                "meant to type into a form, that's a CODE.\n"
+                "- If it provides a specific button/link the recipient "
+                "is meant to click to complete verification (NOT a "
+                "tracking pixel, NOT an image URL, NOT an unsubscribe "
+                "or footer link, NOT the sender's homepage), that's a "
+                "LINK.\n\n"
                 f"Email content:\n{body_text[:4000]}\n\n"
-                "Reply with ONLY the exact code as it appears in the "
-                "email — no extra words, quotes, or punctuation. If "
-                "there is no verification code/PIN in this email, reply "
-                "with exactly: NONE"
+                "Respond with EXACTLY ONE of the following formats, "
+                "nothing else:\n"
+                "CODE: <the exact code>\n"
+                "LINK: <the exact full URL>\n"
+                "NONE"
             ),
         }]
         response = await call_llm(
@@ -239,36 +218,49 @@ async def _ai_extract_verification_code(
             model=llm_model,
             base_url=llm_base_url,
             messages=messages,
-            max_tokens=20,
         )
         if not response:
             logger.warning(
-                "AI code extraction: call failed or returned empty response"
+                "AI confirmation extraction: call failed or returned empty response"
             )
             return None
 
-        candidate = response.strip().strip("\"'` \n")
-        if not candidate or candidate.upper() == "NONE":
+        text = response.strip()
+        if text.upper() == "NONE":
             logger.info(
-                "AI code extraction: model reported no code present in this email"
+                "AI confirmation extraction: model reported no actionable "
+                "confirmation in this email"
             )
             return None
 
-        # Guardrail, not a primary extraction mechanism: reject anything
-        # that clearly isn't a short code (the model wrote a sentence,
-        # apologized, hedged, etc.) rather than submit garbage to the
-        # target's form.
-        if not re.fullmatch(r"[A-Za-z0-9\-]{3,12}", candidate):
+        if text.upper().startswith("CODE:"):
+            candidate = text[len("CODE:"):].strip().strip("\"'` ")
+            if re.fullmatch(r"[A-Za-z0-9\-]{3,12}", candidate):
+                return ("code", candidate)
             logger.warning(
-                "AI code extraction: response doesn't look like a code, "
-                "discarding: %r", candidate,
+                "AI confirmation extraction: CODE response doesn't look "
+                "like a code, discarding: %r", candidate,
             )
             return None
 
-        return candidate
+        if text.upper().startswith("LINK:"):
+            candidate = text[len("LINK:"):].strip().strip("\"'` ")
+            if re.match(r"^https?://\S+$", candidate):
+                return ("link", candidate)
+            logger.warning(
+                "AI confirmation extraction: LINK response doesn't look "
+                "like a URL, discarding: %r", candidate,
+            )
+            return None
+
+        logger.warning(
+            "AI confirmation extraction: response didn't match expected "
+            "format, discarding: %r", text[:200],
+        )
+        return None
     except Exception as exc:
         logger.warning(
-            "AI code extraction: error calling LLM: %s", exc
+            "AI confirmation extraction: error calling LLM: %s", exc
         )
         return None
 
@@ -331,7 +323,6 @@ async def _ai_judge_is_registration_email_text(
             model=llm_model,
             base_url=llm_base_url,
             messages=messages,
-            max_tokens=10,
         )
         if not response:
             logger.debug("AI classification call failed or empty — failing closed to NO")
@@ -706,7 +697,6 @@ class RegistrationHandler:
                 model=self.config.llm_model,
                 base_url=self.config.llm_base_url or None,
                 messages=messages,
-                max_tokens=10,
             )
             if not response:
                 logger.debug("AI judge post-submit call failed — failing open")
@@ -999,7 +989,7 @@ class RegistrationHandler:
                         pass
 
                 # Diagnostic: log every inspected candidate
-                body_preview = self._get_email_body_text(msg)[:300].replace("\n", " ")
+                body_preview = self._get_email_body_text(msg)[:3000].replace("\n", " ")
                 logger.info(
                     "Candidate confirmation email — from=%s subject=%r body_preview=%r",
                     msg.get("From", ""),
@@ -1112,7 +1102,7 @@ class RegistrationHandler:
                 "Tier 3 candidate — from=%s subject=%r body_preview=%r",
                 msg.get("From", ""),
                 msg.get("Subject", ""),
-                body_text[:300].replace("\n", " "),
+                body_text[:3000].replace("\n", " "),
             )
             is_registration_email = await self._ai_judge_is_registration_email(
                 sender=msg.get("From", ""),
@@ -1132,41 +1122,15 @@ class RegistrationHandler:
                 "AI classified latest unread mail (from %s) as likely the "
                 "registration email", msg.get("From", ""),
             )
-            # Respect the page's own indication of what it wants: code
-            # before link, or link before code (the default).
-            if getattr(self, "_page_expects_code", False):
-                code = await _ai_extract_verification_code(
-                    body_text=body_text,
-                    llm_provider=self.config.llm_provider,
-                    llm_api_key=self.config.llm_api_key,
-                    llm_model=self.config.llm_model,
-                    llm_base_url=self.config.llm_base_url or None,
-                )
-                if code:
-                    return ("code", code)
-                # Same reasoning as in _extract_link_from_email — the
-                # page has already told us what kind of confirmation this
-                # is. Don't fall back to link extraction; let the caller
-                # retry instead of committing to the wrong action.
-                logger.info(
-                    "Tier 3: page expects a code but none could be "
-                    "extracted — returning None so the poll loop can retry"
-                )
-                return None
-            # Try link first, then code
-            link = _extract_link_from_body(body_text, target_domain)
-            if link:
-                return ("link", link)
-            code = await _ai_extract_verification_code(
+            return await _ai_extract_confirmation_action(
                 body_text=body_text,
+                target_domain=target_domain,
+                page_expects_code=getattr(self, "_page_expects_code", False),
                 llm_provider=self.config.llm_provider,
                 llm_api_key=self.config.llm_api_key,
                 llm_model=self.config.llm_model,
                 llm_base_url=self.config.llm_base_url or None,
             )
-            if code:
-                return ("code", code)
-            return None
 
         except ImportError:
             logger.error("aioimaplib is required for IMAP polling")
@@ -1219,55 +1183,21 @@ class RegistrationHandler:
         return body_text
 
     async def _extract_link_from_email(self, msg, target_domain=""):
-        """Try to extract a confirmation link or verification code from *msg*.
+        """Extract a confirmation action from *msg* using a single AI call
+        that decides code-vs-link and returns the value — no regex fallback.
 
         Returns ``("link", url)``, ``("code", code)``, or ``None``.
-
-        When the post-submit page has a visible code-entry field
-        (``self._page_expects_code``), code extraction is tried first —
-        the page is the ground truth for what confirmation mechanism is
-        in play.  Otherwise link extraction is tried first (the default
-        for flows that are genuinely link-based).
         """
         body_text = self._get_email_body_text(msg)
-
-        if getattr(self, "_page_expects_code", False):
-            code = await _ai_extract_verification_code(
-                body_text=body_text,
-                llm_provider=self.config.llm_provider,
-                llm_api_key=self.config.llm_api_key,
-                llm_model=self.config.llm_model,
-                llm_base_url=self.config.llm_base_url or None,
-            )
-            if code:
-                return ("code", code)
-            # Do NOT fall back to link extraction here — the page has
-            # already told us (via a visible code-entry field) what kind
-            # of confirmation this is. A link found via regex against the
-            # same email is not a substitute action; returning None lets
-            # the existing poll loop retry on the next iteration instead
-            # of committing to the wrong kind of action.
-            logger.info(
-                "Page expects a code but none could be extracted from "
-                "this candidate email — will retry on next poll "
-                "iteration rather than falling back to link extraction"
-            )
-            return None
-
-        # Default: link first (existing behavior for link-based flows)
-        link = _extract_link_from_body(body_text, target_domain)
-        if link:
-            return ("link", link)
-        code = await _ai_extract_verification_code(
+        return await _ai_extract_confirmation_action(
             body_text=body_text,
+            target_domain=target_domain,
+            page_expects_code=getattr(self, "_page_expects_code", False),
             llm_provider=self.config.llm_provider,
             llm_api_key=self.config.llm_api_key,
             llm_model=self.config.llm_model,
             llm_base_url=self.config.llm_base_url or None,
         )
-        if code:
-            return ("code", code)
-        return None
 
     @property
     def is_paused(self) -> bool:
