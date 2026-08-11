@@ -728,6 +728,77 @@ async def _run_phase2_custom(
         await explorer_page.close()
 
 
+_NO_FORMS_INSTRUCTION = (
+    "Do not submit any forms or attempt to register/sign up for "
+    "anything, regardless of any other instructions in this task."
+)
+
+
+def _build_agent_task(
+    hostname: str,
+    agent_task: Optional[str],
+    authenticated: bool = False,
+) -> str:
+    """Build the task string for the browser-use Phase 2 agent.
+
+    Args:
+        hostname: Target hostname for interpolation (e.g. example.com).
+        agent_task: Optional user-provided custom task. When provided it
+            is used as the base, with guards appended after it.
+        authenticated: Whether the session is authenticated (cookies
+            supplied or login succeeded).
+
+    Returns:
+        The full task string to pass to the browser-use Agent.
+    """
+    _no_forms = _NO_FORMS_INSTRUCTION
+
+    if agent_task:
+        # Custom task: respect user intent, append auth hint when
+        # authenticated, then always append the no-forms guard.
+        if authenticated:
+            task = (
+                f"{agent_task.rstrip()}\n\n"
+                f"You are logged in to {hostname}. Prioritize navigating into "
+                f"authenticated, logged-in-only areas of the application and "
+                f"enumerating the pages, navigation, and API endpoints they "
+                f"expose: account and profile settings, "
+                f"application/project/developer dashboards, API key or "
+                f"access-token management pages, per-user or per-account data "
+                f"views, and any admin or management consoles. Read and "
+                f"observe only — record what surface exists. Do NOT create, "
+                f"modify, or delete anything, do NOT generate credentials or "
+                f"tokens, and do NOT trigger state-changing actions."
+            )
+        else:
+            task = agent_task.rstrip()
+        return f"{task} {_no_forms}"
+    else:
+        # Default task
+        if authenticated:
+            task = (
+                f"You are logged in to {hostname}. Prioritize navigating "
+                f"INTO authenticated, logged-in-only areas of the application "
+                f"and enumerating the pages, navigation, and API endpoints "
+                f"they expose: account and profile settings, "
+                f"application/project/developer dashboards, API key or "
+                f"access-token management pages, per-user or per-account data "
+                f"views, and any admin or management consoles. Read and "
+                f"observe only — record what surface exists. Do NOT create, "
+                f"modify, or delete anything, do NOT generate credentials or "
+                f"tokens, and do NOT trigger state-changing actions."
+            )
+        else:
+            task = (
+                f"Explore {hostname} thoroughly. Look for API documentation, "
+                f"developer resources, webhook/callback configuration pages, "
+                f"and other technical endpoints. Click through navigation "
+                f"menus, expand collapsed sections, and follow links that "
+                f"seem likely to reveal more of the site's structure."
+            )
+        return f"{task} {_no_forms}"
+
+
 async def _run_phase2_browser_use(
     *,
     session,
@@ -741,6 +812,7 @@ async def _run_phase2_browser_use(
     agent_task: Optional[str],
     hostname: str,
     scope_pattern: Union[str, List[str]],
+    authenticated: bool = False,
 ) -> None:
     """Run browser-use as the Phase 2 agent engine, connected to the same
     browser process via CDP (--remote-debugging-port)."""
@@ -863,20 +935,11 @@ async def _run_phase2_browser_use(
     # the browser-use agent from submitting forms or registering accounts.
     # A custom task forgetting to mention this would otherwise silently
     # drop that constraint.
-    _no_forms_instruction = (
-        "Do not submit any forms or attempt to register/sign up for "
-        "anything, regardless of any other instructions in this task."
+    task = _build_agent_task(
+        hostname=hostname,
+        agent_task=agent_task,
+        authenticated=authenticated,
     )
-    if agent_task:
-        task = f"{agent_task.rstrip()} {_no_forms_instruction}"
-    else:
-        task = (
-            f"Explore {hostname} thoroughly. Look for API documentation, "
-            f"developer resources, webhook/callback configuration pages, "
-            f"and other technical endpoints. Click through navigation menus, "
-            f"expand collapsed sections, and follow links that seem likely "
-            f"to reveal more of the site's structure. {_no_forms_instruction}"
-        )
 
     bu_agent = BrowserUseAgent(
         task=task,
@@ -1105,7 +1168,14 @@ async def _run_crawl(
                 )
                 return
 
+            authenticated = bool(cookies_file) or (login_authenticated is True)
+
             if agent_backend == "custom":
+                # TODO: the 'custom' backend (AgentExplorer) uses a fixed
+                # system prompt with no task-string injection point, so it
+                # does not yet honor `authenticated`.  When/if the custom
+                # backend gains a task-injection mechanism, pass
+                # authenticated=authenticated here.
                 await _run_phase2_custom(
                     session=session,
                     result=result,
@@ -1131,6 +1201,7 @@ async def _run_crawl(
                     agent_task=agent_task,
                     hostname=hostname,
                     scope_pattern=scope_pattern,
+                    authenticated=authenticated,
                 )
 
         elif run_agent and not llm_api_key:
