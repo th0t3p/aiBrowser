@@ -36,7 +36,10 @@ class TestEmailLinkExtraction:
             )
         )
 
-    def test_prioritizes_confirm_link_over_logo(self):
+    @pytest.mark.asyncio
+    async def test_prioritizes_confirm_link_over_logo(self, monkeypatch):
+        from unittest.mock import AsyncMock
+        monkeypatch.setattr("ai_browser.registration_handler.handler.call_llm", AsyncMock(return_value=None))
         """Confirmation link with 'confirm' in path beats logo link."""
         handler = self._handler()
         msg = _make_email(html_body="""
@@ -44,60 +47,78 @@ class TestEmailLinkExtraction:
             <a href="https://target.com/confirm?token=abc123">Confirm</a>
             <a href="https://target.com/unsubscribe">Unsubscribe</a>
         """)
-        result = handler._extract_link_from_email(msg, "target.com")
+        result = await handler._extract_link_from_email(msg, "target.com")
         assert result == ("link", "https://target.com/confirm?token=abc123")
 
-    def test_prioritizes_verify_link(self):
+    @pytest.mark.asyncio
+    async def test_prioritizes_verify_link(self, monkeypatch):
+        from unittest.mock import AsyncMock
+        monkeypatch.setattr("ai_browser.registration_handler.handler.call_llm", AsyncMock(return_value=None))
         """Link with 'verify' in path is prioritized."""
         handler = self._handler()
         msg = _make_email(html_body="""
             <a href="https://example.org/image.jpg">Image</a>
             <a href="https://target.com/verify-email?id=123">Verify</a>
         """)
-        result = handler._extract_link_from_email(msg, "target.com")
+        result = await handler._extract_link_from_email(msg, "target.com")
         assert result is not None and result[0] == "link" and "verify" in result[1]
 
-    def test_prioritizes_activate_link(self):
+    @pytest.mark.asyncio
+    async def test_prioritizes_activate_link(self, monkeypatch):
+        from unittest.mock import AsyncMock
+        monkeypatch.setattr("ai_browser.registration_handler.handler.call_llm", AsyncMock(return_value=None))
         """Link with 'activate' in path is prioritized."""
         handler = self._handler()
         msg = _make_email(html_body="""
             <a href="https://target.com/activate/abc">Activate Account</a>
             <a href="https://target.com/logo.png">Logo</a>
         """)
-        result = handler._extract_link_from_email(msg)
+        result = await handler._extract_link_from_email(msg)
         assert result is not None and result[0] == "link" and "activate" in result[1]
 
-    def test_prioritizes_token_link(self):
+    @pytest.mark.asyncio
+    async def test_prioritizes_token_link(self, monkeypatch):
+        from unittest.mock import AsyncMock
+        monkeypatch.setattr("ai_browser.registration_handler.handler.call_llm", AsyncMock(return_value=None))
         """Link with 'token=' in query string is prioritized."""
         handler = self._handler()
         msg = _make_email(html_body="""
             <a href="https://target.com/home">Home</a>
             <a href="https://target.com/register/complete?token=xyz789">Complete</a>
         """)
-        result = handler._extract_link_from_email(msg, "target.com")
+        result = await handler._extract_link_from_email(msg, "target.com")
         assert result is not None and result[0] == "link" and "token=" in result[1]
 
-    def test_falls_back_to_same_domain_link(self):
+    @pytest.mark.asyncio
+    async def test_falls_back_to_same_domain_link(self, monkeypatch):
+        from unittest.mock import AsyncMock
+        monkeypatch.setattr("ai_browser.registration_handler.handler.call_llm", AsyncMock(return_value=None))
         """When no confirmation pattern found, same-domain link is selected."""
         handler = self._handler()
         msg = _make_email(html_body="""
             <a href="https://other.com/tracker.gif">Tracker</a>
             <a href="https://target.com/welcome">Welcome</a>
         """)
-        result = handler._extract_link_from_email(msg, "target.com")
+        result = await handler._extract_link_from_email(msg, "target.com")
         assert result == ("link", "https://target.com/welcome")
 
-    def test_falls_back_to_first_non_asset_link(self):
+    @pytest.mark.asyncio
+    async def test_falls_back_to_first_non_asset_link(self, monkeypatch):
+        from unittest.mock import AsyncMock
+        monkeypatch.setattr("ai_browser.registration_handler.handler.call_llm", AsyncMock(return_value=None))
         """Last resort: first non-image link wins."""
         handler = self._handler()
         msg = _make_email(html_body="""
             <a href="https://other.com/logo.png">Logo</a>
             <a href="https://other.com/page">Page</a>
         """)
-        result = handler._extract_link_from_email(msg)
+        result = await handler._extract_link_from_email(msg)
         assert result == ("link", "https://other.com/page")
 
-    def test_skips_image_links(self):
+    @pytest.mark.asyncio
+    async def test_skips_image_links(self, monkeypatch):
+        from unittest.mock import AsyncMock
+        monkeypatch.setattr("ai_browser.registration_handler.handler.call_llm", AsyncMock(return_value=None))
         """Image/tracking links are excluded."""
         handler = self._handler()
         msg = _make_email(html_body="""
@@ -105,7 +126,7 @@ class TestEmailLinkExtraction:
             <a href="https://target.com/styles.css">CSS</a>
             <a href="https://target.com/dashboard">Dashboard</a>
         """)
-        result = handler._extract_link_from_email(msg)
+        result = await handler._extract_link_from_email(msg)
         assert result == ("link", "https://target.com/dashboard")
 
 
@@ -562,7 +583,10 @@ class TestGetEmailBodyText:
         assert "Plain text body" in text
         assert "https://example.com/activate" in text
 
-    def test_refactor_produces_same_link_as_before(self):
+    @pytest.mark.asyncio
+    async def test_refactor_produces_same_link_as_before(self, monkeypatch):
+        from unittest.mock import AsyncMock
+        monkeypatch.setattr("ai_browser.registration_handler.handler.call_llm", AsyncMock(return_value=None))
         """Verify that _extract_link_from_email still works identically
         after the refactor — the body text pipe produces the same result."""
         handler = self._handler()
@@ -570,7 +594,7 @@ class TestGetEmailBodyText:
             html_body="""<a href="https://target.com/confirm?token=xyz">Confirm</a>""",
             text_body="Confirm at https://target.com/confirm?token=xyz",
         )
-        result = handler._extract_link_from_email(msg, "target.com")
+        result = await handler._extract_link_from_email(msg, "target.com")
         assert result is not None and result[0] == "link" and "confirm" in result[1]
         assert result is not None and result[0] == "link" and "target.com" in result[1]
 
@@ -1031,75 +1055,128 @@ class TestDiagnosticLogging:
         )
 
 
-class TestExtractVerificationCode:
-    """Tests for the new _extract_verification_code_from_body function."""
 
-    def test_extracts_pin_colon_format(self):
-        from ai_browser.registration_handler.handler import _extract_verification_code_from_body
-        body = "Your PIN: 8R7H3W"
-        assert _extract_verification_code_from_body(body) == "8R7H3W"
+class TestAIExtractVerificationCode:
+    """Tests for the AI-based _ai_extract_verification_code function."""
 
-    def test_extracts_code_is_phrase(self):
-        from ai_browser.registration_handler.handler import _extract_verification_code_from_body
-        body = "Your verification code is AB12CD"
-        assert _extract_verification_code_from_body(body) == "AB12CD"
-
-    def test_extracts_otp_format(self):
-        from ai_browser.registration_handler.handler import _extract_verification_code_from_body
-        body = "OTP: 1234XY"
-        assert _extract_verification_code_from_body(body) == "1234XY"
-
-    def test_extracts_markdown_emphasis(self):
-        from ai_browser.registration_handler.handler import _extract_verification_code_from_body
-        body = "Your code is **8R7H3W**"
-        assert _extract_verification_code_from_body(body) == "8R7H3W"
-
-    def test_does_not_match_bare_token(self):
-        """A short alphanumeric token not near a code keyword is NOT matched.
-        This tests the keyword anchoring — footer boilerplate, unsubscribe
-        tokens, sender names should not false-positive."""
-        from ai_browser.registration_handler.handler import _extract_verification_code_from_body
-        body = (
-            "Thank you for signing up. Your account ID is XK42.\n\n"
-            "If you did not create this account, please ignore this email.\n"
-            "Unsubscribe reference: 9XYZ12\n"
-            "Sender: AB12CD from the verification team\n"
+    @pytest.mark.asyncio
+    async def test_extracts_code_from_llm_response(self, monkeypatch):
+        """Mock call_llm returning "97VJ5D" → returns "97VJ5D"."""
+        from unittest.mock import AsyncMock
+        from ai_browser.registration_handler.handler import _ai_extract_verification_code
+        mock = AsyncMock(return_value="97VJ5D")
+        monkeypatch.setattr(
+            "ai_browser.registration_handler.handler.call_llm", mock,
         )
-        assert _extract_verification_code_from_body(body) is None, (
-            "Bare tokens without code/pin/otp keywords should NOT match"
+        result = await _ai_extract_verification_code(
+            body_text="Here is the pin that you requested:\n97VJ5D",
+            llm_provider="anthropic",
+            llm_api_key="fake-key",
+            llm_model="claude-test",
         )
+        assert result == "97VJ5D"
 
-    def test_empty_body(self):
-        from ai_browser.registration_handler.handler import _extract_verification_code_from_body
-        assert _extract_verification_code_from_body("") is None
-        assert _extract_verification_code_from_body(None) is None
+    @pytest.mark.asyncio
+    async def test_none_response_returns_none(self, monkeypatch):
+        from unittest.mock import AsyncMock
+        from ai_browser.registration_handler.handler import _ai_extract_verification_code
+        mock = AsyncMock(return_value="NONE")
+        monkeypatch.setattr(
+            "ai_browser.registration_handler.handler.call_llm", mock,
+        )
+        result = await _ai_extract_verification_code(
+            body_text="some email content",
+            llm_provider="anthropic", llm_api_key="fk", llm_model="m",
+        )
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_sentence_response_rejected(self, monkeypatch, caplog):
+        """LLM returning a full sentence → discarded, WARNING logged."""
+        from unittest.mock import AsyncMock
+        from ai_browser.registration_handler.handler import _ai_extract_verification_code
+        dummy = AsyncMock(return_value="Your verification code is 97VJ5D")
+        monkeypatch.setattr(
+            "ai_browser.registration_handler.handler.call_llm", dummy,
+        )
+        with caplog.at_level("WARNING"):
+            result = await _ai_extract_verification_code(
+                body_text="dummy",
+                llm_provider="anthropic", llm_api_key="fk", llm_model="m",
+            )
+        assert result is None
+        warnings = [r for r in caplog.records if "look like a code" in r.message]
+        assert len(warnings) >= 1
+
+    @pytest.mark.asyncio
+    async def test_llm_failure_returns_none(self, monkeypatch):
+        from unittest.mock import AsyncMock
+        from ai_browser.registration_handler.handler import _ai_extract_verification_code
+        mock = AsyncMock(return_value=None)
+        monkeypatch.setattr(
+            "ai_browser.registration_handler.handler.call_llm", mock,
+        )
+        result = await _ai_extract_verification_code(
+            body_text="dummy",
+            llm_provider="anthropic", llm_api_key="fk", llm_model="m",
+        )
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_regression_real_world_content(self, monkeypatch):
+        """Exact regression test for the bug that prompted replacing regex.
+        The body contains "Here is the pin that you requested:\n97VJ5D"
+        which the regex would fail on — AI should return the right code."""
+        from unittest.mock import AsyncMock
+        from ai_browser.registration_handler.handler import _ai_extract_verification_code
+        body = "Here is the pin that you requested:\n97VJ5D"
+        mock = AsyncMock(return_value="97VJ5D")
+        monkeypatch.setattr(
+            "ai_browser.registration_handler.handler.call_llm", mock,
+        )
+        result = await _ai_extract_verification_code(
+            body_text=body,
+            llm_provider="anthropic", llm_api_key="fk", llm_model="m",
+        )
+        assert result == "97VJ5D"
 
 
 class TestCodeExtractionIntegration:
-    """Test that code extraction is wired into Tiers 1/2 and Tier 3."""
+    """Test that AI code extraction is wired into Tiers 1/2 and Tier 3."""
 
-    def test_extract_link_from_email_finds_code(self):
+    @pytest.mark.asyncio
+    async def test_extract_link_from_email_finds_code(self, monkeypatch):
         """When email body has no link but has a code, _extract_link_from_email
-        returns (\"code\", code)."""
+        returns ("code", code)."""
+        from unittest.mock import AsyncMock
         handler = TestGetEmailBodyText._handler()
         from email.mime.text import MIMEText
         msg = MIMEText("Your verification code: AB12CD")
         msg["From"] = "noreply@target.com"
         msg["Subject"] = "Verify your email"
-        result = handler._extract_link_from_email(msg, "target.com")
+        mock = AsyncMock(return_value="AB12CD")
+        monkeypatch.setattr(
+            "ai_browser.registration_handler.handler.call_llm", mock,
+        )
+        result = await handler._extract_link_from_email(msg, "target.com")
         assert result == ("code", "AB12CD")
 
-    def test_extract_link_from_email_finds_link_over_code(self):
+    @pytest.mark.asyncio
+    async def test_extract_link_from_email_finds_link_over_code(self, monkeypatch):
         """Link extraction wins when both a link and code are present."""
+        from unittest.mock import AsyncMock
         handler = TestGetEmailBodyText._handler()
         msg = _make_email(html_body="""
             <a href="https://target.com/confirm?token=abc">Confirm</a>
             Your code is: XYZ123
         """)
-        result = handler._extract_link_from_email(msg, "target.com")
+        mock = AsyncMock(return_value="XYZ123")
+        monkeypatch.setattr(
+            "ai_browser.registration_handler.handler.call_llm", mock,
+        )
+        result = await handler._extract_link_from_email(msg, "target.com")
         assert result[0] == "link"
         assert "confirm" in result[1]
-
 
 class TestRunHandlesCodeField:
     """Test that register() handles a code result properly."""
@@ -1682,36 +1759,54 @@ class TestPageExpectsCodeCheck:
 class TestExtractionPriorityFlip:
     """Verify that _page_expects_code flips extraction order."""
 
-    def test_prefer_code_returns_code_first_when_both_present(self):
+    @pytest.mark.asyncio
+    async def test_prefer_code_returns_code_first_when_both_present(self, monkeypatch):
         """When _page_expects_code is set and email has both link and code,
         code is returned first."""
+        from unittest.mock import AsyncMock
         handler = TestGetEmailBodyText._handler()
         handler._page_expects_code = True
+        mock = AsyncMock(return_value="XYZ789")
+        monkeypatch.setattr(
+            "ai_browser.registration_handler.handler.call_llm", mock,
+        )
         msg = _make_email(
             html_body="""<a href="https://target.com/confirm?token=abc">Confirm</a>
             Your verification code is XYZ789""",
         )
-        result = handler._extract_link_from_email(msg, "target.com")
+        result = await handler._extract_link_from_email(msg, "target.com")
         assert result == ("code", "XYZ789")
 
-    def test_prefer_code_falls_back_to_link(self):
+    @pytest.mark.asyncio
+    async def test_prefer_code_falls_back_to_link(self, monkeypatch):
         """When _page_expects_code is set but email has only a link, the
         link is still returned."""
+        from unittest.mock import AsyncMock
         handler = TestGetEmailBodyText._handler()
         handler._page_expects_code = True
+        mock = AsyncMock(return_value=None)
+        monkeypatch.setattr(
+            "ai_browser.registration_handler.handler.call_llm", mock,
+        )
         msg = _make_email(html_body="""<a href="https://target.com/confirm?token=abc">Confirm</a>""")
-        result = handler._extract_link_from_email(msg, "target.com")
+        result = await handler._extract_link_from_email(msg, "target.com")
         assert result == ("link", "https://target.com/confirm?token=abc")
 
-    def test_default_link_first_no_code_field(self):
+    @pytest.mark.asyncio
+    async def test_default_link_first_no_code_field(self, monkeypatch):
         """Without _page_expects_code, link is tried first (default behavior)."""
+        from unittest.mock import AsyncMock
         handler = TestGetEmailBodyText._handler()
+        mock = AsyncMock(return_value=None)
+        monkeypatch.setattr(
+            "ai_browser.registration_handler.handler.call_llm", mock,
+        )
         # _page_expects_code not set (defaults to False via getattr)
         msg = _make_email(
             html_body="""<a href="https://target.com/confirm?token=abc">Confirm</a>
             Your code: XYZ789""",
         )
-        result = handler._extract_link_from_email(msg, "target.com")
+        result = await handler._extract_link_from_email(msg, "target.com")
         assert result[0] == "link"
         assert "confirm" in result[1]
 

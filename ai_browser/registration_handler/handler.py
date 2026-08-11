@@ -126,16 +126,6 @@ def _same_registrable_domain(a: str, b: str) -> bool:
         return False
 
 
-# Regex for extracting a verification code/PIN from email body text.
-# Keyword-anchored (pin/code/otp) to avoid matching unrelated short
-# alphanumeric tokens (sender names, footer boilerplate, unsubscribe IDs).
-# Tolerates markdown-style emphasis (**8R7H3W**) that HTML-to-text
-# conversion often leaves behind.
-_CODE_RE = re.compile(
-    r"(?:pin|code|otp)\s*(?:is|:)?\s*\**\s*([A-Z0-9]{4,8})\**",
-    re.IGNORECASE,
-)
-
 # Shared list of field names for code/OTP/PIN inputs — used by both
 # _page_expects_code_check (read-only check) and _submit_verification_code
 # (fill + submit).  Keep in sync if either is updated.
@@ -205,25 +195,75 @@ def _extract_link_from_body(body_text: str, target_domain: str = "") -> Optional
     return non_asset_links[0]
 
 
-def _extract_verification_code_from_body(body_text: str) -> Optional[str]:
-    """Extract a short alphanumeric verification code/PIN from an email body.
+async def _ai_extract_verification_code(
+    *,
+    body_text: str,
+    llm_provider: str,
+    llm_api_key: str,
+    llm_model: str,
+    llm_base_url: Optional[str] = None,
+) -> Optional[str]:
+    """AI-based verification code/PIN extraction, replacing brittle regex
+    matching against free-form (and often HTML-formatted) email copy.
 
-    Handles phrasing like 'PIN: 8R7H3W', 'your code is 8R7H3W',
-    'verification code: 8R7H3W', tolerant of markdown-style emphasis
-    (**8R7H3W**) that HTML-to-text conversion often leaves behind.
-
-    The regex is keyword-anchored (pin/code/otp) — it won't match a
-    bare alphanumeric token elsewhere in the body (footer boilerplate,
-    unsubscribe IDs, etc.).
+    Fails closed (returns None) on any error, empty response, model
+    reporting no code present, or a response that doesn't look like a
+    plausible code — a missed code just falls through to the existing
+    'no code found' handling and the poll loop retries next iteration;
+    a WRONG code gets submitted to the target's form, which is strictly
+    worse than finding nothing.
     """
-    if not body_text:
+    try:
+        messages = [{
+            "role": "user",
+            "content": (
+                "The following is the raw content of an email. It may "
+                "contain HTML markup, tracking pixels, inline styling, "
+                "and unrelated boilerplate — ignore all of that and any "
+                "unrelated links or images.\n\n"
+                "Find the account verification code, PIN, or one-time "
+                "code this email is providing to the recipient (the "
+                "short alphanumeric string the person is meant to type "
+                "into a form — not a token embedded in a URL, not a "
+                "tracking ID, not part of the sender's boilerplate).\n\n"
+                f"Email content:\n{body_text[:4000]}\n\n"
+                "Reply with ONLY the exact code as it appears in the "
+                "email — no extra words, quotes, or punctuation. If "
+                "there is no verification code/PIN in this email, reply "
+                "with exactly: NONE"
+            ),
+        }]
+        response = await call_llm(
+            provider=llm_provider,
+            api_key=llm_api_key,
+            model=llm_model,
+            base_url=llm_base_url,
+            messages=messages,
+            max_tokens=20,
+        )
+        if not response:
+            logger.debug("AI code extraction call failed or empty")
+            return None
+
+        candidate = response.strip().strip("\"'` \n")
+        if not candidate or candidate.upper() == "NONE":
+            return None
+
+        # Guardrail, not a primary extraction mechanism: reject anything
+        # that clearly isn't a short code (the model wrote a sentence,
+        # apologized, hedged, etc.) rather than submit garbage to the
+        # target's form.
+        if not re.fullmatch(r"[A-Za-z0-9\-]{3,12}", candidate):
+            logger.warning(
+                "AI code extraction returned something that doesn't "
+                "look like a code, discarding: %r", candidate,
+            )
+            return None
+
+        return candidate
+    except Exception as exc:
+        logger.debug("AI code extraction error: %s", exc)
         return None
-    match = _CODE_RE.search(body_text)
-    if match:
-        code = match.group(1)
-        logger.debug("Found verification code in email body: %s", code)
-        return code
-    return None
 
 
 def _detect_error_text(body_text: str) -> Optional[str]:
@@ -971,7 +1011,7 @@ class RegistrationHandler:
             # links WITHIN the email body whose own hostname matches the
             # target), not the sender check. Don't conflate the two.
             for msg in domain_matched:
-                found = self._extract_link_from_email(msg, target_domain)
+                found = await self._extract_link_from_email(msg, target_domain)
                 if found:
                     await imap.logout()
                     return found
@@ -980,7 +1020,7 @@ class RegistrationHandler:
             # content-extractable even though the sender didn't domain-match
             # (e.g. a third-party ESP sending domain).
             for msg in others:
-                found = self._extract_link_from_email(msg, target_domain)
+                found = await self._extract_link_from_email(msg, target_domain)
                 if found:
                     await imap.logout()
                     return found
@@ -1088,7 +1128,13 @@ class RegistrationHandler:
             # Respect the page's own indication of what it wants: code
             # before link, or link before code (the default).
             if getattr(self, "_page_expects_code", False):
-                code = _extract_verification_code_from_body(body_text)
+                code = await _ai_extract_verification_code(
+                    body_text=body_text,
+                    llm_provider=self.config.llm_provider,
+                    llm_api_key=self.config.llm_api_key,
+                    llm_model=self.config.llm_model,
+                    llm_base_url=self.config.llm_base_url or None,
+                )
                 if code:
                     return ("code", code)
                 link = _extract_link_from_body(body_text, target_domain)
@@ -1099,7 +1145,13 @@ class RegistrationHandler:
             link = _extract_link_from_body(body_text, target_domain)
             if link:
                 return ("link", link)
-            code = _extract_verification_code_from_body(body_text)
+            code = await _ai_extract_verification_code(
+                body_text=body_text,
+                llm_provider=self.config.llm_provider,
+                llm_api_key=self.config.llm_api_key,
+                llm_model=self.config.llm_model,
+                llm_base_url=self.config.llm_base_url or None,
+            )
             if code:
                 return ("code", code)
             return None
@@ -1154,7 +1206,7 @@ class RegistrationHandler:
                 pass
         return body_text
 
-    def _extract_link_from_email(self, msg, target_domain=""):
+    async def _extract_link_from_email(self, msg, target_domain=""):
         """Try to extract a confirmation link or verification code from *msg*.
 
         Returns ``("link", url)``, ``("code", code)``, or ``None``.
@@ -1168,7 +1220,13 @@ class RegistrationHandler:
         body_text = self._get_email_body_text(msg)
 
         if getattr(self, "_page_expects_code", False):
-            code = _extract_verification_code_from_body(body_text)
+            code = await _ai_extract_verification_code(
+                body_text=body_text,
+                llm_provider=self.config.llm_provider,
+                llm_api_key=self.config.llm_api_key,
+                llm_model=self.config.llm_model,
+                llm_base_url=self.config.llm_base_url or None,
+            )
             if code:
                 return ("code", code)
             link = _extract_link_from_body(body_text, target_domain)
@@ -1180,7 +1238,13 @@ class RegistrationHandler:
         link = _extract_link_from_body(body_text, target_domain)
         if link:
             return ("link", link)
-        code = _extract_verification_code_from_body(body_text)
+        code = await _ai_extract_verification_code(
+            body_text=body_text,
+            llm_provider=self.config.llm_provider,
+            llm_api_key=self.config.llm_api_key,
+            llm_model=self.config.llm_model,
+            llm_base_url=self.config.llm_base_url or None,
+        )
         if code:
             return ("code", code)
         return None
