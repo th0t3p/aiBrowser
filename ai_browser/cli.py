@@ -69,6 +69,57 @@ def main(ctx: click.Context):
     ctx.ensure_object(dict)
 
 
+def _resolve_start_url(
+    start_url_opt: Optional[str],
+    hostname: str,
+    scope_pattern: Union[str, List[str]],
+) -> str:
+    """Resolve the --start-url option to the actual URL for Phase 1+2.
+
+    Args:
+        start_url_opt: The raw --start-url value (None = use default).
+        hostname: Target hostname.
+        scope_pattern: Scope pattern(s) for validation.
+
+    Returns:
+        The resolved start URL string.
+    """
+    if start_url_opt is None:
+        return f"https://{hostname}"
+
+    url = start_url_opt.strip()
+    # Prepend https if no scheme provided
+    if "://" not in url:
+        url = f"https://{url}"
+
+    # Parse the host from the URL
+    from urllib.parse import urlparse
+    parsed = urlparse(url)
+    url_host = parsed.hostname or ""
+
+    # Must be on the same host as the seed hostname.
+    # Cross-host start is a deliberate future extension; keeping this
+    # simple for now ensures seed_hostname (robots/sitemap) stays
+    # consistent with the start host.
+    if url_host != hostname:
+        raise click.ClickException(
+            f"--start-url host '{url_host}' does not match the seed "
+            f"hostname '{hostname}'. Cross-host start is not yet "
+            f"supported."
+        )
+
+    # Reject if not in scope
+    from ai_browser._scope import hostname_matches_any_scope
+    if not hostname_matches_any_scope(url_host, scope_pattern):
+        raise click.ClickException(
+            f"--start-url host '{url_host}' is not within the declared "
+            f"scope."
+        )
+
+    click.echo(f"[start] crawl/explore will begin at {url}")
+    return url
+
+
 @main.command()
 @click.argument("hostname", type=str)
 @click.option(
@@ -234,6 +285,15 @@ def main(ctx: click.Context):
     help="Directly specify the signup/registration page URL, "
     "bypassing automatic discovery from crawled endpoints. "
     "Useful when you already know the URL, or when running with --no-crawl.",
+)
+@click.option(
+    "--start-url",
+    "start_url_opt",
+    default=None,
+    help="URL to begin crawling and agent exploration from, instead of the target root "
+    "(https://<hostname>). Must be on the target host and within scope. Useful for "
+    "pointing the run at a deep entry (e.g. an authenticated area) and skipping the "
+    "landing page.",
 )
 @click.option(
     "--login-verify-url",
@@ -412,6 +472,7 @@ def crawl(
     register_password: Optional[str],
     register_name: str,
     signup_url: Optional[str],
+    start_url_opt: Optional[str],
     login_verify_url: Optional[str],
     login: bool,
     login_email: Optional[str],
@@ -483,7 +544,6 @@ def crawl(
             "Pass --register or --login for the other phases to run.",
         )
 
-    start_url = f"https://{hostname}"
     scope_pattern: Union[str, List[str]]
 
     # Build the combined scope pattern list
@@ -518,6 +578,11 @@ def crawl(
                 f"own declared scope.",
                 err=True,
             )
+
+    # Resolve the start URL for both Phase 1 and Phase 2.
+    # --start-url is orthogonal to --signup-url (signup entry vs crawl
+    # entry); no conflict, no cross-validation.
+    start_url = _resolve_start_url(start_url_opt, hostname, scope_pattern)
 
     # Print proxy routing status — always visible so anyone reading
     # a run's output can tell at a glance which mode was used.
@@ -606,6 +671,7 @@ def crawl(
             no_crawl=no_crawl,
             hostname=hostname,
             scope_pattern=scope_pattern,
+            start_url=start_url,
             traffic_dir=traffic_dir,
             no_traffic_capture=no_traffic_capture,
             email_backend=email_backend,
@@ -671,6 +737,7 @@ async def _run_phase2_custom(
     llm_max_tokens: Optional[int],
     hostname: str,
     scope_pattern: Union[str, List[str]],
+    start_url: str,
 ) -> None:
     """Run aiBrowser's own AgentExplorer (default, stable)."""
     click.echo(f"\n[Phase 2] Running agent explorer on {hostname}...")
@@ -687,7 +754,7 @@ async def _run_phase2_custom(
 
     explorer_page = await session.new_page()
     try:
-        await explorer_page.goto(f"https://{hostname}", timeout=30000)
+        await explorer_page.goto(start_url, timeout=30000)
     except Exception as exc:
         logger.warning(
             "Failed to navigate to %s for agent exploration: %s",
@@ -813,6 +880,7 @@ async def _run_phase2_browser_use(
     hostname: str,
     scope_pattern: Union[str, List[str]],
     authenticated: bool = False,
+    start_url: str,
 ) -> None:
     """Run browser-use as the Phase 2 agent engine, connected to the same
     browser process via CDP (--remote-debugging-port)."""
@@ -883,7 +951,7 @@ async def _run_phase2_browser_use(
     # ---- Confirm hostname loads before handing off --------------------
     explorer_page = await session.new_page()
     try:
-        await explorer_page.goto(f"https://{hostname}", timeout=30000)
+        await explorer_page.goto(start_url, timeout=30000)
     except Exception as exc:
         logger.warning(
             "Failed to navigate to %s for browser-use exploration: %s",
@@ -1060,6 +1128,7 @@ async def _run_crawl(
     no_crawl: bool,
     hostname: str,
     scope_pattern: Union[str, List[str]],
+    start_url: str,
     traffic_dir: Optional[str],
     no_traffic_capture: bool,
     email_backend: str,
@@ -1187,6 +1256,7 @@ async def _run_crawl(
                     llm_max_tokens=llm_max_tokens,
                     hostname=hostname,
                     scope_pattern=scope_pattern,
+                    start_url=start_url,
                 )
             elif agent_backend == "browser-use":
                 await _run_phase2_browser_use(
@@ -1202,6 +1272,7 @@ async def _run_crawl(
                     hostname=hostname,
                     scope_pattern=scope_pattern,
                     authenticated=authenticated,
+                    start_url=start_url,
                 )
 
         elif run_agent and not llm_api_key:
